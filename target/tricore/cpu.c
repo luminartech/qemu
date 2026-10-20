@@ -255,9 +255,9 @@ static const struct SysemuCPUOps tricore_sysemu_ops = {
 };
 
 static const TCGCPUOps tricore_tcg_ops = {
-    /* MTTCG not yet supported: require strict ordering */
+    /* Atomics (swap/cmpswap/swapmsk/ldmst) use host atomics: MTTCG capable */
     .guest_default_memory_order = TCG_MO_ALL,
-    .mttcg_supported = false,
+    .mttcg_supported = true,
     .initialize = tricore_tcg_init,
     .translate_code = tricore_translate_code,
     .get_tb_cpu_state = tricore_get_tb_cpu_state,

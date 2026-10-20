@@ -281,23 +281,38 @@ static void gen_ld_preincr(DisasContext *ctx, TCGv_i32 r1, TCGv_i32 r2,
     tcg_gen_mov_i32(r2, temp);
 }
 
+/*
+ * Masked atomic update: M(EA, word) = (M & ~mask) | (val & mask), returning the
+ * old word. A cmpxchg retry loop keeps it atomic under MTTCG.
+ */
+static void gen_masked_rmw(DisasContext *ctx, TCGv_i32 old, TCGv_i32 ea,
+                           TCGv_i32 val, TCGv_i32 mask)
+{
+    TCGLabel *retry = gen_new_label();
+    TCGLabel *done = gen_new_label();
+    TCGv_i32 newv = tcg_temp_new_i32();
+    TCGv_i32 tmp = tcg_temp_new_i32();
+    TCGv_i32 seen = tcg_temp_new_i32();
+
+    tcg_gen_qemu_ld_i32(old, ea, ctx->mem_idx, MO_LEUL);
+    gen_set_label(retry);
+    tcg_gen_andc_i32(newv, old, mask);
+    tcg_gen_and_i32(tmp, val, mask);
+    tcg_gen_or_i32(newv, newv, tmp);
+    tcg_gen_atomic_cmpxchg_i32(seen, ea, old, newv, ctx->mem_idx, MO_LEUL);
+    tcg_gen_brcond_i32(TCG_COND_EQ, seen, old, done);
+    tcg_gen_mov_i32(old, seen);
+    tcg_gen_br(retry);
+    gen_set_label(done);
+}
+
 /* M(EA, word) = (M(EA, word) & ~E[a][63:32]) | (E[a][31:0] & E[a][63:32]); */
 static void gen_ldmst(DisasContext *ctx, int ereg, TCGv_i32 ea)
 {
-    TCGv_i32 temp = tcg_temp_new_i32();
-    TCGv_i32 temp2 = tcg_temp_new_i32();
+    TCGv_i32 old = tcg_temp_new_i32();
 
     CHECK_REG_PAIR(ereg);
-    /* temp = (M(EA, word) */
-    tcg_gen_qemu_ld_i32(temp, ea, ctx->mem_idx, MO_LEUL);
-    /* temp = temp & ~E[a][63:32]) */
-    tcg_gen_andc_i32(temp, temp, cpu_gpr_d[ereg + 1]);
-    /* temp2 = (E[a][31:0] & E[a][63:32]); */
-    tcg_gen_and_i32(temp2, cpu_gpr_d[ereg], cpu_gpr_d[ereg + 1]);
-    /* temp = temp | temp2; */
-    tcg_gen_or_i32(temp, temp, temp2);
-    /* M(EA, word) = temp; */
-    tcg_gen_qemu_st_i32(temp, ea, ctx->mem_idx, MO_LEUL);
+    gen_masked_rmw(ctx, old, ea, cpu_gpr_d[ereg], cpu_gpr_d[ereg + 1]);
 }
 
 /* tmp = M(EA, word);
@@ -305,37 +320,25 @@ static void gen_ldmst(DisasContext *ctx, int ereg, TCGv_i32 ea)
    D[a] = tmp[31:0];*/
 static void gen_swap(DisasContext *ctx, int reg, TCGv_i32 ea)
 {
-    TCGv_i32 temp = tcg_temp_new_i32();
-
-    tcg_gen_qemu_ld_i32(temp, ea, ctx->mem_idx, MO_LEUL);
-    tcg_gen_qemu_st_i32(cpu_gpr_d[reg], ea, ctx->mem_idx, MO_LEUL);
-    tcg_gen_mov_i32(cpu_gpr_d[reg], temp);
+    tcg_gen_atomic_xchg_i32(cpu_gpr_d[reg], ea, cpu_gpr_d[reg],
+                            ctx->mem_idx, MO_LEUL);
 }
 
+/* M(EA) = (M(EA) == D[a+1]) ? D[a] : M(EA); D[a] = old M(EA) */
 static void gen_cmpswap(DisasContext *ctx, int reg, TCGv_i32 ea)
 {
-    TCGv_i32 temp = tcg_temp_new_i32();
-    TCGv_i32 temp2 = tcg_temp_new_i32();
     CHECK_REG_PAIR(reg);
-    tcg_gen_qemu_ld_i32(temp, ea, ctx->mem_idx, MO_LEUL);
-    tcg_gen_movcond_i32(TCG_COND_EQ, temp2, cpu_gpr_d[reg + 1], temp,
-                       cpu_gpr_d[reg], temp);
-    tcg_gen_qemu_st_i32(temp2, ea, ctx->mem_idx, MO_LEUL);
-    tcg_gen_mov_i32(cpu_gpr_d[reg], temp);
+    tcg_gen_atomic_cmpxchg_i32(cpu_gpr_d[reg], ea, cpu_gpr_d[reg + 1],
+                               cpu_gpr_d[reg], ctx->mem_idx, MO_LEUL);
 }
 
 static void gen_swapmsk(DisasContext *ctx, int reg, TCGv_i32 ea)
 {
-    TCGv_i32 temp = tcg_temp_new_i32();
-    TCGv_i32 temp2 = tcg_temp_new_i32();
-    TCGv_i32 temp3 = tcg_temp_new_i32();
+    TCGv_i32 old = tcg_temp_new_i32();
+
     CHECK_REG_PAIR(reg);
-    tcg_gen_qemu_ld_i32(temp, ea, ctx->mem_idx, MO_LEUL);
-    tcg_gen_and_i32(temp2, cpu_gpr_d[reg], cpu_gpr_d[reg + 1]);
-    tcg_gen_andc_i32(temp3, temp, cpu_gpr_d[reg + 1]);
-    tcg_gen_or_i32(temp2, temp2, temp3);
-    tcg_gen_qemu_st_i32(temp2, ea, ctx->mem_idx, MO_LEUL);
-    tcg_gen_mov_i32(cpu_gpr_d[reg], temp);
+    gen_masked_rmw(ctx, old, ea, cpu_gpr_d[reg], cpu_gpr_d[reg + 1]);
+    tcg_gen_mov_i32(cpu_gpr_d[reg], old);
 }
 
 /* We generate loads and store to core special function register (csfr) through
