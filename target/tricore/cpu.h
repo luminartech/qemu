@@ -69,6 +69,14 @@ typedef struct CPUArchState {
 
     /* Internal CPU feature flags.  */
     uint64_t features;
+
+    /*
+     * With TriCoreCPU.csa_cache: host addresses of the last two RAM pages
+     * that held a context save area (op_helper.c csa_host), by bit 0 of
+     * the page number; a guest page address with low bits set means none.
+     */
+    uint32_t csa_page[2];
+    uint8_t *csa_host_page[2];
 } CPUTriCoreState;
 
 /**
@@ -84,6 +92,8 @@ struct ArchCPU {
 
     uint32_t core_id;
     bool start_halted;
+    /* remember context save area pages across TBs (op_helper.c csa_host) */
+    bool csa_cache;
     /* called with the priority of every interrupt the CPU takes */
     void (*irq_ack)(void *opaque, uint32_t core_id, uint32_t prio);
     void *irq_ack_opaque;

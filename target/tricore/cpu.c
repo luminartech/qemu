@@ -85,6 +85,7 @@ static void tricore_cpu_reset_hold(Object *obj, ResetType type)
     memset(cpu_env(cs)->csfr_generic, 0, sizeof(cpu_env(cs)->csfr_generic));
     cpu_env(cs)->CORE_ID = TRICORE_CPU(obj)->core_id;
     cpu_env(cs)->pending_irq_prio = 0;
+    cpu_env(cs)->csa_page[0] = cpu_env(cs)->csa_page[1] = 1;
     cpu_env(cs)->boot_halted = TRICORE_CPU(obj)->start_halted;
     cs->halted = cpu_env(cs)->boot_halted;
 }
@@ -231,6 +232,7 @@ static void tc4x_initfn(Object *obj)
 static const Property tricore_cpu_properties[] = {
     DEFINE_PROP_UINT32("core-id", TriCoreCPU, core_id, 0),
     DEFINE_PROP_BOOL("start-halted", TriCoreCPU, start_halted, false),
+    DEFINE_PROP_BOOL("csa-cache", TriCoreCPU, csa_cache, false),
 };
 
 static bool tricore_cpu_exec_interrupt(CPUState *cs, int interrupt_request)

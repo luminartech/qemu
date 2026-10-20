@@ -23,6 +23,7 @@
 #include "accel/tcg/cpu-loop.h"
 #include "qemu/plugin.h"
 #include "accel/tcg/probe.h"
+#include "exec/target_page.h"
 #include <zlib.h> /* for crc32 */
 
 
@@ -2526,6 +2527,41 @@ static uint8_t *csa_probe(CPUTriCoreState *env, uint32_t ea,
 }
 
 /*
+ * Host address of the CSA at @ea when it lies in plain RAM, else NULL.
+ * With the CPU's csa-cache property the pages are remembered instead of
+ * probed on every call and return.  That assumes the free context list
+ * never lies where code is translated from and that its RAM is never
+ * remapped, and stores through a remembered page skip dirty tracking and
+ * watchpoints set later: faster, but only for guests that keep to it.
+ */
+static uint8_t *csa_host(CPUTriCoreState *env, target_ulong ea)
+{
+    target_ulong page = ea & TARGET_PAGE_MASK;
+    unsigned slot = (page >> TARGET_PAGE_BITS) & 1;
+    bool cache = env_archcpu(env)->csa_cache;
+    void *host;
+    int flags;
+
+    if (ea & (CSA_WORDS * 4 - 1)) {
+        return NULL;
+    }
+    if (cache && env->csa_page[slot] == page) {
+        return env->csa_host_page[slot] + (ea - page);
+    }
+    flags = probe_access_flags(env, ea, CSA_WORDS * 4, MMU_DATA_STORE,
+                               cpu_mmu_index(env_cpu(env), false), true,
+                               &host, 0);
+    if (flags || !host) {
+        return NULL;
+    }
+    if (cache) {
+        env->csa_page[slot] = page;
+        env->csa_host_page[slot] = (uint8_t *)host - (ea - page);
+    }
+    return host;
+}
+
+/*
  * Store a 16-word CSA.  A context save takes the next free CSA from the
  * link word in its first word: with @link, read it through the same host
  * translation before overwriting it.
@@ -2533,9 +2569,12 @@ static uint8_t *csa_probe(CPUTriCoreState *env, uint32_t ea,
 static void csa_store(CPUTriCoreState *env, uint32_t ea,
                       const uint32_t words[CSA_WORDS], uint32_t *link)
 {
-    uint8_t *host = csa_probe(env, ea, MMU_DATA_STORE);
+    uint8_t *host = csa_host(env, ea);
     int i;
 
+    if (!host) {
+        host = csa_probe(env, ea, MMU_DATA_STORE);
+    }
     if (link) {
         *link = host ? ldl_le_p(host) : cpu_ldl_le_data(env, ea);
     }
@@ -2555,9 +2594,12 @@ static void csa_store(CPUTriCoreState *env, uint32_t ea,
 static void csa_load(CPUTriCoreState *env, uint32_t ea,
                      uint32_t words[CSA_WORDS], const uint32_t *link)
 {
-    uint8_t *host = csa_probe(env, ea,
-                              link ? MMU_DATA_STORE : MMU_DATA_LOAD);
+    uint8_t *host = csa_host(env, ea);
     int i;
+
+    if (!host) {
+        host = csa_probe(env, ea, link ? MMU_DATA_STORE : MMU_DATA_LOAD);
+    }
 
     for (i = 0; i < CSA_WORDS; i++) {
         words[i] = host ? ldl_le_p(host + i * 4)
