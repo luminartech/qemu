@@ -358,6 +358,13 @@ static void gen_mfcr(DisasContext *ctx, TCGv_i32 ret, int32_t offset)
     } else {
         switch (offset) {
 #include "csfr.h.inc"
+        default:
+            if (has_feature(ctx, TRICORE_FEATURE_18)) {
+                tcg_gen_ld_tl(ret, tcg_env,
+                              offsetof(CPUTriCoreState, csfr_generic) +
+                              (offset & 0xfffc));
+            }
+            break;
         }
     }
 }
@@ -388,6 +395,13 @@ static void gen_mtcr(DisasContext *ctx, TCGv_i32 r1, int32_t offset)
         } else {
             switch (offset) {
 #include "csfr.h.inc"
+            default:
+                if (has_feature(ctx, TRICORE_FEATURE_18)) {
+                    tcg_gen_st_tl(r1, tcg_env,
+                                  offsetof(CPUTriCoreState, csfr_generic) +
+                                  (offset & 0xfffc));
+                }
+                break;
             }
         }
     } else {

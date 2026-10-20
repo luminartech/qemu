@@ -18,6 +18,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/qdev-properties.h"
+#include "system/cpus.h"
 #include "qapi/error.h"
 #include "cpu.h"
 #include "exec/translation-block.h"
@@ -79,11 +81,29 @@ static void tricore_cpu_reset_hold(Object *obj, ResetType type)
     }
 
     cpu_state_reset(cpu_env(cs));
+    memset(cpu_env(cs)->csfr_generic, 0, sizeof(cpu_env(cs)->csfr_generic));
+    cpu_env(cs)->CORE_ID = TRICORE_CPU(obj)->core_id;
+    cpu_env(cs)->boot_halted = TRICORE_CPU(obj)->start_halted;
+    cs->halted = cpu_env(cs)->boot_halted;
 }
 
 static bool tricore_cpu_has_work(CPUState *cs)
 {
-    return true;
+    return !cpu_env(cs)->boot_halted;
+}
+
+void tricore_cpu_release_boot_halt(TriCoreCPU *cpu, uint32_t pc)
+{
+    CPUState *cs = CPU(cpu);
+    CPUTriCoreState *env = &cpu->env;
+
+    if (!env->boot_halted) {
+        return;
+    }
+    env->PC = pc;
+    env->boot_halted = false;
+    cs->halted = 0;
+    qemu_cpu_kick(cs);
 }
 
 static int tricore_cpu_mmu_index(CPUState *cs, bool ifetch)
@@ -106,6 +126,10 @@ static void tricore_cpu_realizefn(DeviceState *dev, Error **errp)
     }
 
     /* Some features automatically imply others */
+    if (tricore_has_feature(env, TRICORE_FEATURE_18)) {
+        set_feature(env, TRICORE_FEATURE_162);
+    }
+
     if (tricore_has_feature(env, TRICORE_FEATURE_162)) {
         set_feature(env, TRICORE_FEATURE_161);
     }
@@ -166,6 +190,18 @@ static void tc37x_initfn(Object *obj)
     set_feature(&cpu->env, TRICORE_FEATURE_162);
 }
 
+static void tc4x_initfn(Object *obj)
+{
+    TriCoreCPU *cpu = TRICORE_CPU(obj);
+
+    set_feature(&cpu->env, TRICORE_FEATURE_18);
+}
+
+static const Property tricore_cpu_properties[] = {
+    DEFINE_PROP_UINT32("core-id", TriCoreCPU, core_id, 0),
+    DEFINE_PROP_BOOL("start-halted", TriCoreCPU, start_halted, false),
+};
+
 static bool tricore_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 {
     /* Interrupts are not implemented */
@@ -209,6 +245,7 @@ static void tricore_cpu_class_init(ObjectClass *c, const void *data)
     resettable_class_set_parent_phases(rc, NULL, tricore_cpu_reset_hold, NULL,
                                        &mcc->parent_phases);
     cc->class_by_name = tricore_cpu_class_by_name;
+    device_class_set_props(dc, tricore_cpu_properties);
 
     cc->gdb_read_register = tricore_cpu_gdb_read_register;
     cc->gdb_write_register = tricore_cpu_gdb_write_register;
@@ -243,6 +280,7 @@ static const TypeInfo tricore_cpu_type_infos[] = {
     DEFINE_TRICORE_CPU_TYPE("tc1797", tc1797_initfn),
     DEFINE_TRICORE_CPU_TYPE("tc27x", tc27x_initfn),
     DEFINE_TRICORE_CPU_TYPE("tc37x", tc37x_initfn),
+    DEFINE_TRICORE_CPU_TYPE("tc4x", tc4x_initfn),
 };
 
 DEFINE_TYPES(tricore_cpu_type_infos)

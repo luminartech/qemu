@@ -56,6 +56,15 @@ typedef struct CPUArchState {
     /* Floating Point Registers */
     float_status fp_status;
 
+    /*
+     * Backing store for CSFRs the translator has no dedicated field for
+     * (e.g. the TC1.8 MPU range registers). Indexed by (offset & 0xfffc) >> 2.
+     */
+    uint32_t csfr_generic[0x10000 / 4];
+
+    /* Core is parked in boot-halt until released through BOOTCON.BHALT */
+    bool boot_halted;
+
     /* Internal CPU feature flags.  */
     uint64_t features;
 } CPUTriCoreState;
@@ -70,7 +79,12 @@ struct ArchCPU {
     CPUState parent_obj;
 
     CPUTriCoreState env;
+
+    uint32_t core_id;
+    bool start_halted;
 };
+
+void tricore_cpu_release_boot_halt(TriCoreCPU *cpu, uint32_t pc);
 
 struct TriCoreCPUClass {
     CPUClass parent_class;
@@ -157,6 +171,7 @@ enum tricore_features {
     TRICORE_FEATURE_16,
     TRICORE_FEATURE_161,
     TRICORE_FEATURE_162,
+    TRICORE_FEATURE_18,
 };
 
 static inline int tricore_has_feature(CPUTriCoreState *env, int feature)

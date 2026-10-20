@@ -15,6 +15,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "cpu.h"
 #include "qemu/host-utils.h"
 #include "exec/helper-proto.h"
@@ -36,6 +37,10 @@ void raise_exception_sync_internal(CPUTriCoreState *env, uint32_t class, int tin
     /* in case we come from a helper-call we need to restore the PC */
     cpu_restore_state(cs, pc);
     last_pc = env->PC;
+
+    qemu_log_mask(CPU_LOG_INT, "core%u: trap class %u tin %d at pc 0x%08x"
+                  " fcx 0x%08x lcx 0x%08x\n", env->CORE_ID, class, tin,
+                  env->PC, env->FCX, env->LCX);
 
     /* Tin is loaded into d[15] */
     env->gpr_d[15] = tin;
