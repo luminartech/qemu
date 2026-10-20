@@ -111,25 +111,11 @@ FIELD(PCXI, UL_13, 22, 1)
 FIELD(PCXI, UL_161, 20, 1)
 FIELD(PCXI, PCXS, 16, 4)
 FIELD(PCXI, PCXO, 0, 16)
-uint32_t pcxi_get_ul(CPUTriCoreState *env);
-uint32_t pcxi_get_pie(CPUTriCoreState *env);
-uint32_t pcxi_get_pcpn(CPUTriCoreState *env);
-uint32_t pcxi_get_pcxs(CPUTriCoreState *env);
-uint32_t pcxi_get_pcxo(CPUTriCoreState *env);
-void pcxi_set_ul(CPUTriCoreState *env, uint32_t val);
-void pcxi_set_pie(CPUTriCoreState *env, uint32_t val);
-void pcxi_set_pcpn(CPUTriCoreState *env, uint32_t val);
 
 FIELD(ICR, IE_161, 15, 1)
 FIELD(ICR, IE_13, 8, 1)
 FIELD(ICR, PIPN, 16, 8)
 FIELD(ICR, CCPN, 0, 8)
-
-uint32_t icr_get_ie(CPUTriCoreState *env);
-uint32_t icr_get_ccpn(CPUTriCoreState *env);
-
-void icr_set_ccpn(CPUTriCoreState *env, uint32_t val);
-void icr_set_ie(CPUTriCoreState *env, uint32_t val);
 
 #define MASK_PSW_USB 0xff000000
 #define MASK_USB_C   0x80000000
@@ -263,12 +249,85 @@ enum {
     TIN7_NMI = 0,
 };
 
-uint32_t psw_read(CPUTriCoreState *env);
-void psw_write(CPUTriCoreState *env, uint32_t val);
 int tricore_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n);
 int tricore_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n);
 
 void fpu_set_state(CPUTriCoreState *env);
+
+static inline uint32_t psw_read(CPUTriCoreState *env)
+{
+    /* clear all USB bits */
+    env->PSW &= 0x7ffffff;
+    /* now set them from the cache */
+    env->PSW |= ((env->PSW_USB_C != 0) << 31);
+    env->PSW |= ((env->PSW_USB_V   & (1 << 31))  >> 1);
+    env->PSW |= ((env->PSW_USB_SV  & (1 << 31))  >> 2);
+    env->PSW |= ((env->PSW_USB_AV  & (1 << 31))  >> 3);
+    env->PSW |= ((env->PSW_USB_SAV & (1 << 31))  >> 4);
+
+    return env->PSW;
+}
+
+static inline void psw_write(CPUTriCoreState *env, uint32_t val)
+{
+    /* the FPU state follows PSW.RM, which calls and returns keep */
+    bool rm_changed = (env->PSW ^ val) & MASK_PSW_FPU_RM;
+
+    env->PSW_USB_C = (val & MASK_USB_C);
+    env->PSW_USB_V = (val & MASK_USB_V) << 1;
+    env->PSW_USB_SV = (val & MASK_USB_SV) << 2;
+    env->PSW_USB_AV = (val & MASK_USB_AV) << 3;
+    env->PSW_USB_SAV = (val & MASK_USB_SAV) << 4;
+    env->PSW = val;
+    if (rm_changed) {
+        fpu_set_state(env);
+    }
+}
+
+#define FIELD_GETTER_WITH_FEATURE(NAME, REG, FIELD, FEATURE)                  \
+static inline uint32_t NAME(CPUTriCoreState *env)                             \
+{                                                                             \
+    if (tricore_has_feature(env, TRICORE_FEATURE_##FEATURE)) {                \
+        return FIELD_EX32(env->REG, REG, FIELD ## _ ## FEATURE);              \
+    }                                                                         \
+    return FIELD_EX32(env->REG, REG, FIELD ## _13);                           \
+}
+
+#define FIELD_GETTER(NAME, REG, FIELD)                                        \
+static inline uint32_t NAME(CPUTriCoreState *env)                             \
+{                                                                             \
+    return FIELD_EX32(env->REG, REG, FIELD);                                  \
+}
+
+#define FIELD_SETTER_WITH_FEATURE(NAME, REG, FIELD, FEATURE)                  \
+static inline void NAME(CPUTriCoreState *env, uint32_t val)                   \
+{                                                                             \
+    if (tricore_has_feature(env, TRICORE_FEATURE_##FEATURE)) {                \
+        env->REG = FIELD_DP32(env->REG, REG, FIELD ## _ ## FEATURE, val);     \
+    } else {                                                                  \
+        env->REG = FIELD_DP32(env->REG, REG, FIELD ## _13, val);              \
+    }                                                                         \
+}
+
+#define FIELD_SETTER(NAME, REG, FIELD)                                        \
+static inline void NAME(CPUTriCoreState *env, uint32_t val)                   \
+{                                                                             \
+    env->REG = FIELD_DP32(env->REG, REG, FIELD, val);                         \
+}
+
+FIELD_GETTER_WITH_FEATURE(pcxi_get_pcpn, PCXI, PCPN, 161)
+FIELD_SETTER_WITH_FEATURE(pcxi_set_pcpn, PCXI, PCPN, 161)
+FIELD_GETTER_WITH_FEATURE(pcxi_get_pie, PCXI, PIE, 161)
+FIELD_SETTER_WITH_FEATURE(pcxi_set_pie, PCXI, PIE, 161)
+FIELD_GETTER_WITH_FEATURE(pcxi_get_ul, PCXI, UL, 161)
+FIELD_SETTER_WITH_FEATURE(pcxi_set_ul, PCXI, UL, 161)
+FIELD_GETTER(pcxi_get_pcxs, PCXI, PCXS)
+FIELD_GETTER(pcxi_get_pcxo, PCXI, PCXO)
+
+FIELD_GETTER_WITH_FEATURE(icr_get_ie, ICR, IE, 161)
+FIELD_SETTER_WITH_FEATURE(icr_set_ie, ICR, IE, 161)
+FIELD_GETTER(icr_get_ccpn, ICR, CCPN)
+FIELD_SETTER(icr_set_ccpn, ICR, CCPN)
 
 #define MMU_USER_IDX 2
 
