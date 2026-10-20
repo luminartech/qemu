@@ -104,6 +104,54 @@ void raise_exception_sync_internal(CPUTriCoreState *env, uint32_t class, int tin
     cpu_loop_exit(cs);
 }
 
+/*
+ * Interrupt entry, called from cpu_exec_interrupt between TBs (TC1.8
+ * architecture manual volume 1, sections 5.2 and 5.4)
+ */
+void tricore_cpu_do_interrupt(CPUTriCoreState *env, uint32_t pipn)
+{
+    TriCoreCPU *cpu = env_archcpu(env);
+    uint32_t vector_shift = (env->BIV & 1) ? 3 : 5;
+
+    qemu_log_mask(CPU_LOG_INT, "core%u: interrupt prio %u at pc 0x%08x pcxi "
+                  "0x%08x icr 0x%08x fcx 0x%08x\n", env->CORE_ID, pipn, env->PC,
+                  env->PCXI, env->ICR, env->FCX);
+
+    helper_svucx(env);
+    env->gpr_a[11] = env->PC;
+    if ((env->PSW & MASK_PSW_IS) == 0) {
+        env->gpr_a[10] = env->ISP;
+    }
+    env->PSW |= MASK_PSW_IS;
+    env->PSW = (env->PSW & ~MASK_PSW_IO) | (2 << 10);
+    env->PSW &= ~MASK_PSW_PRS;
+    env->PSW &= ~MASK_PSW_CDC;
+    env->PSW |= MASK_PSW_CDE;
+    env->PSW &= ~MASK_PSW_GW;
+
+    /* helper_svucx already stored ICR.IE/CCPN into PCXI.PIE/PCPN */
+    icr_set_ie(env, 0);
+    icr_set_ccpn(env, pipn);
+
+    env->PC = (env->BIV & ~1u) | (pipn << vector_shift);
+
+    if (cpu->irq_ack) {
+        cpu->irq_ack(cpu->irq_ack_opaque, cpu->core_id, pipn);
+    }
+}
+
+void helper_wait(CPUTriCoreState *env)
+{
+    CPUState *cs = env_cpu(env);
+
+    if (qatomic_read(&env->pending_irq_prio) != 0) {
+        return;
+    }
+    cs->halted = 1;
+    cs->exception_index = EXCP_HLT;
+    cpu_loop_exit(cs);
+}
+
 void helper_raise_exception_sync(CPUTriCoreState *env, uint32_t class,
                                  uint32_t tin)
 {

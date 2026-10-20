@@ -62,6 +62,8 @@ typedef struct CPUArchState {
      */
     uint32_t csfr_generic[0x10000 / 4];
 
+    /* Priority of the highest pending service request routed here (0: none) */
+    uint32_t pending_irq_prio;
     /* Core is parked in boot-halt until released through BOOTCON.BHALT */
     bool boot_halted;
 
@@ -82,9 +84,14 @@ struct ArchCPU {
 
     uint32_t core_id;
     bool start_halted;
+    /* called with the priority of every interrupt the CPU takes */
+    void (*irq_ack)(void *opaque, uint32_t core_id, uint32_t prio);
+    void *irq_ack_opaque;
 };
 
+void tricore_cpu_set_pending_irq(TriCoreCPU *cpu, uint32_t prio);
 void tricore_cpu_release_boot_halt(TriCoreCPU *cpu, uint32_t pc);
+void tricore_cpu_do_interrupt(CPUTriCoreState *env, uint32_t pipn);
 
 struct TriCoreCPUClass {
     CPUClass parent_class;

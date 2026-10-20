@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/qdev-properties.h"
+#include "exec/cpu-interrupt.h"
 #include "system/cpus.h"
 #include "qapi/error.h"
 #include "cpu.h"
@@ -83,13 +84,43 @@ static void tricore_cpu_reset_hold(Object *obj, ResetType type)
     cpu_state_reset(cpu_env(cs));
     memset(cpu_env(cs)->csfr_generic, 0, sizeof(cpu_env(cs)->csfr_generic));
     cpu_env(cs)->CORE_ID = TRICORE_CPU(obj)->core_id;
+    cpu_env(cs)->pending_irq_prio = 0;
     cpu_env(cs)->boot_halted = TRICORE_CPU(obj)->start_halted;
     cs->halted = cpu_env(cs)->boot_halted;
 }
 
+static bool tricore_cpu_irq_deliverable(CPUTriCoreState *env, uint32_t prio)
+{
+    return icr_get_ie(env) && prio > icr_get_ccpn(env);
+}
+
 static bool tricore_cpu_has_work(CPUState *cs)
 {
-    return !cpu_env(cs)->boot_halted;
+    CPUTriCoreState *env = cpu_env(cs);
+
+    if (env->boot_halted) {
+        return false;
+    }
+    /* WAIT ends on any pending request, even one that cannot be taken yet */
+    return qatomic_read(&env->pending_irq_prio) != 0;
+}
+
+void tricore_cpu_set_pending_irq(TriCoreCPU *cpu, uint32_t prio)
+{
+    CPUState *cs = CPU(cpu);
+    CPUTriCoreState *env = &cpu->env;
+
+    /*
+     * Called from the interrupt router (another thread under MTTCG): only
+     * publish the priority.  ICR belongs to the vCPU thread (enable, disable,
+     * RFE write it without the BQL), so ICR.PIPN is synced there.
+     */
+    qatomic_set(&env->pending_irq_prio, prio);
+    if (prio != 0) {
+        cpu_interrupt(cs, CPU_INTERRUPT_HARD);
+    } else {
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+    }
 }
 
 void tricore_cpu_release_boot_halt(TriCoreCPU *cpu, uint32_t pc)
@@ -204,7 +235,15 @@ static const Property tricore_cpu_properties[] = {
 
 static bool tricore_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 {
-    /* Interrupts are not implemented */
+    CPUTriCoreState *env = cpu_env(cs);
+    uint32_t prio = qatomic_read(&env->pending_irq_prio);
+
+    env->ICR = deposit32(env->ICR, R_ICR_PIPN_SHIFT, R_ICR_PIPN_LENGTH, prio);
+    if ((interrupt_request & CPU_INTERRUPT_HARD) &&
+        !env->boot_halted && tricore_cpu_irq_deliverable(env, prio)) {
+        tricore_cpu_do_interrupt(env, prio);
+        return true;
+    }
     return false;
 }
 

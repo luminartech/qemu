@@ -403,6 +403,10 @@ static void gen_mtcr(DisasContext *ctx, TCGv_i32 r1, int32_t offset)
                 }
                 break;
             }
+            /* ICR/BIV changes may make a pending interrupt deliverable */
+            if (offset == 0xfe2c || offset == 0xfe20) {
+                ctx->base.is_jmp = DISAS_EXIT_UPDATE;
+            }
         }
     } else {
         generate_trap(ctx, TRAPC_PROT, TIN1_PRIV);
@@ -8274,6 +8278,11 @@ static void decode_sys_interrupts(DisasContext *ctx)
         } else {
             generate_trap(ctx, TRAPC_INSN_ERR, TIN2_IOPC);
         }
+        break;
+    case OPC2_32_SYS_WAIT:
+        gen_save_pc(ctx->base.pc_next + 4);
+        gen_helper_wait(tcg_env);
+        ctx->base.is_jmp = DISAS_EXIT;
         break;
     case OPC2_32_SYS_TRAPSV:
         l1 = gen_new_label();

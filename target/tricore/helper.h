@@ -160,6 +160,7 @@ DEF_HELPER_2(psw_write, void, env, i32)
 DEF_HELPER_1(psw_read, i32, env)
 /* Exceptions */
 DEF_HELPER_3(raise_exception_sync, noreturn, env, i32, i32)
+DEF_HELPER_1(wait, void, env)
 /* TriCore 1.8 */
 DEF_HELPER_3(dfadd, i64, env, i64, i64)
 DEF_HELPER_3(dfsub, i64, env, i64, i64)
