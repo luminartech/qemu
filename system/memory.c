@@ -2729,6 +2729,11 @@ static FlatRange *flatview_lookup(FlatView *view, AddrRange addr)
                    sizeof(FlatRange), cmp_flatrange_addr);
 }
 
+void memory_region_set_imprecise_io(MemoryRegion *mr, bool imprecise)
+{
+    mr->imprecise_io = imprecise;
+}
+
 bool memory_region_is_mapped(const MemoryRegion *mr)
 {
     return !!mr->container || mr->mapped_via_alias;

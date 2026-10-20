@@ -571,6 +571,8 @@ struct MemoryRegion {
     bool rom_device;
     bool flush_coalesced_mmio;
     bool lockless_io;
+    /* side effects at the next TB: see memory_region_set_imprecise_io() */
+    bool imprecise_io;
     bool unmergeable;
     uint8_t dirty_log_mask;
     bool is_iommu;
@@ -2226,6 +2228,22 @@ bool memory_region_present(MemoryRegion *container, hwaddr addr);
  * @mr: a #MemoryRegion which should be checked if it's mapped
  */
 bool memory_region_is_mapped(const MemoryRegion *mr);
+
+/**
+ * memory_region_set_imprecise_io: let TCG accesses skip the I/O rewind
+ *
+ * Without icount, a TCG access to an I/O region before the last
+ * instruction of its TB normally re-executes the TB from one that ends at
+ * the access, so that side effects of the access (an interrupt, a mapping
+ * change) take effect at the next instruction.  With @imprecise set, the
+ * access is served in place and its side effects take effect at the next
+ * TB boundary instead: faster for regions accessed in tight loops, but no
+ * longer instruction-precise.  icount always keeps the precise behaviour.
+ *
+ * @mr: the memory region
+ * @imprecise: whether accesses skip the rewind
+ */
+void memory_region_set_imprecise_io(MemoryRegion *mr, bool imprecise);
 
 /**
  * memory_region_get_ram_discard_manager: get the #RamDiscardManager for a

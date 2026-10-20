@@ -36,6 +36,7 @@
 #include "exec/tlb-common.h"
 #include "exec/vaddr.h"
 #include "tcg/tcg.h"
+#include "exec/icount.h"
 #include "qemu/error-report.h"
 #include "exec/log.h"
 #include "exec/helper-proto-common.h"
@@ -1280,7 +1281,14 @@ io_prepare(hwaddr *out_offset, CPUState *cpu, CPUTLBEntryFull *full,
     section = full->section;
     mr_offset = full->xlat_offset + addr;
     cpu->mem_io_pc = retaddr;
-    if (!cpu->neg.can_do_io) {
+    /*
+     * An I/O access before the last insn of the TB re-executes it from a TB
+     * that ends there, so that device side effects take effect at the next
+     * instruction.  Without icount, the side effects of an imprecise_io
+     * region take effect at the next TB boundary instead.
+     */
+    if (!cpu->neg.can_do_io &&
+        (icount_enabled() || !section->mr->imprecise_io)) {
         cpu_io_recompile(cpu, retaddr);
     }
 
