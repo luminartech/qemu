@@ -2941,7 +2941,7 @@ static void gen_fret(DisasContext *ctx)
     tcg_gen_qemu_ld_i32(cpu_gpr_a[11], cpu_gpr_a[10], ctx->mem_idx, MO_LESL);
     tcg_gen_addi_i32(cpu_gpr_a[10], cpu_gpr_a[10], 4);
     tcg_gen_mov_i32(cpu_PC, temp);
-    ctx->base.is_jmp = DISAS_EXIT;
+    ctx->base.is_jmp = DISAS_JUMP;
 }
 
 static void gen_compute_branch(DisasContext *ctx, uint32_t opc, int r1,
@@ -3040,12 +3040,16 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc, int r1,
 /* SR-format jumps */
     case OPC1_16_SR_JI:
         tcg_gen_andi_i32(cpu_PC, cpu_gpr_a[r1], 0xfffffffe);
-        ctx->base.is_jmp = DISAS_EXIT;
+        ctx->base.is_jmp = DISAS_JUMP;
         break;
     case OPC2_32_SYS_RET:
     case OPC2_16_SR_RET:
+        /*
+         * RET restores PSW but not ICR, so no interrupt becomes deliverable:
+         * look the return address up without leaving the generated code.
+         */
         gen_helper_ret(tcg_env);
-        ctx->base.is_jmp = DISAS_EXIT;
+        ctx->base.is_jmp = DISAS_JUMP;
         break;
 /* B-format */
     case OPC1_32_B_CALLA:
@@ -3821,7 +3825,7 @@ static void decode_16Bit_opc(DisasContext *ctx)
             /* TC1.8 16-bit CALLI A[a] shares op1 0xDC with JI (op2 = 1) */
             gen_helper_1arg(call, ctx->base.pc_next + 2);
             tcg_gen_andi_tl(cpu_PC, cpu_gpr_a[r1], ~0x1);
-            ctx->base.is_jmp = DISAS_EXIT;
+            ctx->base.is_jmp = DISAS_JUMP;
         } else {
             gen_compute_branch(ctx, op1, r1, 0, 0, 0);
         }
