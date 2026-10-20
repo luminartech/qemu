@@ -171,8 +171,9 @@ void NAME(CPUTriCoreState *env, uint32_t val)                            \
 {                                                                         \
     if (tricore_has_feature(env, TRICORE_FEATURE_##FEATURE)) {            \
         env->REG = FIELD_DP32(env->REG, REG, FIELD ## _ ## FEATURE, val); \
+    } else {                                                              \
+        env->REG = FIELD_DP32(env->REG, REG, FIELD ## _13, val);          \
     }                                                                     \
-    env->REG = FIELD_DP32(env->REG, REG, FIELD ## _13, val);              \
 }
 
 #define FIELD_SETTER(NAME, REG, FIELD)                \
