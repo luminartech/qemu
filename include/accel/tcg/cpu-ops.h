@@ -173,6 +173,15 @@ struct TCGCPUOps {
     void (*do_interrupt)(CPUState *cpu);
     /** @cpu_exec_interrupt: Callback for processing interrupts in cpu_exec */
     bool (*cpu_exec_interrupt)(CPUState *cpu, int interrupt_request);
+    /**
+     * @cpu_exec_interrupt_ready: Optional.  A target that sets it takes
+     * CPU_INTERRUPT_HARD without the BQL when that is the only request:
+     * cpu_exec calls this on the vCPU thread, and @cpu_exec_interrupt
+     * (still without the BQL) only when it returns true, i.e. when the
+     * pending interrupt can be taken now.  Its interrupt delivery must not
+     * need the BQL.
+     */
+    bool (*cpu_exec_interrupt_ready)(CPUState *cpu);
     /** @cpu_exec_reset: Callback for reset in cpu_exec.  */
     void (*cpu_exec_reset)(CPUState *cpu);
     /**

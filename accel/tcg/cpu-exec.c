@@ -779,6 +779,30 @@ static inline bool icount_exit_request(CPUState *cpu)
     return cpu->neg.icount_decr.u16.low + cpu->icount_extra == 0;
 }
 
+/*
+ * Targets with cpu_exec_interrupt_ready take CPU_INTERRUPT_HARD without the
+ * BQL when it is the only request: the interrupt is checked on every return
+ * to the execution loop while it stays pending, and a masked one would
+ * otherwise cost a BQL round trip each time.
+ */
+static inline bool cpu_handle_irq_lockless(CPUState *cpu,
+                                           TranslationBlock **last_tb)
+{
+    const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
+
+    if (!tcg_ops->cpu_exec_interrupt_ready ||
+        qatomic_read(&cpu->interrupt_request) != CPU_INTERRUPT_HARD ||
+        cpu->singlestep_flags || replay_mode != REPLAY_MODE_NONE) {
+        return false;
+    }
+    if (tcg_ops->cpu_exec_interrupt_ready(cpu) &&
+        tcg_ops->cpu_exec_interrupt(cpu, CPU_INTERRUPT_HARD)) {
+        cpu->exception_index = -1;
+        *last_tb = NULL;
+    }
+    return true;
+}
+
 static inline bool cpu_handle_interrupt(CPUState *cpu,
                                         TranslationBlock **last_tb)
 {
@@ -802,7 +826,8 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
 #ifdef CONFIG_USER_ONLY
     assert(!cpu_test_interrupt(cpu, ~0));
 #else
-    if (unlikely(cpu_test_interrupt(cpu, ~0))) {
+    if (unlikely(cpu_test_interrupt(cpu, ~0)) &&
+        !cpu_handle_irq_lockless(cpu, last_tb)) {
         bql_lock();
         if (cpu_test_interrupt(cpu, CPU_INTERRUPT_DEBUG)) {
             cpu_reset_interrupt(cpu, CPU_INTERRUPT_DEBUG);
