@@ -22,6 +22,7 @@
 #include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/cpu-loop.h"
 #include "qemu/plugin.h"
+#include "accel/tcg/probe.h"
 #include <zlib.h> /* for crc32 */
 
 
@@ -2503,86 +2504,148 @@ static bool cdc_zero(uint32_t *psw)
     return count == 0;
 }
 
-static void save_context_upper(CPUTriCoreState *env, uint32_t ea)
+/*
+ * A context save area (CSA) is 16 words, 64-byte aligned, so it never
+ * crosses a page: translate it once and copy the words through the host
+ * pointer, or word by word when it is not backed by RAM.
+ */
+#define CSA_WORDS 16
+
+/*
+ * LDLCX, STLCX, LDUCX and STUCX take any word address: only an aligned
+ * CSA is accessed through one translation.
+ */
+static uint8_t *csa_probe(CPUTriCoreState *env, uint32_t ea,
+                          MMUAccessType access)
 {
-    cpu_stl_le_data(env, ea, env->PCXI);
-    cpu_stl_le_data(env, ea + 4, psw_read(env));
-    cpu_stl_le_data(env, ea + 8, env->gpr_a[10]);
-    cpu_stl_le_data(env, ea + 12, env->gpr_a[11]);
-    cpu_stl_le_data(env, ea + 16, env->gpr_d[8]);
-    cpu_stl_le_data(env, ea + 20, env->gpr_d[9]);
-    cpu_stl_le_data(env, ea + 24, env->gpr_d[10]);
-    cpu_stl_le_data(env, ea + 28, env->gpr_d[11]);
-    cpu_stl_le_data(env, ea + 32, env->gpr_a[12]);
-    cpu_stl_le_data(env, ea + 36, env->gpr_a[13]);
-    cpu_stl_le_data(env, ea + 40, env->gpr_a[14]);
-    cpu_stl_le_data(env, ea + 44, env->gpr_a[15]);
-    cpu_stl_le_data(env, ea + 48, env->gpr_d[12]);
-    cpu_stl_le_data(env, ea + 52, env->gpr_d[13]);
-    cpu_stl_le_data(env, ea + 56, env->gpr_d[14]);
-    cpu_stl_le_data(env, ea + 60, env->gpr_d[15]);
+    if (ea & (CSA_WORDS * 4 - 1)) {
+        return NULL;
+    }
+    return probe_access(env, ea, CSA_WORDS * 4, access,
+                        cpu_mmu_index(env_cpu(env), false), 0);
 }
 
-static void save_context_lower(CPUTriCoreState *env, uint32_t ea)
+/*
+ * Store a 16-word CSA.  A context save takes the next free CSA from the
+ * link word in its first word: with @link, read it through the same host
+ * translation before overwriting it.
+ */
+static void csa_store(CPUTriCoreState *env, uint32_t ea,
+                      const uint32_t words[CSA_WORDS], uint32_t *link)
 {
-    cpu_stl_le_data(env, ea, env->PCXI);
-    cpu_stl_le_data(env, ea + 4, env->gpr_a[11]);
-    cpu_stl_le_data(env, ea + 8, env->gpr_a[2]);
-    cpu_stl_le_data(env, ea + 12, env->gpr_a[3]);
-    cpu_stl_le_data(env, ea + 16, env->gpr_d[0]);
-    cpu_stl_le_data(env, ea + 20, env->gpr_d[1]);
-    cpu_stl_le_data(env, ea + 24, env->gpr_d[2]);
-    cpu_stl_le_data(env, ea + 28, env->gpr_d[3]);
-    cpu_stl_le_data(env, ea + 32, env->gpr_a[4]);
-    cpu_stl_le_data(env, ea + 36, env->gpr_a[5]);
-    cpu_stl_le_data(env, ea + 40, env->gpr_a[6]);
-    cpu_stl_le_data(env, ea + 44, env->gpr_a[7]);
-    cpu_stl_le_data(env, ea + 48, env->gpr_d[4]);
-    cpu_stl_le_data(env, ea + 52, env->gpr_d[5]);
-    cpu_stl_le_data(env, ea + 56, env->gpr_d[6]);
-    cpu_stl_le_data(env, ea + 60, env->gpr_d[7]);
+    uint8_t *host = csa_probe(env, ea, MMU_DATA_STORE);
+    int i;
+
+    if (link) {
+        *link = host ? ldl_le_p(host) : cpu_ldl_le_data(env, ea);
+    }
+    for (i = 0; i < CSA_WORDS; i++) {
+        if (host) {
+            stl_le_p(host + i * 4, words[i]);
+        } else {
+            cpu_stl_le_data(env, ea + i * 4, words[i]);
+        }
+    }
+}
+
+/*
+ * Load a 16-word CSA.  A context restore returns the CSA to the free list:
+ * with @link, write it to the first word through the same host translation.
+ */
+static void csa_load(CPUTriCoreState *env, uint32_t ea,
+                     uint32_t words[CSA_WORDS], const uint32_t *link)
+{
+    uint8_t *host = csa_probe(env, ea,
+                              link ? MMU_DATA_STORE : MMU_DATA_LOAD);
+    int i;
+
+    for (i = 0; i < CSA_WORDS; i++) {
+        words[i] = host ? ldl_le_p(host + i * 4)
+                        : cpu_ldl_le_data(env, ea + i * 4);
+    }
+    if (link) {
+        if (host) {
+            stl_le_p(host, *link);
+        } else {
+            cpu_stl_le_data(env, ea, *link);
+        }
+    }
+}
+
+static void save_context_upper(CPUTriCoreState *env, uint32_t ea,
+                               uint32_t *link)
+{
+    const uint32_t words[CSA_WORDS] = {
+        env->PCXI, psw_read(env), env->gpr_a[10], env->gpr_a[11],
+        env->gpr_d[8], env->gpr_d[9], env->gpr_d[10], env->gpr_d[11],
+        env->gpr_a[12], env->gpr_a[13], env->gpr_a[14], env->gpr_a[15],
+        env->gpr_d[12], env->gpr_d[13], env->gpr_d[14], env->gpr_d[15],
+    };
+
+    csa_store(env, ea, words, link);
+}
+
+static void save_context_lower(CPUTriCoreState *env, uint32_t ea,
+                               uint32_t *link)
+{
+    const uint32_t words[CSA_WORDS] = {
+        env->PCXI, env->gpr_a[11], env->gpr_a[2], env->gpr_a[3],
+        env->gpr_d[0], env->gpr_d[1], env->gpr_d[2], env->gpr_d[3],
+        env->gpr_a[4], env->gpr_a[5], env->gpr_a[6], env->gpr_a[7],
+        env->gpr_d[4], env->gpr_d[5], env->gpr_d[6], env->gpr_d[7],
+    };
+
+    csa_store(env, ea, words, link);
 }
 
 static void restore_context_upper(CPUTriCoreState *env, uint32_t ea,
-                                  uint32_t *new_PCXI, uint32_t *new_PSW)
+                                  uint32_t *new_PCXI, uint32_t *new_PSW,
+                                  const uint32_t *link)
 {
-    *new_PCXI = cpu_ldl_le_data(env, ea);
-    *new_PSW = cpu_ldl_le_data(env, ea + 4);
-    env->gpr_a[10] = cpu_ldl_le_data(env, ea + 8);
-    env->gpr_a[11] = cpu_ldl_le_data(env, ea + 12);
-    env->gpr_d[8]  = cpu_ldl_le_data(env, ea + 16);
-    env->gpr_d[9]  = cpu_ldl_le_data(env, ea + 20);
-    env->gpr_d[10] = cpu_ldl_le_data(env, ea + 24);
-    env->gpr_d[11] = cpu_ldl_le_data(env, ea + 28);
-    env->gpr_a[12] = cpu_ldl_le_data(env, ea + 32);
-    env->gpr_a[13] = cpu_ldl_le_data(env, ea + 36);
-    env->gpr_a[14] = cpu_ldl_le_data(env, ea + 40);
-    env->gpr_a[15] = cpu_ldl_le_data(env, ea + 44);
-    env->gpr_d[12] = cpu_ldl_le_data(env, ea + 48);
-    env->gpr_d[13] = cpu_ldl_le_data(env, ea + 52);
-    env->gpr_d[14] = cpu_ldl_le_data(env, ea + 56);
-    env->gpr_d[15] = cpu_ldl_le_data(env, ea + 60);
+    uint32_t w[CSA_WORDS];
+
+    csa_load(env, ea, w, link);
+    *new_PCXI = w[0];
+    *new_PSW = w[1];
+    env->gpr_a[10] = w[2];
+    env->gpr_a[11] = w[3];
+    env->gpr_d[8] = w[4];
+    env->gpr_d[9] = w[5];
+    env->gpr_d[10] = w[6];
+    env->gpr_d[11] = w[7];
+    env->gpr_a[12] = w[8];
+    env->gpr_a[13] = w[9];
+    env->gpr_a[14] = w[10];
+    env->gpr_a[15] = w[11];
+    env->gpr_d[12] = w[12];
+    env->gpr_d[13] = w[13];
+    env->gpr_d[14] = w[14];
+    env->gpr_d[15] = w[15];
 }
 
 static void restore_context_lower(CPUTriCoreState *env, uint32_t ea,
-                                  uint32_t *ra, uint32_t *pcxi)
+                                  uint32_t *ra, uint32_t *pcxi,
+                                  const uint32_t *link)
 {
-    *pcxi = cpu_ldl_le_data(env, ea);
-    *ra = cpu_ldl_le_data(env, ea + 4);
-    env->gpr_a[2] = cpu_ldl_le_data(env, ea + 8);
-    env->gpr_a[3] = cpu_ldl_le_data(env, ea + 12);
-    env->gpr_d[0] = cpu_ldl_le_data(env, ea + 16);
-    env->gpr_d[1] = cpu_ldl_le_data(env, ea + 20);
-    env->gpr_d[2] = cpu_ldl_le_data(env, ea + 24);
-    env->gpr_d[3] = cpu_ldl_le_data(env, ea + 28);
-    env->gpr_a[4] = cpu_ldl_le_data(env, ea + 32);
-    env->gpr_a[5] = cpu_ldl_le_data(env, ea + 36);
-    env->gpr_a[6] = cpu_ldl_le_data(env, ea + 40);
-    env->gpr_a[7] = cpu_ldl_le_data(env, ea + 44);
-    env->gpr_d[4] = cpu_ldl_le_data(env, ea + 48);
-    env->gpr_d[5] = cpu_ldl_le_data(env, ea + 52);
-    env->gpr_d[6] = cpu_ldl_le_data(env, ea + 56);
-    env->gpr_d[7] = cpu_ldl_le_data(env, ea + 60);
+    uint32_t w[CSA_WORDS];
+
+    csa_load(env, ea, w, link);
+    *pcxi = w[0];
+    *ra = w[1];
+    env->gpr_a[2] = w[2];
+    env->gpr_a[3] = w[3];
+    env->gpr_d[0] = w[4];
+    env->gpr_d[1] = w[5];
+    env->gpr_d[2] = w[6];
+    env->gpr_d[3] = w[7];
+    env->gpr_a[4] = w[8];
+    env->gpr_a[5] = w[9];
+    env->gpr_a[6] = w[10];
+    env->gpr_a[7] = w[11];
+    env->gpr_d[4] = w[12];
+    env->gpr_d[5] = w[13];
+    env->gpr_d[6] = w[14];
+    env->gpr_d[7] = w[15];
 }
 
 void helper_call(CPUTriCoreState *env, uint32_t next_pc)
@@ -2620,11 +2683,10 @@ void helper_call(CPUTriCoreState *env, uint32_t next_pc)
     ea = ((env->FCX & MASK_FCX_FCXS) << 12) +
          ((env->FCX & MASK_FCX_FCXO) << 6);
     /* new_FCX = M(EA, word); */
-    new_FCX = cpu_ldl_le_data(env, ea);
     /* M(EA, 16 * word) = {PCXI, PSW, A[10], A[11], D[8], D[9], D[10], D[11],
                            A[12], A[13], A[14], A[15], D[12], D[13], D[14],
                            D[15]}; */
-    save_context_upper(env, ea);
+    save_context_upper(env, ea, &new_FCX);
 
     /* PCXI.PCPN = ICR.CCPN; */
     pcxi_set_pcpn(env, icr_get_ccpn(env));
@@ -2684,9 +2746,8 @@ void helper_ret(CPUTriCoreState *env)
          (pcxi_get_pcxo(env) << 6);
     /* {new_PCXI, new_PSW, A[10], A[11], D[8], D[9], D[10], D[11], A[12],
         A[13], A[14], A[15], D[12], D[13], D[14], D[15]} = M(EA, 16 * word); */
-    restore_context_upper(env, ea, &new_PCXI, &new_PSW);
     /* M(EA, word) = FCX; */
-    cpu_stl_le_data(env, ea, env->FCX);
+    restore_context_upper(env, ea, &new_PCXI, &new_PSW, &env->FCX);
     /* FCX[19: 0] = PCXI[19: 0]; */
     env->FCX = (env->FCX & 0xfff00000) + (env->PCXI & 0x000fffff);
     /* PCXI = new_PCXI; */
@@ -2716,10 +2777,9 @@ void helper_bisr(CPUTriCoreState *env, uint32_t const9)
     ea = ((env->FCX & 0xf0000) << 12) + ((env->FCX & 0xffff) << 6);
 
     /* new_FCX = M(EA, word); */
-    new_FCX = cpu_ldl_le_data(env, ea);
     /* M(EA, 16 * word) = {PCXI, A[11], A[2], A[3], D[0], D[1], D[2], D[3], A[4]
                            , A[5], A[6], A[7], D[4], D[5], D[6], D[7]}; */
-    save_context_lower(env, ea);
+    save_context_lower(env, ea, &new_FCX);
 
 
     /* PCXI.PCPN = ICR.CCPN */
@@ -2778,9 +2838,8 @@ void helper_rfe(CPUTriCoreState *env)
 
     /*{new_PCXI, PSW, A[10], A[11], D[8], D[9], D[10], D[11], A[12],
       A[13], A[14], A[15], D[12], D[13], D[14], D[15]} = M(EA, 16 * word); */
-    restore_context_upper(env, ea, &new_PCXI, &new_PSW);
     /* M(EA, word) = FCX;*/
-    cpu_stl_le_data(env, ea, env->FCX);
+    restore_context_upper(env, ea, &new_PCXI, &new_PSW, &env->FCX);
     /* FCX[19: 0] = PCXI[19: 0]; */
     env->FCX = (env->FCX & 0xfff00000) + (env->PCXI & 0x000fffff);
     /* PCXI = new_PCXI; */
@@ -2812,24 +2871,24 @@ void helper_ldlcx(CPUTriCoreState *env, uint32_t ea)
 {
     uint32_t dummy;
     /* insn doesn't load PCXI and RA */
-    restore_context_lower(env, ea, &dummy, &dummy);
+    restore_context_lower(env, ea, &dummy, &dummy, NULL);
 }
 
 void helper_lducx(CPUTriCoreState *env, uint32_t ea)
 {
     uint32_t dummy;
     /* insn doesn't load PCXI and PSW */
-    restore_context_upper(env, ea, &dummy, &dummy);
+    restore_context_upper(env, ea, &dummy, &dummy, NULL);
 }
 
 void helper_stlcx(CPUTriCoreState *env, uint32_t ea)
 {
-    save_context_lower(env, ea);
+    save_context_lower(env, ea, NULL);
 }
 
 void helper_stucx(CPUTriCoreState *env, uint32_t ea)
 {
-    save_context_upper(env, ea);
+    save_context_upper(env, ea, NULL);
 }
 
 void helper_svlcx(CPUTriCoreState *env)
@@ -2848,11 +2907,10 @@ void helper_svlcx(CPUTriCoreState *env)
     ea = ((env->FCX & MASK_FCX_FCXS) << 12) +
          ((env->FCX & MASK_FCX_FCXO) << 6);
     /* new_FCX = M(EA, word); */
-    new_FCX = cpu_ldl_le_data(env, ea);
     /* M(EA, 16 * word) = {PCXI, PSW, A[10], A[11], D[8], D[9], D[10], D[11],
                            A[12], A[13], A[14], A[15], D[12], D[13], D[14],
                            D[15]}; */
-    save_context_lower(env, ea);
+    save_context_lower(env, ea, &new_FCX);
 
     /* PCXI.PCPN = ICR.CCPN; */
     pcxi_set_pcpn(env, icr_get_ccpn(env));
@@ -2891,11 +2949,10 @@ void helper_svucx(CPUTriCoreState *env)
     ea = ((env->FCX & MASK_FCX_FCXS) << 12) +
          ((env->FCX & MASK_FCX_FCXO) << 6);
     /* new_FCX = M(EA, word); */
-    new_FCX = cpu_ldl_le_data(env, ea);
     /* M(EA, 16 * word) = {PCXI, PSW, A[10], A[11], D[8], D[9], D[10], D[11],
                            A[12], A[13], A[14], A[15], D[12], D[13], D[14],
                            D[15]}; */
-    save_context_upper(env, ea);
+    save_context_upper(env, ea, &new_FCX);
 
     /* PCXI.PCPN = ICR.CCPN; */
     pcxi_set_pcpn(env, icr_get_ccpn(env));
@@ -2939,11 +2996,8 @@ void helper_rslcx(CPUTriCoreState *env)
 
     /* {new_PCXI, A[11], A[10], A[11], D[8], D[9], D[10], D[11], A[12],
         A[13], A[14], A[15], D[12], D[13], D[14], D[15]} = M(EA, 16 * word); */
-    restore_context_lower(env, ea, &env->gpr_a[11], &new_PCXI);
     /* M(EA, word) = FCX; */
-    cpu_stl_le_data(env, ea, env->FCX);
-    /* M(EA, word) = FCX; */
-    cpu_stl_le_data(env, ea, env->FCX);
+    restore_context_lower(env, ea, &env->gpr_a[11], &new_PCXI, &env->FCX);
     /* FCX[19: 0] = PCXI[19: 0]; */
     env->FCX = (env->FCX & 0xfff00000) + (env->PCXI & 0x000fffff);
     /* PCXI = new_PCXI; */
