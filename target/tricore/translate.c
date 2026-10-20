@@ -3422,6 +3422,7 @@ static void decode_sc_opc(DisasContext *ctx, int op1)
     case OPC1_16_SC_BISR:
         if (ctx->priv == TRICORE_PRIV_SM) {
             gen_helper_1arg(bisr, const16 & 0xff);
+            ctx->base.is_jmp = DISAS_EXIT_UPDATE;
         } else {
             generate_trap(ctx, TRAPC_PROT, TIN1_PRIV);
         }
@@ -5352,6 +5353,7 @@ static void decode_rc_serviceroutine(DisasContext *ctx)
     case OPC2_32_RC_BISR:
         if (ctx->priv == TRICORE_PRIV_SM) {
             gen_helper_1arg(bisr, const9);
+            ctx->base.is_jmp = DISAS_EXIT_UPDATE;
         } else {
             generate_trap(ctx, TRAPC_PROT, TIN1_PRIV);
         }

@@ -25,6 +25,8 @@
 #include "cpu.h"
 #include "exec/translation-block.h"
 #include "qemu/error-report.h"
+#include "qemu/main-loop.h"
+#include "qemu/aio.h"
 #include "tcg/debug-assert.h"
 #include "accel/tcg/cpu-ops.h"
 
@@ -106,21 +108,36 @@ static bool tricore_cpu_has_work(CPUState *cs)
     return qatomic_read(&env->pending_irq_prio) != 0;
 }
 
+static void tricore_cpu_kick_bh(void *opaque)
+{
+    qemu_cpu_kick(opaque);
+}
+
 void tricore_cpu_set_pending_irq(TriCoreCPU *cpu, uint32_t prio)
 {
     CPUState *cs = CPU(cpu);
     CPUTriCoreState *env = &cpu->env;
+    uint32_t old = qatomic_xchg(&env->pending_irq_prio, prio);
 
     /*
-     * Called from the interrupt router (another thread under MTTCG): only
-     * publish the priority.  ICR belongs to the vCPU thread (enable, disable,
-     * RFE write it without the BQL), so ICR.PIPN is synced there.
+     * Called from the interrupt router, possibly without the BQL: only
+     * publish the priority (ICR.PIPN is synced on the vCPU thread).
+     * CPU_INTERRUPT_HARD stays set and tricore_cpu_exec_interrupt_ready
+     * decides from the priority, so only a higher one must reach a
+     * running vCPU.  TBs that enable interrupts end with an exit, so a
+     * masked request is taken once it becomes deliverable.
      */
-    qatomic_set(&env->pending_irq_prio, prio);
-    if (prio != 0) {
-        cpu_interrupt(cs, CPU_INTERRUPT_HARD);
-    } else {
-        cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+    if (prio > old) {
+        qatomic_or(&cs->interrupt_request, CPU_INTERRUPT_HARD);
+        qatomic_set(&cs->neg.icount_decr.u16.high, -1);
+    }
+    if (prio != 0 && !qemu_cpu_is_self(cs) && qatomic_read(&cs->halted)) {
+        qemu_cpu_kick(cs);
+        if (!bql_locked()) {
+            /* the vCPU may be between its idle check and its wait */
+            aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                                    tricore_cpu_kick_bh, cs);
+        }
     }
 }
 
@@ -235,6 +252,15 @@ static const Property tricore_cpu_properties[] = {
     DEFINE_PROP_BOOL("csa-cache", TriCoreCPU, csa_cache, false),
 };
 
+static bool tricore_cpu_exec_interrupt_ready(CPUState *cs)
+{
+    CPUTriCoreState *env = cpu_env(cs);
+    uint32_t prio = qatomic_read(&env->pending_irq_prio);
+
+    env->ICR = deposit32(env->ICR, R_ICR_PIPN_SHIFT, R_ICR_PIPN_LENGTH, prio);
+    return !env->boot_halted && tricore_cpu_irq_deliverable(env, prio);
+}
+
 static bool tricore_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 {
     CPUTriCoreState *env = cpu_env(cs);
@@ -269,6 +295,7 @@ static const TCGCPUOps tricore_tcg_ops = {
     .tlb_fill = tricore_cpu_tlb_fill,
     .pointer_wrap = cpu_pointer_wrap_uint32,
     .cpu_exec_interrupt = tricore_cpu_exec_interrupt,
+    .cpu_exec_interrupt_ready = tricore_cpu_exec_interrupt_ready,
     .cpu_exec_halt = tricore_cpu_has_work,
     .cpu_exec_reset = cpu_reset,
 };
