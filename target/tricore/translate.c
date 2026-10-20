@@ -3809,7 +3809,15 @@ static void decode_16Bit_opc(DisasContext *ctx)
         break;
     case OPC1_16_SR_JI:
         r1 = MASK_OP_SR_S1D(ctx->opcode);
-        gen_compute_branch(ctx, op1, r1, 0, 0, 0);
+        if (MASK_OP_SR_OP2(ctx->opcode) == 1 &&
+            has_feature(ctx, TRICORE_FEATURE_18)) {
+            /* TC1.8 16-bit CALLI A[a] shares op1 0xDC with JI (op2 = 1) */
+            gen_helper_1arg(call, ctx->base.pc_next + 2);
+            tcg_gen_andi_tl(cpu_PC, cpu_gpr_a[r1], ~0x1);
+            ctx->base.is_jmp = DISAS_EXIT;
+        } else {
+            gen_compute_branch(ctx, op1, r1, 0, 0, 0);
+        }
         break;
     case OPC1_16_SR_NOT:
         r1 = MASK_OP_SR_S1D(ctx->opcode);
@@ -4257,6 +4265,50 @@ static void decode_bit_sh_logic2(DisasContext *ctx)
 /* BO-format */
 
 
+/* TriCore 1.8 LD.DD / ST.DD: quad-word to/from Q[a] = D[a..a+3] */
+static void gen_quad_access(DisasContext *ctx, int r1, TCGv base, bool store)
+{
+    TCGv ea = tcg_temp_new();
+
+    for (int i = 0; i < 4; i++) {
+        tcg_gen_addi_tl(ea, base, 4 * i);
+        if (store) {
+            tcg_gen_qemu_st_tl(cpu_gpr_d[r1 + i], ea, ctx->mem_idx, MO_LEUL);
+        } else {
+            tcg_gen_qemu_ld_tl(cpu_gpr_d[r1 + i], ea, ctx->mem_idx, MO_LEUL);
+        }
+    }
+}
+
+static bool decode_bo_quad(DisasContext *ctx, uint32_t op2, int r1, int r2,
+                           int32_t off10, bool store)
+{
+    TCGv temp;
+
+    if (!has_feature(ctx, TRICORE_FEATURE_18) || (r1 & 3) != 0) {
+        return false;
+    }
+    switch (op2) {
+    case 0x09: /* post-increment */
+        gen_quad_access(ctx, r1, cpu_gpr_a[r2], store);
+        tcg_gen_addi_tl(cpu_gpr_a[r2], cpu_gpr_a[r2], off10);
+        return true;
+    case 0x19: /* pre-increment */
+        temp = tcg_temp_new();
+        tcg_gen_addi_tl(temp, cpu_gpr_a[r2], off10);
+        gen_quad_access(ctx, r1, temp, store);
+        tcg_gen_mov_tl(cpu_gpr_a[r2], temp);
+        return true;
+    case 0x29: /* base + short offset */
+        temp = tcg_temp_new();
+        tcg_gen_addi_tl(temp, cpu_gpr_a[r2], off10);
+        gen_quad_access(ctx, r1, temp, store);
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void decode_bo_addrmode_post_pre_base(DisasContext *ctx)
 {
     uint32_t op2;
@@ -4268,6 +4320,10 @@ static void decode_bo_addrmode_post_pre_base(DisasContext *ctx)
     r2  = MASK_OP_BO_S2(ctx->opcode);
     off10 = MASK_OP_BO_OFF10_SEXT(ctx->opcode);
     op2 = MASK_OP_BO_OP2(ctx->opcode);
+
+    if (decode_bo_quad(ctx, op2, r1, r2, off10, true)) {
+        return;
+    }
 
     switch (op2) {
     case OPC2_32_BO_CACHEA_WI_SHORTOFF:
@@ -4531,6 +4587,10 @@ static void decode_bo_addrmode_ld_post_pre_base(DisasContext *ctx)
     r2  = MASK_OP_BO_S2(ctx->opcode);
     off10 = MASK_OP_BO_OFF10_SEXT(ctx->opcode);
     op2 = MASK_OP_BO_OP2(ctx->opcode);
+
+    if (decode_bo_quad(ctx, op2, r1, r2, off10, false)) {
+        return;
+    }
 
     switch (op2) {
     case OPC2_32_BO_LD_A_SHORTOFF:
@@ -6136,6 +6196,139 @@ static void decode_rr_idirect(DisasContext *ctx)
     ctx->base.is_jmp = DISAS_JUMP;
 }
 
+/* TriCore 1.8: RR ops with n == 2 (DFPU, 64-bit divide) and new n == 1 ops */
+static TCGv_i64 gen_epair(DisasContext *ctx, int r)
+{
+    TCGv_i64 t = tcg_temp_new_i64();
+
+    /* an odd register traps; the indices stay in range regardless */
+    CHECK_REG_PAIR(r);
+    tcg_gen_concat_i32_i64(t, cpu_gpr_d[r & ~1], cpu_gpr_d[r | 1]);
+    return t;
+}
+
+static void gen_set_epair(DisasContext *ctx, int r, TCGv_i64 v)
+{
+    CHECK_REG_PAIR(r);
+    tcg_gen_extr_i64_i32(cpu_gpr_d[r & ~1], cpu_gpr_d[r | 1], v);
+}
+
+static bool decode_rr_tc18(DisasContext *ctx, uint32_t op2, int r1, int r2,
+                           int r3)
+{
+    uint32_t n = extract32(ctx->opcode, 16, 2);
+    TCGv_i64 res = tcg_temp_new_i64();
+
+    if (n == 1) {
+        switch (op2) {
+        case 0x30: /* ABS.F */
+            tcg_gen_andi_tl(cpu_gpr_d[r3], cpu_gpr_d[r1], 0x7fffffff);
+            return true;
+        case 0x31: /* NEG.F */
+            tcg_gen_xori_tl(cpu_gpr_d[r3], cpu_gpr_d[r1], 0x80000000);
+            return true;
+        case 0x32: /* MAX.F */
+            gen_helper_fmax(cpu_gpr_d[r3], tcg_env, cpu_gpr_d[r1],
+                            cpu_gpr_d[r2]);
+            return true;
+        case 0x33: /* MIN.F */
+            gen_helper_fmin(cpu_gpr_d[r3], tcg_env, cpu_gpr_d[r1],
+                            cpu_gpr_d[r2]);
+            return true;
+        case 0x37: /* FTOIN */
+            gen_helper_ftoin(cpu_gpr_d[r3], tcg_env, cpu_gpr_d[r1]);
+            return true;
+        default:
+            return false;
+        }
+    }
+    if (n != 2) {
+        return false;
+    }
+
+    switch (op2) {
+    case 0x00: /* CMP.DF */
+        gen_helper_dfcmp(cpu_gpr_d[r3], tcg_env, gen_epair(ctx, r1),
+                         gen_epair(ctx, r2));
+        return true;
+    case 0x04: /* MUL.DF */
+        gen_helper_dfmul(res, tcg_env, gen_epair(ctx, r1), gen_epair(ctx, r2));
+        break;
+    case 0x05: /* DIV.DF */
+        gen_helper_dfdiv(res, tcg_env, gen_epair(ctx, r1), gen_epair(ctx, r2));
+        break;
+    case 0x10: /* DFTOI */
+        gen_helper_dftoi(cpu_gpr_d[r3], tcg_env, gen_epair(ctx, r1));
+        return true;
+    case 0x12: /* DFTOU */
+        gen_helper_dftou(cpu_gpr_d[r3], tcg_env, gen_epair(ctx, r1));
+        return true;
+    case 0x13: /* DFTOIZ */
+        gen_helper_dftoiz(cpu_gpr_d[r3], tcg_env, gen_epair(ctx, r1));
+        return true;
+    case 0x14: /* ITODF */
+        gen_helper_itodf(res, tcg_env, cpu_gpr_d[r1]);
+        break;
+    case 0x16: /* UTODF */
+        gen_helper_utodf(res, tcg_env, cpu_gpr_d[r1]);
+        break;
+    case 0x17: /* DFTOUZ */
+        gen_helper_dftouz(cpu_gpr_d[r3], tcg_env, gen_epair(ctx, r1));
+        return true;
+    case 0x1a: /* DFTOL */
+        gen_helper_dftol(res, tcg_env, gen_epair(ctx, r1));
+        break;
+    case 0x1b: /* DFTOLZ */
+        gen_helper_dftolz(res, tcg_env, gen_epair(ctx, r1));
+        break;
+    case 0x1e: /* DFTOUL */
+        gen_helper_dftoul(res, tcg_env, gen_epair(ctx, r1));
+        break;
+    case 0x1f: /* DFTOULZ */
+        gen_helper_dftoulz(res, tcg_env, gen_epair(ctx, r1));
+        break;
+    case 0x20: /* DIV64 */
+        gen_helper_div64(res, tcg_env, gen_epair(ctx, r1), gen_epair(ctx, r2));
+        break;
+    case 0x21: /* DIV64.U */
+        gen_helper_div64_u(res, tcg_env, gen_epair(ctx, r1), gen_epair(ctx,
+                           r2));
+        break;
+    case 0x26: /* LTODF */
+        gen_helper_ltodf(res, tcg_env, gen_epair(ctx, r1));
+        break;
+    case 0x27: /* ULTODF */
+        gen_helper_ultodf(res, tcg_env, gen_epair(ctx, r1));
+        break;
+    case 0x28: /* DFTOF */
+        gen_helper_dftof(cpu_gpr_d[r3], tcg_env, gen_epair(ctx, r1));
+        return true;
+    case 0x29: /* FTODF */
+        gen_helper_ftodf(res, tcg_env, cpu_gpr_d[r1]);
+        break;
+    case 0x30: /* ABS.DF */
+        tcg_gen_andi_i64(res, gen_epair(ctx, r1), INT64_MAX);
+        break;
+    case 0x31: /* NEG.DF */
+        tcg_gen_xori_i64(res, gen_epair(ctx, r1), INT64_MIN);
+        break;
+    case 0x34: /* REM64 */
+        gen_helper_rem64(res, tcg_env, gen_epair(ctx, r1), gen_epair(ctx, r2));
+        break;
+    case 0x35: /* REM64.U */
+        gen_helper_rem64_u(res, tcg_env, gen_epair(ctx, r1), gen_epair(ctx,
+                           r2));
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "tc1.8 RR n=2 op2=0x%02x unimplemented at "
+                      "0x%08" VADDR_PRIx "\n", op2, ctx->base.pc_next);
+        generate_trap(ctx, TRAPC_INSN_ERR, TIN2_IOPC);
+        return true;
+    }
+    gen_set_epair(ctx, r3, res);
+    return true;
+}
+
 static void decode_rr_divide(DisasContext *ctx)
 {
     uint32_t op2;
@@ -6147,6 +6340,11 @@ static void decode_rr_divide(DisasContext *ctx)
     r3 = MASK_OP_RR_D(ctx->opcode);
     r2 = MASK_OP_RR_S2(ctx->opcode);
     r1 = MASK_OP_RR_S1(ctx->opcode);
+
+    if (has_feature(ctx, TRICORE_FEATURE_18) &&
+        decode_rr_tc18(ctx, op2, r1, r2, r3)) {
+        return;
+    }
 
     switch (op2) {
     case OPC2_32_RR_BMERGE:
@@ -6681,6 +6879,37 @@ static void decode_rrr_divide(DisasContext *ctx)
     r2 = MASK_OP_RRR_S2(ctx->opcode);
     r3 = MASK_OP_RRR_S3(ctx->opcode);
     r4 = MASK_OP_RRR_D(ctx->opcode);
+
+    if (extract32(ctx->opcode, 16, 2) == 2 &&
+        has_feature(ctx, TRICORE_FEATURE_18)) {
+        TCGv_i64 res = tcg_temp_new_i64();
+
+        switch (op2) {
+        case OPC2_32_RRR_ADD_F: /* ADD.DF: E[c] = E[d] + E[a] */
+            gen_helper_dfadd(res, tcg_env, gen_epair(ctx, r3), gen_epair(ctx,
+                             r1));
+            break;
+        case OPC2_32_RRR_SUB_F: /* SUB.DF: E[c] = E[d] - E[a] */
+            gen_helper_dfsub(res, tcg_env, gen_epair(ctx, r3), gen_epair(ctx,
+                             r1));
+            break;
+        case OPC2_32_RRR_MADD_F: /* MADD.DF: E[c] = E[d] + E[a] * E[b] */
+            gen_helper_dfmadd(res, tcg_env, gen_epair(ctx, r1),
+                              gen_epair(ctx, r2), gen_epair(ctx, r3));
+            break;
+        case OPC2_32_RRR_MSUB_F: /* MSUB.DF: E[c] = E[d] - E[a] * E[b] */
+            gen_helper_dfmsub(res, tcg_env, gen_epair(ctx, r1),
+                              gen_epair(ctx, r2), gen_epair(ctx, r3));
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP, "tc1.8 RRR n=2 op2=0x%x unimplemented\n",
+                          op2);
+            generate_trap(ctx, TRAPC_INSN_ERR, TIN2_IOPC);
+            return;
+        }
+        gen_set_epair(ctx, r4, res);
+        return;
+    }
 
     switch (op2) {
     case OPC2_32_RRR_DVADJ:
@@ -8001,6 +8230,13 @@ static void decode_sys_interrupts(DisasContext *ctx)
     case OPC2_32_SYS_FRET:
         gen_fret(ctx);
         break;
+    case OPC2_32_SYS_RFH:
+        if (!has_feature(ctx, TRICORE_FEATURE_18)) {
+            generate_trap(ctx, TRAPC_INSN_ERR, TIN2_IOPC);
+            break;
+        }
+        /* No hypervisor modelled: RFH behaves like RFE */
+        /* fall through */
     case OPC2_32_SYS_RFE:
         gen_helper_rfe(tcg_env);
         ctx->base.is_jmp = DISAS_EXIT;

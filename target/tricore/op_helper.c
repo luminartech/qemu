@@ -2911,3 +2911,64 @@ uint32_t helper_psw_read(CPUTriCoreState *env)
 {
     return psw_read(env);
 }
+
+/*
+ * TriCore 1.8 64-bit integer divide / remainder: TC1.8 architecture manual
+ * volume 2, DIV64, DIV64.U, REM64 and REM64.U (results and PSW.V/SV/AV)
+ */
+static void div64_flags(CPUTriCoreState *env, bool overflow)
+{
+    env->PSW_USB_V = overflow ? (1u << 31) : 0;
+    env->PSW_USB_SV |= env->PSW_USB_V;
+    env->PSW_USB_AV = 0;
+}
+
+uint64_t helper_div64(CPUTriCoreState *env, uint64_t a, uint64_t b)
+{
+    int64_t dividend = a;
+    int64_t divisor = b;
+
+    if (divisor == 0) {
+        div64_flags(env, true);
+        return dividend >= 0 ? INT64_MAX : INT64_MIN;
+    }
+    if (divisor == -1 && dividend == INT64_MIN) {
+        div64_flags(env, true);
+        return INT64_MAX;
+    }
+    div64_flags(env, false);
+    return dividend / divisor;
+}
+
+uint64_t helper_div64_u(CPUTriCoreState *env, uint64_t a, uint64_t b)
+{
+    if (b == 0) {
+        div64_flags(env, true);
+        return UINT64_MAX;
+    }
+    div64_flags(env, false);
+    return a / b;
+}
+
+uint64_t helper_rem64(CPUTriCoreState *env, uint64_t a, uint64_t b)
+{
+    int64_t dividend = a;
+    int64_t divisor = b;
+
+    if (divisor == 0 || (divisor == -1 && dividend == INT64_MIN)) {
+        div64_flags(env, true);
+        return 0;
+    }
+    div64_flags(env, false);
+    return dividend % divisor;
+}
+
+uint64_t helper_rem64_u(CPUTriCoreState *env, uint64_t a, uint64_t b)
+{
+    if (b == 0) {
+        div64_flags(env, true);
+        return 0;
+    }
+    div64_flags(env, false);
+    return a % b;
+}

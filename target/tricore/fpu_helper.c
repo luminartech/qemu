@@ -580,3 +580,216 @@ void helper_updfl(CPUTriCoreState *env, uint32_t arg)
 
     fpu_set_state(env);
 }
+
+/*
+ * TriCore 1.8 double-precision FPU (DFPU) and new single-precision ops.
+ * Operands are 64-bit register pairs E[x] = {D[x+1], D[x]}.  Semantics and
+ * status flags: TriCore TC1.8 architecture manual, volume 2 (V1.0.0),
+ * sections 3.2 (FPU) and 3.3 (DFPU).
+ */
+#define DP_QUIET_NAN    0x7ff8000000000000ULL
+#define DP_INVALID_NAN  0x7ff8000000000001ULL
+
+static void df_finish_flags(CPUTriCoreState *env)
+{
+    uint32_t flags = f_get_excp_flags(env);
+
+    if (flags) {
+        f_update_psw_flags(env, flags);
+    } else {
+        env->FPU_FS = 0;
+    }
+}
+
+static uint64_t df_arith_result(CPUTriCoreState *env, float64 a, float64 b,
+                                float64 result)
+{
+    uint32_t flags = f_get_excp_flags(env);
+
+    if (float64_is_any_nan(a) || float64_is_any_nan(b)) {
+        result = make_float64(DP_QUIET_NAN);
+    } else if (flags & float_flag_invalid) {
+        result = make_float64(DP_INVALID_NAN);
+    }
+    if (flags) {
+        f_update_psw_flags(env, flags);
+    } else {
+        env->FPU_FS = 0;
+    }
+    return float64_val(result);
+}
+
+uint64_t helper_dfadd(CPUTriCoreState *env, uint64_t a, uint64_t b)
+{
+    return df_arith_result(env, a, b, float64_add(a, b, &env->fp_status));
+}
+
+uint64_t helper_dfsub(CPUTriCoreState *env, uint64_t a, uint64_t b)
+{
+    return df_arith_result(env, a, b, float64_sub(a, b, &env->fp_status));
+}
+
+uint64_t helper_dfmul(CPUTriCoreState *env, uint64_t a, uint64_t b)
+{
+    return df_arith_result(env, a, b, float64_mul(a, b, &env->fp_status));
+}
+
+/* MADD.DF / MSUB.DF: E[d] +/- E[a] * E[b], fused (one rounding) */
+static uint64_t df_muladd(CPUTriCoreState *env, uint64_t a, uint64_t b,
+                          uint64_t d, int flags)
+{
+    float64 r = float64_muladd(a, b, d, flags, &env->fp_status);
+
+    if (float64_is_any_nan(d)) {
+        r = make_float64(DP_QUIET_NAN);
+    }
+    return df_arith_result(env, a, b, r);
+}
+
+uint64_t helper_dfmadd(CPUTriCoreState *env, uint64_t a, uint64_t b,
+                       uint64_t d)
+{
+    return df_muladd(env, a, b, d, 0);
+}
+
+uint64_t helper_dfmsub(CPUTriCoreState *env, uint64_t a, uint64_t b,
+                       uint64_t d)
+{
+    return df_muladd(env, a, b, d, float_muladd_negate_product);
+}
+
+uint64_t helper_dfdiv(CPUTriCoreState *env, uint64_t a, uint64_t b)
+{
+    return df_arith_result(env, a, b, float64_div(a, b, &env->fp_status));
+}
+
+uint32_t helper_dfcmp(CPUTriCoreState *env, uint64_t a, uint64_t b)
+{
+    FloatRelation rel = float64_compare_quiet(a, b, &env->fp_status);
+    uint32_t result = 0;
+
+    switch (rel) {
+    case float_relation_less:
+        result = 1 << 0;
+        break;
+    case float_relation_equal:
+        result = 1 << 1;
+        break;
+    case float_relation_greater:
+        result = 1 << 2;
+        break;
+    case float_relation_unordered:
+        result = 1 << 3;
+        break;
+    }
+    result |= float64_is_zero_or_denormal(a) && !float64_is_zero(a) ?
+              1 << 4 : 0;
+    result |= float64_is_zero_or_denormal(b) && !float64_is_zero(b) ?
+              1 << 5 : 0;
+    df_finish_flags(env);
+    return result;
+}
+
+#define DF_TO_INT(name, type, conv, mode)                                      \
+type helper_##name(CPUTriCoreState *env, uint64_t a)                           \
+{                                                                              \
+    type result;                                                               \
+                                                                               \
+    if (float64_is_any_nan(a)) {                                               \
+        float_raise(float_flag_invalid, &env->fp_status);                      \
+        result = 0;                                                            \
+    } else {                                                                   \
+        result = conv(a, mode, 0, &env->fp_status);                            \
+    }                                                                          \
+    df_finish_flags(env);                                                      \
+    return result;                                                             \
+}
+
+#define RM_PSW  (env->fp_status.float_rounding_mode)
+DF_TO_INT(dftoi, uint32_t, float64_to_int32_scalbn, RM_PSW)
+DF_TO_INT(dftoiz, uint32_t, float64_to_int32_scalbn, float_round_to_zero)
+DF_TO_INT(dftou, uint32_t, float64_to_uint32_scalbn, RM_PSW)
+DF_TO_INT(dftouz, uint32_t, float64_to_uint32_scalbn, float_round_to_zero)
+DF_TO_INT(dftol, uint64_t, float64_to_int64_scalbn, RM_PSW)
+DF_TO_INT(dftolz, uint64_t, float64_to_int64_scalbn, float_round_to_zero)
+DF_TO_INT(dftoul, uint64_t, float64_to_uint64_scalbn, RM_PSW)
+DF_TO_INT(dftoulz, uint64_t, float64_to_uint64_scalbn, float_round_to_zero)
+
+uint64_t helper_itodf(CPUTriCoreState *env, uint32_t a)
+{
+    float64 r = int32_to_float64(a, &env->fp_status);
+
+    df_finish_flags(env);
+    return r;
+}
+
+uint64_t helper_utodf(CPUTriCoreState *env, uint32_t a)
+{
+    float64 r = uint32_to_float64(a, &env->fp_status);
+
+    df_finish_flags(env);
+    return r;
+}
+
+uint64_t helper_ltodf(CPUTriCoreState *env, uint64_t a)
+{
+    float64 r = int64_to_float64(a, &env->fp_status);
+
+    df_finish_flags(env);
+    return r;
+}
+
+uint64_t helper_ultodf(CPUTriCoreState *env, uint64_t a)
+{
+    float64 r = uint64_to_float64(a, &env->fp_status);
+
+    df_finish_flags(env);
+    return r;
+}
+
+uint32_t helper_dftof(CPUTriCoreState *env, uint64_t a)
+{
+    float32 r = float64_to_float32(a, &env->fp_status);
+
+    df_finish_flags(env);
+    return r;
+}
+
+uint64_t helper_ftodf(CPUTriCoreState *env, uint32_t a)
+{
+    float64 r = float32_to_float64(a, &env->fp_status);
+
+    df_finish_flags(env);
+    return r;
+}
+
+uint32_t helper_ftoin(CPUTriCoreState *env, uint32_t a)
+{
+    uint32_t result;
+
+    if (float32_is_any_nan(a)) {
+        float_raise(float_flag_invalid, &env->fp_status);
+        result = 0;
+    } else {
+        result = float32_to_int32_scalbn(a, float_round_nearest_even, 0,
+                                         &env->fp_status);
+    }
+    df_finish_flags(env);
+    return result;
+}
+
+uint32_t helper_fmin(CPUTriCoreState *env, uint32_t a, uint32_t b)
+{
+    float32 r = float32_min(a, b, &env->fp_status);
+
+    df_finish_flags(env);
+    return r;
+}
+
+uint32_t helper_fmax(CPUTriCoreState *env, uint32_t a, uint32_t b)
+{
+    float32 r = float32_max(a, b, &env->fp_status);
+
+    df_finish_flags(env);
+    return r;
+}
