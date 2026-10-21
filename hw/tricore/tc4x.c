@@ -37,6 +37,7 @@
 #include "migration/vmstate.h"
 #include "elf.h"
 #include "cpu.h"
+#include "exec/target_page.h"
 #include "trace.h"
 #include "hw/core/irq.h"
 #include "hw/net/tc4x_geth.h"
@@ -228,7 +229,9 @@
 #define SRC_QSPI_STRIDE     0x14u
 
 /* eGTM TBU channel 0: 27 bits of the STM time base */
-#define EGTM_TBU_CH0        0xF9080108u
+#define EGTM_TBU_PAGE       0xF9080000u
+#define EGTM_TBU_CH0_BASE   0x108u
+#define EGTM_TBU_CH0        (EGTM_TBU_PAGE + EGTM_TBU_CH0_BASE)
 #define EGTM_TBU_MASK       0x07FFFFFFu
 
 /*
@@ -256,6 +259,12 @@
 
 #define TYPE_TC4X_MACHINE MACHINE_TYPE_NAME("tc4x")
 OBJECT_DECLARE_SIMPLE_TYPE(Tc4xSoc, TC4X_MACHINE)
+
+typedef struct Tc4xStmPage {
+    MemoryRegion mr;
+    Tc4xSoc *machine;
+    uint32_t base;
+} Tc4xStmPage;
 
 typedef struct Tc4xTomCounter {
     uint32_t start;     /* CN0 value written by software */
@@ -320,6 +329,8 @@ struct Tc4xSoc {
 
     TriCoreCPU *cpu[TC4X_NUM_CORES];
     MemoryRegion cpu_root[TC4X_NUM_CORES];
+    Tc4xStmPage stm_page[TC4X_NUM_CORES];
+    Tc4xStmPage tbu_page;
     MemoryRegion cpu_sys_alias[TC4X_NUM_CORES];
     MemoryRegion cpu_local_dspr[TC4X_NUM_CORES];
     MemoryRegion cpu_local_pspr[TC4X_NUM_CORES];
@@ -1516,11 +1527,7 @@ static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr)
     } else if (addr == EGTM_TBU_CH0) {
         v = stm_now(s) & EGTM_TBU_MASK;
     } else if (sfr_is_cpu(addr, &core, &off)) {
-        if (off == CPU_STM_ABS) {
-            v = (uint32_t)stm_now(s);
-        } else if (off == CPU_STM_ABS + 4) {
-            v = stm_now(s) >> 32;
-        } else if (off == CPU_HRA_CORE_ID || off == CPU_HRHV_CORE_ID) {
+        if (off == CPU_HRA_CORE_ID || off == CPU_HRHV_CORE_ID) {
             v = core;
         } else if (off == CPU_HRA_BOOTCON) {
             v = (v & ~1u) | (s->cpu[core]->env.boot_halted ? 1 : 0);
@@ -1952,6 +1959,85 @@ static const MemoryRegionOps sfr_f_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+/*
+ * Idle cores poll CPUx_STM_ABS continuously.  Its page is a lockless_io
+ * region of its own (a smaller region would sit behind a subpage container
+ * that takes the BQL); the page's other registers take the usual path.
+ */
+#define CPU_STM_PAGE_SIZE   (1u << TARGET_PAGE_BITS)
+#define CPU_STM_VIEW        0x120u
+
+/*
+ * The CPUx_STM view at +0x120 shows the registers of the VM the CPU runs
+ * in.  Without a hypervisor model that is VM0.
+ */
+static hwaddr cpu_stm_page_offset(hwaddr off)
+{
+    if (off >= CPU_STM_VIEW && off < CPU_STM_VIEW + CPU_STM_VM_STRIDE) {
+        return off - CPU_STM_VIEW + CPU_STM_VM_BASE;
+    }
+    return off;
+}
+
+static uint64_t cpu_stm_page_read(void *opaque, hwaddr off, unsigned size)
+{
+    Tc4xStmPage *pg = opaque;
+
+    if (off >= CPU_STM_ABS && off + size <= CPU_STM_ABS + 8) {
+        return extract64(stm_now(pg->machine), (off - CPU_STM_ABS) * 8,
+                         size * 8);
+    }
+    return sfr_region_read(pg->machine, cpu_stm_page_offset(off), size,
+                           pg->base);
+}
+
+static void cpu_stm_page_write(void *opaque, hwaddr off, uint64_t val,
+                               unsigned size)
+{
+    Tc4xStmPage *pg = opaque;
+
+    sfr_region_write(pg->machine, cpu_stm_page_offset(off), val, size,
+                     pg->base);
+}
+
+static const MemoryRegionOps cpu_stm_page_ops = {
+    .read = cpu_stm_page_read,
+    .write = cpu_stm_page_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/*
+ * Served without the BQL like the STM, so that back-to-back STM and TBU
+ * reads see the same delay.
+ */
+static uint64_t tbu_page_read(void *opaque, hwaddr off, unsigned size)
+{
+    Tc4xStmPage *pg = opaque;
+
+    if (off == EGTM_TBU_CH0_BASE && size == 4) {
+        return stm_now(pg->machine) & EGTM_TBU_MASK;
+    }
+    return sfr_region_read(pg->machine, off, size, pg->base);
+}
+
+static void tbu_page_write(void *opaque, hwaddr off, uint64_t val,
+                           unsigned size)
+{
+    Tc4xStmPage *pg = opaque;
+
+    sfr_region_write(pg->machine, off, val, size, pg->base);
+}
+
+static const MemoryRegionOps tbu_page_ops = {
+    .read = tbu_page_read,
+    .write = tbu_page_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 void tc4x_sim_add_command(Tc4xSoc *s, const char *prefix, Tc4xSimCommandFn fn,
                           void *opaque, bool qspi_lock)
 {
@@ -2277,6 +2363,25 @@ static void tc4x_init(MachineState *ms)
                           0x10000000u);
     memory_region_enable_lockless_io(&s->sfr_f);
     memory_region_add_subregion(sysmem, 0xF0000000u, &s->sfr_f);
+    for (int c = 0; c < TC4X_NUM_CORES; c++) {
+        g_autofree char *name = g_strdup_printf("cpu%d.stm_page", c);
+        Tc4xStmPage *pg = &s->stm_page[c];
+
+        pg->machine = s;
+        pg->base = CPU_SFR_BASE + c * CPU_SFR_STRIDE;
+        memory_region_init_io(&pg->mr, NULL, &cpu_stm_page_ops, pg, name,
+                              CPU_STM_PAGE_SIZE);
+        memory_region_enable_lockless_io(&pg->mr);
+        memory_region_add_subregion_overlap(&s->sfr_f, pg->base - 0xF0000000u,
+                                            &pg->mr, 1);
+    }
+    s->tbu_page.machine = s;
+    s->tbu_page.base = EGTM_TBU_PAGE;
+    memory_region_init_io(&s->tbu_page.mr, NULL, &tbu_page_ops, &s->tbu_page,
+                          "egtm.tbu_page", CPU_STM_PAGE_SIZE);
+    memory_region_enable_lockless_io(&s->tbu_page.mr);
+    memory_region_add_subregion_overlap(&s->sfr_f, EGTM_TBU_PAGE - 0xF0000000u,
+                                        &s->tbu_page.mr, 1);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         Object *cpuobj = object_new(ms->cpu_type);
