@@ -4,6 +4,7 @@
  * TC4x GETH0 is based on the Synopsys DWC Ethernet QoS core and has two MAC
  * ports.  No PHY is attached by default, so MDIO reads of a port return all
  * ones; board code attaches PHYs with tc4x_geth_attach_phy().
+ * The PTP system time stamps frames in TX status and RX context descriptors.
  *
  * Sources, all public: the GETH registers of the iLLD SFR headers and the
  * iLLD Ethernet driver (IfxGeth) bundled with the TC4D7 projects of
@@ -77,6 +78,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(Tc4xGethState, TC4X_GETH)
 #define MMC_RX_BROADCAST      0x918u
 #define MMC_RX_MULTICAST      0x920u
 #define MMC_RX_UNICAST        0x970u
+#define MAC_TIMESTAMP_CONTROL 0xD00u
+#define MAC_SYSTIME_SEC       0xD08u
+#define MAC_SYSTIME_NSEC      0xD0Cu
+#define MAC_SYSTIME_SEC_UPD   0xD10u
+#define MAC_SYSTIME_NSEC_UPD  0xD14u
+#define MAC_SYSTIME_HI_SEC    0xD1Cu
+#define MAC_TIMESTAMP_STATUS  0xD20u
+#define MAC_TXTS_NSEC         0xD30u
+#define MAC_TXTS_SEC          0xD34u
+#define MAC_TXTS_PKTID        0xD38u
 #define MTL_RXQ_DMA_MAP0      0x1030u
 #define MTL_RXQ_DMA_MAP1      0x1034u
 #define MTL_TCQ_BASE          0x1100u
@@ -95,6 +106,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(Tc4xGethState, TC4X_GETH)
 #define MDIO_CMD_WRITE        1u
 #define MDIO_CMD_READ         3u
 #define MDIO_CMD_POSTINC_READ 2u
+#define TS_TSENA              BIT(0)
+#define TS_TSINIT             BIT(2)
+#define TS_TSUPDT             BIT(3)
+#define TS_TSADDREG           BIT(5)
+#define TS_TSENALL            BIT(8)
+#define TS_STATUS_TTSNS_SHIFT 10
+#define TS_STATUS_TXTSC       BIT(15)
+#define MAC_INT_TSIS          BIT(12)
+#define NSEC_UPD_ADDSUB       BIT(31)
 
 #define BRIDGE_PORT_CONTROL(p) (0x1E00Cu + (p) * 0xCu)
 #define BRIDGE_TXQ_MAP(p)      (0x1E010u + (p) * 0xCu)
@@ -146,10 +166,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(Tc4xGethState, TC4X_GETH)
 #define TDES2_IOC             BIT(31)
 #define TDES3_CIC(v)          extract32(v, 16, 2)
 #define RDES3_IOC             BIT(30)
+#define TDES2_TTSE            BIT(30)
+#define TDES3_PIDV            BIT(25)
+#define TDES3_TTSS            BIT(17)
+#define RDES3_RS1V            BIT(26)
+#define RDES1_TSA             BIT(14)
+/* TSA as it appears in RDES3 of the RX context descriptor */
+#define RDES3_CTX_TSA         BIT(4)
 
 #define MAX_FRAME             16384
 #define MIN_FRAME             60
 #define VLAN_HLEN             4
+#define TXTS_FIFO_DEPTH       16
+
+typedef struct Tc4xGethTxTs {
+    uint32_t pktid, nsec, sec;
+} Tc4xGethTxTs;
 
 typedef struct Tc4xGethPort {
     struct Tc4xGethState *s;
@@ -159,10 +191,15 @@ typedef struct Tc4xGethPort {
     uint8_t phy_addr;
     const Tc4xGethPhyOps *phy;  /* NULL: nothing answers on MDIO */
     void *phy_opaque;
+    int64_t ptp_offset_ns;
+    Tc4xGethTxTs txts[TXTS_FIFO_DEPTH];
+    unsigned txts_count;
 } Tc4xGethPort;
 
 typedef struct Tc4xGethDma {
     uint32_t tx_cur, rx_cur;
+    uint32_t tx_pktid;          /* packet id from the last TX context desc */
+    bool tx_pktid_valid;
     uint8_t txbuf[MAX_FRAME];
     unsigned txlen;
 } Tc4xGethDma;
@@ -254,6 +291,75 @@ static void ch_status(Tc4xGethState *s, int ch, uint32_t bits)
     }
     chset(s, ch, CH_STATUS, st);
     geth_update_irq(s);
+}
+
+static int64_t ptp_now(Tc4xGethPort *port)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + port->ptp_offset_ns;
+}
+
+static void ptp_split(int64_t t, uint32_t *sec, uint32_t *nsec)
+{
+    if (t < 0) {
+        t = 0;
+    }
+    *sec = t / NANOSECONDS_PER_SECOND;
+    *nsec = t % NANOSECONDS_PER_SECOND;
+}
+
+static void ptp_control_write(Tc4xGethState *s, int p, uint32_t val)
+{
+    Tc4xGethPort *port = &s->port[p];
+    int64_t upd = (int64_t)preg(s, p, MAC_SYSTIME_SEC_UPD) *
+                  NANOSECONDS_PER_SECOND +
+                  (preg(s, p, MAC_SYSTIME_NSEC_UPD) & ~NSEC_UPD_ADDSUB);
+
+    if (val & TS_TSINIT) {
+        port->ptp_offset_ns = upd - qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    } else if (val & TS_TSUPDT) {
+        port->ptp_offset_ns += (preg(s, p, MAC_SYSTIME_NSEC_UPD) &
+                                NSEC_UPD_ADDSUB) ? -upd : upd;
+    }
+    /* TSINIT, TSUPDT, TSADDREG complete immediately */
+    sreg(s, PORT_BASE(p) + MAC_TIMESTAMP_CONTROL,
+         val & ~(TS_TSINIT | TS_TSUPDT | TS_TSADDREG));
+}
+
+static void txts_push(Tc4xGethState *s, int p, uint32_t pktid,
+                      uint32_t sec, uint32_t nsec)
+{
+    Tc4xGethPort *port = &s->port[p];
+
+    if (port->txts_count == TXTS_FIFO_DEPTH) {
+        return;
+    }
+    port->txts[port->txts_count] = (Tc4xGethTxTs){ pktid, nsec, sec };
+    qatomic_set(&port->txts_count, port->txts_count + 1);
+    sreg(s, PORT_BASE(p) + MAC_INTERRUPT_STATUS,
+         preg(s, p, MAC_INTERRUPT_STATUS) | MAC_INT_TSIS);
+    geth_update_irq(s);
+}
+
+static uint32_t txts_read(Tc4xGethState *s, int p, uint32_t reg)
+{
+    Tc4xGethPort *port = &s->port[p];
+    Tc4xGethTxTs head;
+
+    if (port->txts_count == 0) {
+        return 0;
+    }
+    head = port->txts[0];
+    if (reg == MAC_TXTS_PKTID) {
+        return head.pktid;
+    }
+    if (reg == MAC_TXTS_NSEC) {
+        return head.nsec;
+    }
+    /* reading the seconds word completes the FIFO entry */
+    memmove(&port->txts[0], &port->txts[1],
+            (port->txts_count - 1) * sizeof(port->txts[0]));
+    qatomic_set(&port->txts_count, port->txts_count - 1);
+    return head.sec;
 }
 
 static void mdio_command(Tc4xGethState *s, int p, uint32_t ctrl)
@@ -416,6 +522,8 @@ static void tx_process(Tc4xGethState *s, int ch)
             break;
         }
         if (d[3] & DES3_CTXT) {
+            dma->tx_pktid_valid = d[3] & TDES3_PIDV;
+            dma->tx_pktid = d[0] & 0x3FF;
             d[3] = DES3_CTXT;
             desc_store(dma->tx_cur, d);
         } else {
@@ -440,6 +548,18 @@ static void tx_process(Tc4xGethState *s, int ch)
                 if (cic) {
                     tx_checksum(dma->txbuf, dma->txlen, cic);
                 }
+                if (d[2] & TDES2_TTSE) {
+                    uint32_t sec, nsec;
+
+                    ptp_split(ptp_now(&s->port[p]), &sec, &nsec);
+                    if (dma->tx_pktid_valid) {
+                        txts_push(s, p, dma->tx_pktid | (ch << 5), sec, nsec);
+                    }
+                    d[0] = nsec;
+                    d[1] = sec;
+                    d[3] |= TDES3_TTSS;
+                }
+                dma->tx_pktid_valid = false;
                 port_send(s, p, dma->txbuf, dma->txlen);
                 dma->txlen = 0;
             }
@@ -512,6 +632,8 @@ static bool rx_deliver(Tc4xGethState *s, int p, int ch, const uint8_t *buf,
 {
     Tc4xGethDma *dma = &s->dma[ch];
     uint32_t bufsz = CH_RX_RBSZ(chreg(s, ch, CH_RX_CONTROL)) & ~3u;
+    uint32_t tsctl = preg(s, p, MAC_TIMESTAMP_CONTROL);
+    bool ts = (tsctl & TS_TSENA) && (tsctl & TS_TSENALL);
     unsigned need, off = 0;
     uint32_t cur, d[4], status = 0;
 
@@ -520,7 +642,7 @@ static bool rx_deliver(Tc4xGethState *s, int p, int ch, const uint8_t *buf,
         return true;                    /* DMA stopped: frame is lost */
     }
     /* All descriptors of the frame must be available before writing any */
-    need = DIV_ROUND_UP(len, bufsz);
+    need = DIV_ROUND_UP(len, bufsz) + (ts ? 1 : 0);
     cur = dma->rx_cur;
     for (unsigned i = 0; i < need; i++) {
         desc_load(cur, d);
@@ -545,13 +667,27 @@ static bool rx_deliver(Tc4xGethState *s, int p, int ch, const uint8_t *buf,
         off += chunk;
         if (off == len) {
             wb3 |= DES3_LD | (len & 0x7FFF);
+            if (ts) {
+                wb3 |= RDES3_RS1V;
+            }
         } else {
             wb3 |= chunk & 0x7FFF;
         }
         d[0] = 0;
-        d[1] = 0;
+        d[1] = (off == len && ts) ? RDES1_TSA : 0;
         d[2] = 0;
         d[3] = wb3;
+        desc_store(dma->rx_cur, d);
+        dma->rx_cur = desc_next(s, ch, dma->rx_cur, false);
+    }
+    if (ts) {
+        uint32_t sec, nsec;
+
+        ptp_split(ptp_now(&s->port[p]), &sec, &nsec);
+        d[0] = nsec;
+        d[1] = sec;
+        d[2] = 0;
+        d[3] = DES3_CTXT | RDES3_CTX_TSA;
         desc_store(dma->rx_cur, d);
         dma->rx_cur = desc_next(s, ch, dma->rx_cur, false);
     }
@@ -625,10 +761,12 @@ static void geth_core_reset(Tc4xGethState *s)
         sreg(s, base + MAC_HW_FEATURE2, 0x07070707u);
         sreg(s, base + MAC_ADDRESS_HIGH(0), 0x8000FFFFu);
         sreg(s, base + MAC_ADDRESS_LOW(0), 0xFFFFFFFFu);
+        qatomic_set(&s->port[p].txts_count, 0);
     }
     for (int ch = 0; ch < TC4X_GETH_NUM_DMA; ch++) {
         s->dma[ch].tx_cur = s->dma[ch].rx_cur = 0;
         s->dma[ch].txlen = 0;
+        s->dma[ch].tx_pktid_valid = false;
     }
     geth_update_irq(s);
 }
@@ -645,8 +783,18 @@ static void geth_reset_hold(Object *obj, ResetType type)
         if (port->phy && port->phy->reset) {
             port->phy->reset(port->phy_opaque);
         }
+        port->ptp_offset_ns = 0;
     }
     geth_core_reset(s);
+}
+
+/* TX timestamp FIFO fill level */
+static uint32_t timestamp_status(Tc4xGethState *s, int p)
+{
+    unsigned count = qatomic_read(&s->port[p].txts_count);
+
+    return deposit32(preg(s, p, MAC_TIMESTAMP_STATUS), TS_STATUS_TTSNS_SHIFT,
+                     5, count) | (count ? TS_STATUS_TXTSC : 0);
 }
 
 static uint32_t geth_read_word(Tc4xGethState *s, uint32_t off)
@@ -655,6 +803,32 @@ static uint32_t geth_read_word(Tc4xGethState *s, uint32_t off)
 
     if (off == R_CLC) {
         return (v & ~CLC_DISS) | ((v & CLC_DISR) ? CLC_DISS : 0);
+    }
+    if (off >= PORT_BASE(0) && off < PORT_BASE(TC4X_GETH_NUM_PORTS)) {
+        int p = PORT_OF(off);
+        uint32_t r = off - PORT_BASE(p);
+        uint32_t sec, nsec;
+
+        switch (r) {
+        case MAC_SYSTIME_SEC:
+        case MAC_SYSTIME_NSEC:
+            ptp_split(ptp_now(&s->port[p]), &sec, &nsec);
+            return r == MAC_SYSTIME_SEC ? sec : nsec;
+        case MAC_SYSTIME_HI_SEC:
+            return 0;
+        case MAC_TIMESTAMP_STATUS:
+            return timestamp_status(s, p);
+        case MAC_TXTS_NSEC:
+        case MAC_TXTS_SEC:
+        case MAC_TXTS_PKTID:
+            return txts_read(s, p, r);
+        case MAC_INTERRUPT_STATUS:
+            /* TSIS reflects a non-empty TX timestamp FIFO */
+            v = s->port[p].txts_count ? (v | MAC_INT_TSIS) :
+                                        (v & ~MAC_INT_TSIS);
+            sreg(s, off, v);
+            return v;
+        }
     }
     return v;
 }
@@ -763,6 +937,13 @@ static void geth_write_word(Tc4xGethState *s, uint32_t off, uint32_t val)
         case MAC_VLAN_TAG_CTRL:
             sreg(s, off, val & ~BIT(0));        /* OB: busy self-clears */
             return;
+        case MAC_TIMESTAMP_CONTROL:
+            ptp_control_write(s, p, val);
+            return;
+        case MAC_TIMESTAMP_STATUS:
+        case MAC_TXTS_NSEC:
+        case MAC_TXTS_SEC:
+        case MAC_TXTS_PKTID:
         case MAC_VERSION:
         case MAC_HW_FEATURE0:
         case MAC_HW_FEATURE1:
@@ -797,15 +978,28 @@ static bool geth_read_is_plain(uint32_t off)
            (off < PORT_BASE(0) || off >= PORT_BASE(TC4X_GETH_NUM_PORTS));
 }
 
+/* TX timestamp status reads are served without the BQL too */
+static bool geth_read_is_ts_status(uint32_t off, int *p)
+{
+    if (off < PORT_BASE(0) || off >= PORT_BASE(TC4X_GETH_NUM_PORTS) ||
+        off - PORT_BASE(PORT_OF(off)) != MAC_TIMESTAMP_STATUS) {
+        return false;
+    }
+    *p = PORT_OF(off);
+    return true;
+}
 
 static uint64_t geth_read(void *opaque, hwaddr addr, unsigned size)
 {
     Tc4xGethState *s = opaque;
     uint32_t off = addr & ~3u;
     uint32_t word;
+    int p;
 
     if (geth_read_is_plain(off)) {
         word = greg(s, off);
+    } else if (geth_read_is_ts_status(off, &p)) {
+        word = timestamp_status(s, p);
     } else {
         BQL_LOCK_GUARD();
         word = geth_read_word(s, off);
