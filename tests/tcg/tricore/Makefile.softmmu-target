@@ -31,6 +31,44 @@ TESTS += test_context_save_areas.c.tst
 
 QEMU_OPTS += -M tricore_testboard -cpu tc37x -nographic -kernel
 
+# An LLVM TriCore toolchain (clang and ld.lld, CC=clang): GNU relocation
+# operators folded by llvm-fold-hi-lo.py, and a linker script without the
+# BFD-only output format names and "p" region attribute, with the small data
+# bases crt0 loads defined (the tests do not use small data).
+ifneq ($(findstring clang,$(notdir $(CC))),)
+LLVM_FLAGS = --target=tricore -march=tc162
+CFLAGS = $(LLVM_FLAGS) -O1 -c -I$(TESTS_PATH)
+LDFLAGS = -Tlink-lld.ld
+
+link-lld.ld: $(TESTS_PATH)/link.ld
+	sed -e 's/(rx!p)/(rx)/; s/(w!xp)/(w!x)/' \
+	    -e '/^OUTPUT_FORMAT/d; /^OUTPUT_ARCH/d' $< > $@
+	printf '_SMALL_DATA_ = 0;\n_SMALL_DATA2_ = 0;\n_SMALL_DATA3_ = 0;\n_SMALL_DATA4_ = 0;\n' >> $@
+
+%.pS: $(ASM_TESTS_PATH)/%.S
+	$(CC) $(LLVM_FLAGS) -E -o $@ $<
+
+%.s: %.pS
+	$(PYTHON) $(TESTS_PATH)/llvm-fold-hi-lo.py $< $@
+
+%.o: %.s
+	$(CC) $(LLVM_FLAGS) -c -o $@ $<
+
+%.asm.tst: %.o link-lld.ld
+	$(LD) $(LDFLAGS) $< -o $@
+
+crt0-tc2x.s: $(C_TESTS_PATH)/crt0-tc2x.S
+	$(PYTHON) $(TESTS_PATH)/llvm-fold-hi-lo.py $< $@
+
+crt0-tc2x.o: crt0-tc2x.s
+	$(CC) $(LLVM_FLAGS) -c -o $@ $<
+
+%.o: $(C_TESTS_PATH)/%.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+%.c.tst: %.o crt0-tc2x.o link-lld.ld
+	$(LD) $(LDFLAGS) -o $@ $(filter %.o,$^)
+else
 %.pS: $(ASM_TESTS_PATH)/%.S
 	$(CC) -E -o $@ $<
 
@@ -48,6 +86,7 @@ crt0-tc2x.o: $(C_TESTS_PATH)/crt0-tc2x.S
 
 %.c.tst: %.o crt0-tc2x.o
 	$(LD) $(LDFLAGS) -o $@ $^
+endif
 
 # We don't currently support the multiarch system tests
 undefine MULTIARCH_TESTS
