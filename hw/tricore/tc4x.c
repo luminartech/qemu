@@ -27,6 +27,8 @@
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
+#include "chardev/char-fe.h"
+#include "system/system.h"
 #include "system/reset.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
@@ -62,6 +64,8 @@
 #define SRC_SIZE            0x2000u
 #define SRC_STMCPU_BASE     (SRC_BASE + 0x20u)
 #define SRC_STMCPU_STRIDE   0x40u
+#define SRC_ASCLIN_TX(n)    (SRC_BASE + 0x2B0u + (n) * 12u)
+#define SRC_ASCLIN_RX(n)    (SRC_BASE + 0x2B4u + (n) * 12u)
 #define SRC_SRPN_MASK       0xFFu
 #define SRC_TOS_SHIFT       12
 #define SRC_TOS_MASK        0xFu
@@ -72,6 +76,26 @@
 #define SRC_IOV             BIT(27)
 #define SRC_IOVCLR          BIT(28)
 #define SRC_WRITABLE        0x0080FFFFu
+
+#define ASCLIN_BASE         0xF46C0000u
+#define ASCLIN_STRIDE       0x200u
+#define ASCLIN_COUNT        28u
+#define ASCLIN_END          (ASCLIN_BASE + ASCLIN_COUNT * ASCLIN_STRIDE)
+#define ASCLIN_TXFIFOCON    0x104u
+#define ASCLIN_RXFIFOCON    0x108u
+#define ASCLIN_FLAGS        0x12Cu
+#define ASCLIN_CSR          0x13Cu
+#define ASCLIN_CSR_CLKSEL   0x1Fu
+#define ASCLIN_CSR_CON      BIT(31)     /* IfxAsclin_getClockStatus() */
+#define ASCLIN_FLAGSSET     0x130u
+#define ASCLIN_FLAGSCLEAR   0x134u
+#define ASCLIN_TXDATA       0x140u
+#define ASCLIN_RXDATA       0x160u
+#define ASCLIN_FIFO_END     0x180u
+#define ASCLIN_FILL_SHIFT   16
+#define ASCLIN_FLAGS_TFL    BIT(31)
+#define ASCLIN_FLAGS_RFL    BIT(28)
+#define ASCLIN_RXFIFO_DEPTH 16
 
 #define TYPE_TC4X_MACHINE MACHINE_TYPE_NAME("tc4x")
 OBJECT_DECLARE_SIMPLE_TYPE(Tc4xSoc, TC4X_MACHINE)
@@ -128,6 +152,11 @@ struct Tc4xSoc {
     uint32_t cpu_prio[TC4X_NUM_CORES];
 
     Tc4xStmTimer stm[TC4X_NUM_CORES][CPU_STM_VM_COUNT][2];
+
+    unsigned console;       /* ASCLIN instance on serial0 */
+    CharFrontend uart;
+    uint8_t rx_fifo[ASCLIN_RXFIFO_DEPTH];
+    unsigned rx_head, rx_count;
 
     uint32_t boot_pc;
 };
@@ -353,6 +382,104 @@ static void stm_fire(void *opaque)
     stm_schedule(s, t->core, t->vm, t->cmp);
 }
 
+static uint32_t asclin_reg(unsigned n, uint32_t off)
+{
+    return ASCLIN_BASE + n * ASCLIN_STRIDE + off;
+}
+
+static int uart_can_receive(void *opaque)
+{
+    Tc4xSoc *s = opaque;
+
+    return ASCLIN_RXFIFO_DEPTH - s->rx_count;
+}
+
+static void uart_receive(void *opaque, const uint8_t *buf, int size)
+{
+    Tc4xSoc *s = opaque;
+
+    for (int i = 0; i < size && s->rx_count < ASCLIN_RXFIFO_DEPTH; i++) {
+        s->rx_fifo[(s->rx_head + s->rx_count) % ASCLIN_RXFIFO_DEPTH] = buf[i];
+        s->rx_count++;
+    }
+    reg_set(s, asclin_reg(s->console, ASCLIN_FLAGS),
+            reg_get(s, asclin_reg(s->console, ASCLIN_FLAGS)) |
+            ASCLIN_FLAGS_RFL);
+    src_set_srr(s, SRC_ASCLIN_RX(s->console), true);
+}
+
+static uint32_t uart_rx_pop(Tc4xSoc *s)
+{
+    uint32_t c;
+
+    if (s->rx_count == 0) {
+        return 0;
+    }
+    c = s->rx_fifo[s->rx_head];
+    s->rx_head = (s->rx_head + 1) % ASCLIN_RXFIFO_DEPTH;
+    s->rx_count--;
+    qemu_chr_fe_accept_input(&s->uart);
+    return c;
+}
+
+/*
+ * Every instance transmits at once with an empty TX FIFO; only the console
+ * instance has a character backend and receives.
+ */
+static bool asclin_read(Tc4xSoc *s, uint32_t addr, uint32_t *v)
+{
+    unsigned n = (addr - ASCLIN_BASE) / ASCLIN_STRIDE;
+    uint32_t off = (addr - ASCLIN_BASE) % ASCLIN_STRIDE;
+    bool console = n == s->console;
+
+    if (addr < ASCLIN_BASE || addr >= ASCLIN_END) {
+        return false;
+    }
+    if (off == ASCLIN_TXFIFOCON) {
+        *v &= ~(0x1Fu << ASCLIN_FILL_SHIFT);
+    } else if (off == ASCLIN_RXFIFOCON) {
+        *v = (*v & ~(0x1Fu << ASCLIN_FILL_SHIFT)) |
+             ((console ? s->rx_count : 0) << ASCLIN_FILL_SHIFT);
+    } else if (off == ASCLIN_FLAGS) {
+        *v |= ASCLIN_FLAGS_TFL;
+    } else if (off == ASCLIN_CSR) {
+        /* the selected clock is on at once: CON follows CLKSEL */
+        *v = (*v & ~ASCLIN_CSR_CON) |
+             ((*v & ASCLIN_CSR_CLKSEL) ? ASCLIN_CSR_CON : 0);
+    } else if (off >= ASCLIN_RXDATA && off < ASCLIN_FIFO_END) {
+        *v = console ? uart_rx_pop(s) : 0;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool asclin_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
+{
+    unsigned n = (addr - ASCLIN_BASE) / ASCLIN_STRIDE;
+    uint32_t off = (addr - ASCLIN_BASE) % ASCLIN_STRIDE;
+    uint32_t flags = asclin_reg(n, ASCLIN_FLAGS);
+
+    if (addr < ASCLIN_BASE || addr >= ASCLIN_END) {
+        return false;
+    }
+    if (off >= ASCLIN_TXDATA && off < ASCLIN_RXDATA) {
+        uint8_t ch = val;
+
+        if (n == s->console) {
+            qemu_chr_fe_write_all(&s->uart, &ch, 1);
+        }
+        src_set_srr(s, SRC_ASCLIN_TX(n), true);
+    } else if (off == ASCLIN_FLAGSCLEAR) {
+        reg_set(s, flags, reg_get(s, flags) & ~val);
+    } else if (off == ASCLIN_FLAGSSET) {
+        reg_set(s, flags, reg_get(s, flags) | val);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 static bool sfr_is_cpu(uint32_t addr, int *core, uint32_t *off)
 {
     if (addr < CPU_SFR_BASE ||
@@ -380,6 +507,8 @@ static uint32_t sfr_read_word(Tc4xSoc *s, uint32_t addr)
         } else if (off == CPU_HRA_BOOTCON) {
             v = (v & ~1u) | (s->cpu[core]->env.boot_halted ? 1 : 0);
         }
+    } else if (asclin_read(s, addr, &v)) {
+        /* served by the ASCLIN model */
     } else {
         Tc4xSfrPage *pg = sfr_page(s, addr, true);
         unsigned long bit = BIT_MASK(sfr_word(addr));
@@ -400,6 +529,9 @@ static void sfr_write_word(Tc4xSoc *s, uint32_t addr, uint32_t val)
 
     if (addr >= SRC_BASE && addr < SRC_BASE + SRC_SIZE) {
         src_write(s, addr, val);
+        return;
+    }
+    if (asclin_write(s, addr, val)) {
         return;
     }
 
@@ -619,6 +751,10 @@ static void tc4x_init(MachineState *ms)
             }
         }
     }
+
+    qemu_chr_fe_init(&s->uart, serial_hd(0), &error_abort);
+    qemu_chr_fe_set_handlers(&s->uart, uart_can_receive, uart_receive, NULL,
+                             NULL, s, NULL, true);
 
     if (ms->kernel_filename) {
         g_auto(GStrv) files = g_strsplit(ms->kernel_filename, ",", -1);
