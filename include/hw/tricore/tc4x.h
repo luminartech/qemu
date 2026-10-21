@@ -58,11 +58,14 @@ void tc4x_geth_attach(Tc4xSoc *soc, unsigned port, uint8_t addr,
 /* Output latch of P@port.@pin (any thread) */
 bool tc4x_gpio_out(Tc4xSoc *soc, unsigned port, unsigned pin);
 
-/* Drive (level 0/1) or release (level < 0) an input */
+/* Drive (level 0/1) or release (level < 0) an input (any thread) */
 void tc4x_gpio_set_input(Tc4xSoc *soc, unsigned port, unsigned pin,
                          int level);
 
-/* @fn sees every change of port @port's output latch, @old to @new */
+/*
+ * @fn sees every change of port @port's output latch, @old to @new; writes
+ * to the port then always take the BQL
+ */
 typedef void (*Tc4xGpioListenerFn)(void *opaque, unsigned port, uint32_t old,
                                    uint32_t new);
 void tc4x_gpio_add_listener(Tc4xSoc *soc, unsigned port,

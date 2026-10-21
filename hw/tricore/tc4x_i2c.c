@@ -108,6 +108,14 @@ static bool i2c_decode(uint32_t addr, unsigned *n, uint32_t *off)
     return false;
 }
 
+bool tc4x_i2c_owns(uint32_t addr)
+{
+    unsigned n;
+    uint32_t off;
+
+    return i2c_decode(addr, &n, &off);
+}
+
 static I2cSlave *i2c_slave(I2cBus *b, unsigned addr)
 {
     for (unsigned i = 0; i < b->nslaves; i++) {

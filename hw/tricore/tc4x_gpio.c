@@ -41,11 +41,13 @@ typedef struct GpioListener {
 
 struct Tc4xGpio {
     Tc4xSoc *soc;
-    /* per port: inputs driven from outside */
+    /* per port: inputs driven from outside, atomic (read without the BQL) */
     uint32_t mask[TC4X_PORT_COUNT];
     uint32_t in[TC4X_PORT_COUNT];
     GpioListener listeners[GPIO_LISTENERS_MAX];
     unsigned n_listeners;
+    /* ports with a listener, one bit each */
+    uint64_t listened;
 };
 
 static uint32_t port_out_addr(unsigned n)
@@ -55,8 +57,10 @@ static uint32_t port_out_addr(unsigned n)
 
 static uint32_t port_in(Tc4xGpio *g, unsigned n)
 {
-    return (tc4x_reg_get(g->soc, port_out_addr(n)) & ~g->mask[n]) |
-           (g->in[n] & g->mask[n]);
+    uint32_t mask = qatomic_read(&g->mask[n]);
+
+    return (tc4x_reg_get(g->soc, port_out_addr(n)) & ~mask) |
+           (qatomic_read(&g->in[n]) & mask);
 }
 
 static bool padcfg_gpio(uint32_t off, unsigned *pin)
@@ -105,15 +109,22 @@ bool tc4x_gpio_read(Tc4xGpio *g, uint32_t addr, uint32_t *val)
     return false;
 }
 
-/* OUT = (OUT & ~clr | set) ^ toggle; returns the old OUT, *out the new one */
+/*
+ * OUT = (OUT & ~clr | set) ^ toggle, atomically: ISRs drive pins without
+ * the BQL (tc4x_gpio_write_lockless) while other cores write the same port
+ * under it.  Returns the old OUT, *out the new one.
+ */
 static uint32_t gpio_out_update(Tc4xGpio *g, unsigned n, uint32_t clr,
                                 uint32_t set, uint32_t toggle, uint32_t *out)
 {
     uint32_t out_addr = port_out_addr(n);
-    uint32_t old = tc4x_reg_get(g->soc, out_addr);
+    uint32_t old = tc4x_reg_get(g->soc, out_addr), prev;
 
-    *out = ((old & ~clr) | set) ^ toggle;
-    tc4x_reg_set(g->soc, out_addr, *out);
+    do {
+        prev = old;
+        *out = ((prev & ~clr) | set) ^ toggle;
+        old = tc4x_reg_cmpxchg(g->soc, out_addr, prev, *out);
+    } while (old != prev);
     return old;
 }
 
@@ -180,6 +191,19 @@ bool tc4x_gpio_write(Tc4xGpio *g, uint32_t addr, uint32_t val)
     return true;
 }
 
+bool tc4x_gpio_write_lockless(Tc4xGpio *g, uint32_t addr, uint32_t val)
+{
+    unsigned n, pin;
+    uint32_t off, out;
+
+    if (!port_decode(addr, &n, &off) || !padcfg_gpio(off, &pin) ||
+        (g->listened & BIT_ULL(n))) {
+        return false;
+    }
+    gpio_padcfg_write(g, addr, n, pin, val, &out);
+    return true;
+}
+
 bool tc4x_gpio_out(Tc4xSoc *soc, unsigned port, unsigned pin)
 {
     return (tc4x_reg_get(soc, port_out_addr(port)) >> pin) & 1;
@@ -191,11 +215,16 @@ void tc4x_gpio_set_input(Tc4xSoc *soc, unsigned port, unsigned pin,
     Tc4xGpio *g = tc4x_soc_gpio(soc);
 
     assert(port < TC4X_PORT_COUNT && pin < PORT_PINS);
-    if (level >= 0) {
-        g->in[port] = deposit32(g->in[port], pin, 1, level & 1);
+    if (level < 0) {
+        qatomic_and(&g->mask[port], ~BIT(pin));
+        return;
     }
-    g->mask[port] = level < 0 ? g->mask[port] & ~BIT(pin) :
-                                g->mask[port] | BIT(pin);
+    if (level & 1) {
+        qatomic_or(&g->in[port], BIT(pin));
+    } else {
+        qatomic_and(&g->in[port], ~BIT(pin));
+    }
+    qatomic_or(&g->mask[port], BIT(pin));
 }
 
 void tc4x_gpio_add_listener(Tc4xSoc *soc, unsigned port,
@@ -207,6 +236,7 @@ void tc4x_gpio_add_listener(Tc4xSoc *soc, unsigned port,
     g->listeners[g->n_listeners++] = (GpioListener) {
         .port = port, .fn = fn, .opaque = opaque,
     };
+    g->listened |= BIT_ULL(port);
 }
 
 static bool gpio_command(void *opaque, int argc, char **argv, GString *out)
