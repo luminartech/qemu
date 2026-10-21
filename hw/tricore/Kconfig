@@ -16,3 +16,4 @@ config TC4X
     bool
     default y
     depends on TRICORE
+    select TC4X_GETH

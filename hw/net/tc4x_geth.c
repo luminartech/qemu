@@ -1,0 +1,942 @@
+/*
+ * TC4x GETH Ethernet controller
+ *
+ * TC4x GETH0 is based on the Synopsys DWC Ethernet QoS core and has two MAC
+ * ports.  No PHY is attached by default, so MDIO reads of a port return all
+ * ones; board code attaches PHYs with tc4x_geth_attach_phy().
+ *
+ * Sources, all public: the GETH registers of the iLLD SFR headers and the
+ * iLLD Ethernet driver (IfxGeth) bundled with the TC4D7 projects of
+ * https://github.com/Infineon/AURIX_code_examples; the DWC Ethernet QoS
+ * descriptor and DMA behaviour as Linux's stmmac driver programs it.
+ *
+ * Copyright (c) 2026 MicroVision, Inc.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "qemu/log.h"
+#include "qemu/main-loop.h"
+#include "qemu/timer.h"
+#include "qemu/units.h"
+#include "qapi/error.h"
+#include "hw/core/irq.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
+#include "hw/net/tc4x_geth.h"
+#include "net/net.h"
+#include "net/eth.h"
+#include "net/checksum.h"
+#include "system/address-spaces.h"
+#include "system/dma.h"
+#include "qom/object.h"
+
+OBJECT_DECLARE_SIMPLE_TYPE(Tc4xGethState, TC4X_GETH)
+
+#define R_CLC                 0x0000u
+#define R_RST_CTRLA           0x000Cu
+#define R_RST_CTRLB           0x0010u
+#define R_RST_STAT            0x0014u
+#define CLC_DISR              BIT(0)
+#define CLC_DISS              BIT(1)
+#define RST_KRST              BIT(0)
+#define RST_CTRLB_STATCLR     BIT(31)
+#define CORE_BASE             0x10000u   /* everything a kernel reset clears */
+
+#define PORT_BASE(p)          (0x10000u + (p) * 0x2000u)
+#define PORT_OF(off)          (((off) - 0x10000u) / 0x2000u)
+#define MAC_TX_CONFIGURATION  0x000u
+#define MAC_RX_CONFIGURATION  0x004u
+#define MAC_PACKET_FILTER     0x008u
+#define MAC_VLAN_TAG_CTRL     0x050u
+#define MAC_RXQ_CTRL0         0x0A0u
+#define MAC_RXQ_CTRL1         0x0A4u
+#define MAC_RXQ_CTRL2         0x0A8u
+#define MAC_RXQ_CTRL3         0x0ACu
+#define MAC_INTERRUPT_STATUS  0x0B0u
+#define MAC_INTERRUPT_ENABLE  0x0B4u
+#define MAC_VERSION           0x110u
+#define MAC_HW_FEATURE0       0x11Cu
+#define MAC_HW_FEATURE1       0x120u
+#define MAC_HW_FEATURE2       0x124u
+#define MDIO_ADDRESS          0x200u
+#define MDIO_DATA             0x204u
+#define MDIO_CLAUSE_22_PORT   0x220u
+#define MAC_ADDRESS_HIGH(n)   (0x300u + (n) * 8u)
+#define MAC_ADDRESS_LOW(n)    (0x304u + (n) * 8u)
+#define MAC_ADDRESS_COUNT     32
+#define MMC_TX_OCTETS_GB      0x814u
+#define MMC_TX_PACKETS_GB     0x81Cu
+#define MMC_TX_PACKETS_G      0x88Cu
+#define MMC_TX_OCTETS_G       0x884u
+#define MMC_RX_PACKETS_GB     0x900u
+#define MMC_RX_OCTETS_GB      0x908u
+#define MMC_RX_OCTETS_G       0x910u
+#define MMC_RX_BROADCAST      0x918u
+#define MMC_RX_MULTICAST      0x920u
+#define MMC_RX_UNICAST        0x970u
+#define MTL_RXQ_DMA_MAP0      0x1030u
+#define MTL_RXQ_DMA_MAP1      0x1034u
+#define MTL_TCQ_BASE          0x1100u
+#define MTL_TCQ_END           0x1500u
+#define MTL_TCQ_STRIDE        0x80u
+
+#define MAC_TE                BIT(0)
+#define MAC_RE                BIT(0)
+#define PF_PR                 BIT(0)
+#define PF_PM                 BIT(4)
+#define PF_DBF                BIT(5)
+#define PF_RA                 BIT(31)
+#define MAC_ADDR_AE           BIT(31)
+#define MDIO_SBUSY            BIT(22)
+#define MDIO_CMD_SHIFT        16
+#define MDIO_CMD_WRITE        1u
+#define MDIO_CMD_READ         3u
+#define MDIO_CMD_POSTINC_READ 2u
+
+#define BRIDGE_PORT_CONTROL(p) (0x1E00Cu + (p) * 0xCu)
+#define BRIDGE_TXQ_MAP(p)      (0x1E010u + (p) * 0xCu)
+#define BRIDGE_TXQ_EN_SHIFT    24
+
+#define DMA_MODE              0x1F000u
+#define DMA_INTERRUPT_STATUS  0x1F008u
+#define DMA_MODE_SWR          BIT(0)
+#define DMA_CH_BASE           0x1F100u
+#define DMA_CH_STRIDE         0x80u
+#define DMA_CH_END            (DMA_CH_BASE + TC4X_GETH_NUM_DMA * DMA_CH_STRIDE)
+#define CH_CONTROL            0x00u
+#define CH_TX_CONTROL         0x04u
+#define CH_RX_CONTROL         0x08u
+#define CH_TXDESC_LIST        0x14u
+#define CH_RXDESC_LIST        0x1Cu
+#define CH_TXDESC_TAIL        0x24u
+#define CH_RXDESC_TAIL        0x2Cu
+#define CH_TX_CONTROL2        0x30u
+#define CH_RX_CONTROL2        0x34u
+#define CH_INTERRUPT_ENABLE   0x38u
+#define CH_CUR_TXDESC         0x44u
+#define CH_CUR_RXDESC         0x4Cu
+#define CH_CUR_TXBUF          0x54u
+#define CH_CUR_RXBUF          0x5Cu
+#define CH_STATUS             0x60u
+#define CH_MISS_PACKET_CNT    0x6Cu
+#define CH_CONTROL_DSL(v)     extract32(v, 18, 3)
+#define CH_TX_ST              BIT(0)
+#define CH_RX_SR              BIT(0)
+#define CH_RX_RBSZ(v)         extract32(v, 1, 14)
+#define CH_RING_LEN(v)        (extract32(v, 0, 16) + 1)
+#define ST_TI                 BIT(0)
+#define ST_TBU                BIT(2)
+#define ST_RI                 BIT(6)
+#define ST_RBU                BIT(7)
+#define ST_AIS                BIT(14)
+#define ST_NIS                BIT(15)
+#define ST_TX_MASK            (ST_TI | ST_TBU)
+#define ST_RX_MASK            (ST_RI | ST_RBU)
+#define IE_AIE                BIT(14)
+#define IE_NIE                BIT(15)
+
+#define DESC_SIZE             16
+#define DES3_OWN              BIT(31)
+#define DES3_CTXT             BIT(30)
+#define DES3_FD               BIT(29)
+#define DES3_LD               BIT(28)
+#define TDES2_IOC             BIT(31)
+#define TDES3_CIC(v)          extract32(v, 16, 2)
+#define RDES3_IOC             BIT(30)
+
+#define MAX_FRAME             16384
+#define MIN_FRAME             60
+#define VLAN_HLEN             4
+
+typedef struct Tc4xGethPort {
+    struct Tc4xGethState *s;
+    int index;
+    NICConf conf;
+    NICState *nic;
+    uint8_t phy_addr;
+    const Tc4xGethPhyOps *phy;  /* NULL: nothing answers on MDIO */
+    void *phy_opaque;
+} Tc4xGethPort;
+
+typedef struct Tc4xGethDma {
+    uint32_t tx_cur, rx_cur;
+    uint8_t txbuf[MAX_FRAME];
+    unsigned txlen;
+} Tc4xGethDma;
+
+struct Tc4xGethState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion geth_mr;
+    uint32_t regs[TC4X_GETH_SIZE / 4];
+    Tc4xGethPort port[TC4X_GETH_NUM_PORTS];
+    Tc4xGethDma dma[TC4X_GETH_NUM_DMA];
+    qemu_irq irq[TC4X_GETH_NUM_IRQ];
+    bool irq_level[TC4X_GETH_NUM_IRQ];
+};
+
+/* Atomic: geth_read() serves plain registers without the BQL */
+static inline uint32_t greg(Tc4xGethState *s, uint32_t off)
+{
+    return qatomic_read(&s->regs[off / 4]);
+}
+
+static inline void sreg(Tc4xGethState *s, uint32_t off, uint32_t v)
+{
+    qatomic_set(&s->regs[off / 4], v);
+}
+
+static inline uint32_t preg(Tc4xGethState *s, int p, uint32_t off)
+{
+    return greg(s, PORT_BASE(p) + off);
+}
+
+static inline uint32_t chreg(Tc4xGethState *s, int ch, uint32_t off)
+{
+    return greg(s, DMA_CH_BASE + ch * DMA_CH_STRIDE + off);
+}
+
+static inline void chset(Tc4xGethState *s, int ch, uint32_t off, uint32_t v)
+{
+    sreg(s, DMA_CH_BASE + ch * DMA_CH_STRIDE + off, v);
+}
+
+static void mmc_inc(Tc4xGethState *s, int p, uint32_t off, uint32_t n)
+{
+    sreg(s, PORT_BASE(p) + off, preg(s, p, off) + n);
+}
+
+static void geth_set_irq(Tc4xGethState *s, int n, bool level)
+{
+    if (level != s->irq_level[n]) {
+        s->irq_level[n] = level;
+        qemu_set_irq(s->irq[n], level);
+    }
+}
+
+static void geth_update_irq(Tc4xGethState *s)
+{
+    uint32_t dma_is = 0;
+
+    for (int ch = 0; ch < TC4X_GETH_NUM_DMA; ch++) {
+        uint32_t st = chreg(s, ch, CH_STATUS);
+        uint32_t ie = chreg(s, ch, CH_INTERRUPT_ENABLE);
+        uint32_t act = st & ie & ~(IE_AIE | IE_NIE);
+
+        if (st & ie & 0x3FFFu) {
+            dma_is |= BIT(ch);
+        }
+        geth_set_irq(s, TC4X_GETH_IRQ_TX(ch), act & ST_TX_MASK);
+        geth_set_irq(s, TC4X_GETH_IRQ_RX(ch), act & ST_RX_MASK);
+    }
+    for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
+        if (preg(s, p, MAC_INTERRUPT_STATUS) &
+            preg(s, p, MAC_INTERRUPT_ENABLE)) {
+            dma_is |= BIT(17);
+        }
+    }
+    sreg(s, DMA_INTERRUPT_STATUS, dma_is);
+    geth_set_irq(s, TC4X_GETH_IRQ_MAC, dma_is & BIT(17));
+}
+
+static void ch_status(Tc4xGethState *s, int ch, uint32_t bits)
+{
+    uint32_t st = chreg(s, ch, CH_STATUS) | bits;
+
+    if (st & (ST_TI | ST_RI)) {
+        st |= ST_NIS;
+    }
+    if (st & (ST_TBU | ST_RBU)) {
+        st |= ST_AIS;
+    }
+    chset(s, ch, CH_STATUS, st);
+    geth_update_irq(s);
+}
+
+static void mdio_command(Tc4xGethState *s, int p, uint32_t ctrl)
+{
+    Tc4xGethPort *port = &s->port[p];
+    uint32_t addr = preg(s, p, MDIO_ADDRESS);
+    uint32_t pa = extract32(addr, 16, 5);
+    uint32_t ra = extract32(addr, 0, 16);
+    uint32_t da = extract32(addr, 21, 5);
+    uint32_t cmd = extract32(ctrl, MDIO_CMD_SHIFT, 2);
+    bool cl22 = preg(s, p, MDIO_CLAUSE_22_PORT) & BIT(pa);
+    bool write = cmd == MDIO_CMD_WRITE;
+    uint16_t data = 0xFFFF;
+
+    if (port->phy && pa == port->phy_addr) {
+        if (cl22 && write) {
+            port->phy->write22(port->phy_opaque, ra & 0x1F, ctrl & 0xFFFF);
+        } else if (cl22) {
+            data = port->phy->read22(port->phy_opaque, ra & 0x1F);
+        } else if (write) {
+            port->phy->write45(port->phy_opaque, da, ra, ctrl & 0xFFFF);
+        } else {
+            data = port->phy->read45(port->phy_opaque, da, ra);
+            if (cmd == MDIO_CMD_POSTINC_READ) {
+                sreg(s, PORT_BASE(p) + MDIO_ADDRESS,
+                     deposit32(addr, 0, 16, ra + 1));
+            }
+        }
+    }
+    ctrl &= ~MDIO_SBUSY;
+    if (!write) {
+        ctrl = deposit32(ctrl, 0, 16, data);
+    }
+    sreg(s, PORT_BASE(p) + MDIO_DATA, ctrl);
+}
+
+static void dma_rd(uint32_t addr, void *buf, unsigned len)
+{
+    if (address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                           buf, len) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR, "tc4x-geth: DMA read fault 0x%08x\n",
+                      addr);
+    }
+}
+
+static void dma_wr(uint32_t addr, const void *buf, unsigned len)
+{
+    if (address_space_write(&address_space_memory, addr,
+                            MEMTXATTRS_UNSPECIFIED, buf, len) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR, "tc4x-geth: DMA write fault 0x%08x\n",
+                      addr);
+    }
+}
+
+static void desc_load(uint32_t addr, uint32_t d[4])
+{
+    dma_rd(addr, d, DESC_SIZE);
+    for (int i = 0; i < 4; i++) {
+        d[i] = le32_to_cpu(d[i]);
+    }
+}
+
+static void desc_store(uint32_t addr, const uint32_t d[4])
+{
+    uint32_t le[4];
+
+    for (int i = 0; i < 4; i++) {
+        le[i] = cpu_to_le32(d[i]);
+    }
+    dma_wr(addr, le, DESC_SIZE);
+}
+
+static uint32_t desc_next(Tc4xGethState *s, int ch, uint32_t cur, bool tx)
+{
+    uint32_t base = chreg(s, ch, tx ? CH_TXDESC_LIST : CH_RXDESC_LIST);
+    uint32_t len = CH_RING_LEN(chreg(s, ch, tx ? CH_TX_CONTROL2 :
+                                            CH_RX_CONTROL2));
+    uint32_t stride = DESC_SIZE + CH_CONTROL_DSL(chreg(s, ch, CH_CONTROL)) * 8;
+    uint32_t idx = (cur - base) / stride + 1;
+
+    return idx >= len ? base : base + idx * stride;
+}
+
+static int tx_port_of_channel(Tc4xGethState *s, int ch)
+{
+    for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
+        uint32_t en = extract32(greg(s, BRIDGE_PORT_CONTROL(p)),
+                                BRIDGE_TXQ_EN_SHIFT, 8);
+        uint32_t map = greg(s, BRIDGE_TXQ_MAP(p));
+
+        for (int q = 0; q < 8; q++) {
+            if ((en & BIT(q)) && extract32(map, q * 4, 4) == ch) {
+                return p;
+            }
+        }
+    }
+    return 0;
+}
+
+static void port_send(Tc4xGethState *s, int p, const uint8_t *buf,
+                      unsigned len)
+{
+    Tc4xGethPort *port = &s->port[p];
+
+    if (!port->nic || !(preg(s, p, MAC_TX_CONFIGURATION) & MAC_TE)) {
+        return;
+    }
+    mmc_inc(s, p, MMC_TX_PACKETS_GB, 1);
+    mmc_inc(s, p, MMC_TX_PACKETS_G, 1);
+    mmc_inc(s, p, MMC_TX_OCTETS_GB, len);
+    mmc_inc(s, p, MMC_TX_OCTETS_G, len);
+    qemu_send_packet(qemu_get_queue(port->nic), buf, len);
+}
+
+static void tx_checksum(uint8_t *buf, unsigned len, uint32_t cic)
+{
+    unsigned l2 = ETH_HLEN;
+    uint8_t *ip;
+    unsigned ihl, tot;
+
+    net_checksum_calculate(buf, len, cic >= 2 ? CSUM_ALL : CSUM_IP);
+    if (cic < 2) {
+        return;
+    }
+    /* net_checksum_calculate() leaves ICMP alone; the MAC does it */
+    if (len >= ETH_HLEN + VLAN_HLEN && lduw_be_p(buf + 12) == ETH_P_VLAN) {
+        l2 += VLAN_HLEN;
+    }
+    if (len < l2 + 20 || lduw_be_p(buf + l2 - 2) != ETH_P_IP) {
+        return;
+    }
+    ip = buf + l2;
+    ihl = (ip[0] & 0xF) * 4;
+    tot = lduw_be_p(ip + 2);
+    if (ip[9] != 1 /* ICMP */ || l2 + tot > len || tot < ihl + 4 ||
+        (lduw_be_p(ip + 6) & 0x3FFF)) {
+        return;
+    }
+    stw_be_p(ip + ihl + 2, 0);
+    stw_be_p(ip + ihl + 2, net_raw_checksum(ip + ihl, tot - ihl));
+}
+
+static void tx_process(Tc4xGethState *s, int ch)
+{
+    Tc4xGethDma *dma = &s->dma[ch];
+    uint32_t tail = chreg(s, ch, CH_TXDESC_TAIL);
+    uint32_t ring = CH_RING_LEN(chreg(s, ch, CH_TX_CONTROL2));
+    uint32_t status = 0;
+    uint32_t cic = 0;
+
+    if (!(chreg(s, ch, CH_TX_CONTROL) & CH_TX_ST)) {
+        return;
+    }
+    for (uint32_t n = 0; n < ring && dma->tx_cur != tail; n++) {
+        uint32_t d[4];
+
+        desc_load(dma->tx_cur, d);
+        if (!(d[3] & DES3_OWN)) {
+            status |= ST_TBU;
+            break;
+        }
+        if (d[3] & DES3_CTXT) {
+            d[3] = DES3_CTXT;
+            desc_store(dma->tx_cur, d);
+        } else {
+            uint32_t l1 = extract32(d[2], 0, 14);
+            uint32_t l2 = extract32(d[2], 16, 14);
+
+            if (d[3] & DES3_FD) {
+                dma->txlen = 0;
+                cic = TDES3_CIC(d[3]);
+            }
+            l1 = MIN(l1, MAX_FRAME - dma->txlen);
+            dma_rd(d[0], dma->txbuf + dma->txlen, l1);
+            dma->txlen += l1;
+            l2 = MIN(l2, MAX_FRAME - dma->txlen);
+            dma_rd(d[1], dma->txbuf + dma->txlen, l2);
+            dma->txlen += l2;
+            chset(s, ch, CH_CUR_TXBUF, d[0]);
+
+            if (d[3] & DES3_LD) {
+                int p = tx_port_of_channel(s, ch);
+
+                if (cic) {
+                    tx_checksum(dma->txbuf, dma->txlen, cic);
+                }
+                port_send(s, p, dma->txbuf, dma->txlen);
+                dma->txlen = 0;
+            }
+            if (d[2] & TDES2_IOC) {
+                status |= ST_TI;
+            }
+            d[3] &= ~DES3_OWN;
+            desc_store(dma->tx_cur, d);
+        }
+        dma->tx_cur = desc_next(s, ch, dma->tx_cur, true);
+    }
+    chset(s, ch, CH_CUR_TXDESC, dma->tx_cur);
+    if (status) {
+        ch_status(s, ch, status);
+    }
+}
+
+static bool rx_mac_accept(Tc4xGethState *s, int p, const uint8_t *buf)
+{
+    uint32_t pf = preg(s, p, MAC_PACKET_FILTER);
+
+    if (pf & (PF_PR | PF_RA)) {
+        return true;
+    }
+    if (is_broadcast_ether_addr(buf)) {
+        return !(pf & PF_DBF);
+    }
+    if (is_multicast_ether_addr(buf)) {
+        return true;                    /* hash filter not modelled */
+    }
+    for (int n = 0; n < MAC_ADDRESS_COUNT; n++) {
+        uint32_t hi = preg(s, p, MAC_ADDRESS_HIGH(n));
+        uint32_t lo = preg(s, p, MAC_ADDRESS_LOW(n));
+
+        if ((n == 0 || (hi & MAC_ADDR_AE)) &&
+            ldl_le_p(buf) == lo && lduw_le_p(buf + 4) == (hi & 0xFFFF)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int rx_channel(Tc4xGethState *s, int p, const uint8_t *buf,
+                      unsigned len)
+{
+    uint32_t en = preg(s, p, MAC_RXQ_CTRL0);
+    int q = extract32(preg(s, p, MAC_RXQ_CTRL1), 0, 4);   /* UPQ */
+
+    if (len >= ETH_HLEN + VLAN_HLEN && lduw_be_p(buf + 12) == ETH_P_VLAN) {
+        uint32_t pcp = buf[14] >> 5;
+
+        for (int i = 0; i < 8; i++) {
+            uint32_t psrq = extract32(preg(s, p, i < 4 ? MAC_RXQ_CTRL2 :
+                                                       MAC_RXQ_CTRL3),
+                                      (i % 4) * 8, 8);
+
+            if (extract32(en, i * 2, 2) && (psrq & BIT(pcp))) {
+                q = i;
+                break;
+            }
+        }
+    }
+    return extract32(preg(s, p, q < 4 ? MTL_RXQ_DMA_MAP0 : MTL_RXQ_DMA_MAP1),
+                     (q % 4) * 8, 3);
+}
+
+/* Returns false when the frame must wait for descriptors */
+static bool rx_deliver(Tc4xGethState *s, int p, int ch, const uint8_t *buf,
+                       unsigned len)
+{
+    Tc4xGethDma *dma = &s->dma[ch];
+    uint32_t bufsz = CH_RX_RBSZ(chreg(s, ch, CH_RX_CONTROL)) & ~3u;
+    unsigned need, off = 0;
+    uint32_t cur, d[4], status = 0;
+
+    if (!(chreg(s, ch, CH_RX_CONTROL) & CH_RX_SR) || bufsz == 0 ||
+        chreg(s, ch, CH_RXDESC_LIST) == 0) {
+        return true;                    /* DMA stopped: frame is lost */
+    }
+    /* All descriptors of the frame must be available before writing any */
+    need = DIV_ROUND_UP(len, bufsz);
+    cur = dma->rx_cur;
+    for (unsigned i = 0; i < need; i++) {
+        desc_load(cur, d);
+        if (!(d[3] & DES3_OWN)) {
+            ch_status(s, ch, ST_RBU);
+            return false;
+        }
+        cur = desc_next(s, ch, cur, false);
+    }
+
+    while (off < len) {
+        unsigned chunk = MIN(bufsz, len - off);
+        uint32_t wb3;
+
+        desc_load(dma->rx_cur, d);
+        dma_wr(d[0], buf + off, chunk);
+        chset(s, ch, CH_CUR_RXBUF, d[0]);
+        if (d[3] & RDES3_IOC) {
+            status |= ST_RI;
+        }
+        wb3 = (off == 0 ? DES3_FD : 0);
+        off += chunk;
+        if (off == len) {
+            wb3 |= DES3_LD | (len & 0x7FFF);
+        } else {
+            wb3 |= chunk & 0x7FFF;
+        }
+        d[0] = 0;
+        d[1] = 0;
+        d[2] = 0;
+        d[3] = wb3;
+        desc_store(dma->rx_cur, d);
+        dma->rx_cur = desc_next(s, ch, dma->rx_cur, false);
+    }
+    chset(s, ch, CH_CUR_RXDESC, dma->rx_cur);
+    if (status) {
+        ch_status(s, ch, status);
+    }
+    return true;
+}
+
+static bool geth_can_receive(NetClientState *nc)
+{
+    return true;
+}
+
+static ssize_t geth_receive(NetClientState *nc, const uint8_t *data,
+                            size_t size)
+{
+    Tc4xGethPort *port = qemu_get_nic_opaque(nc);
+    Tc4xGethState *s = port->s;
+    int p = port->index;
+    uint8_t buf[MAX_FRAME];
+    unsigned len = size;
+    int ch;
+
+    if ((greg(s, R_CLC) & CLC_DISR) ||
+        !(preg(s, p, MAC_RX_CONFIGURATION) & MAC_RE) ||
+        size < ETH_HLEN || size > MAX_FRAME) {
+        return size;
+    }
+    memcpy(buf, data, size);
+    if (len < MIN_FRAME) {
+        memset(buf + len, 0, MIN_FRAME - len);
+        len = MIN_FRAME;
+    }
+    if (!rx_mac_accept(s, p, buf)) {
+        return size;
+    }
+    ch = rx_channel(s, p, buf, len);
+    if (!rx_deliver(s, p, ch, buf, len)) {
+        return 0;                       /* queued; flushed on tail write */
+    }
+    mmc_inc(s, p, MMC_RX_PACKETS_GB, 1);
+    mmc_inc(s, p, MMC_RX_OCTETS_GB, len);
+    mmc_inc(s, p, MMC_RX_OCTETS_G, len);
+    mmc_inc(s, p, is_broadcast_ether_addr(buf) ? MMC_RX_BROADCAST :
+                  is_multicast_ether_addr(buf) ? MMC_RX_MULTICAST :
+                  MMC_RX_UNICAST, 1);
+    return size;
+}
+
+static void rx_kick(Tc4xGethState *s)
+{
+    for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
+        if (s->port[p].nic) {
+            qemu_flush_queued_packets(qemu_get_queue(s->port[p].nic));
+        }
+    }
+}
+
+static void geth_core_reset(Tc4xGethState *s)
+{
+    memset(&s->regs[CORE_BASE / 4], 0, TC4X_GETH_SIZE - CORE_BASE);
+    for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
+        uint32_t base = PORT_BASE(p);
+
+        sreg(s, base + MAC_VERSION, 0x00003052u);
+        /* GMII/RGMII, TS, TX/RX COE, 32 extra MAC addresses */
+        sreg(s, base + MAC_HW_FEATURE0, 0x087C5003u | (31u << 18));
+        sreg(s, base + MAC_HW_FEATURE1, 0x00000000u | (2u << 14));
+        sreg(s, base + MAC_HW_FEATURE2, 0x07070707u);
+        sreg(s, base + MAC_ADDRESS_HIGH(0), 0x8000FFFFu);
+        sreg(s, base + MAC_ADDRESS_LOW(0), 0xFFFFFFFFu);
+    }
+    for (int ch = 0; ch < TC4X_GETH_NUM_DMA; ch++) {
+        s->dma[ch].tx_cur = s->dma[ch].rx_cur = 0;
+        s->dma[ch].txlen = 0;
+    }
+    geth_update_irq(s);
+}
+
+static void geth_reset_hold(Object *obj, ResetType type)
+{
+    Tc4xGethState *s = TC4X_GETH(obj);
+
+    memset(s->regs, 0, sizeof(s->regs));
+    sreg(s, R_CLC, CLC_DISR | CLC_DISS);
+    for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
+        Tc4xGethPort *port = &s->port[p];
+
+        if (port->phy && port->phy->reset) {
+            port->phy->reset(port->phy_opaque);
+        }
+    }
+    geth_core_reset(s);
+}
+
+static uint32_t geth_read_word(Tc4xGethState *s, uint32_t off)
+{
+    uint32_t v = greg(s, off);
+
+    if (off == R_CLC) {
+        return (v & ~CLC_DISS) | ((v & CLC_DISR) ? CLC_DISS : 0);
+    }
+    return v;
+}
+
+static void geth_dma_ch_write(Tc4xGethState *s, int ch, uint32_t r,
+                              uint32_t val)
+{
+    Tc4xGethDma *dma = &s->dma[ch];
+
+    switch (r) {
+    case CH_STATUS:
+        val = chreg(s, ch, CH_STATUS) & ~val;
+        if (!(val & (ST_TI | ST_RI))) {
+            val &= ~ST_NIS;
+        }
+        if (!(val & (ST_TBU | ST_RBU))) {
+            val &= ~ST_AIS;
+        }
+        chset(s, ch, r, val);
+        geth_update_irq(s);
+        return;
+    case CH_CUR_TXDESC:
+    case CH_CUR_RXDESC:
+    case CH_CUR_TXBUF:
+    case CH_CUR_RXBUF:
+    case CH_MISS_PACKET_CNT:
+        return;                         /* read-only */
+    }
+    chset(s, ch, r, val);
+    switch (r) {
+    case CH_TXDESC_LIST:
+        dma->tx_cur = val;
+        chset(s, ch, CH_CUR_TXDESC, val);
+        break;
+    case CH_RXDESC_LIST:
+        dma->rx_cur = val;
+        chset(s, ch, CH_CUR_RXDESC, val);
+        break;
+    case CH_TX_CONTROL:
+    case CH_TXDESC_TAIL:
+        tx_process(s, ch);
+        break;
+    case CH_RXDESC_TAIL:
+        /*
+         * A tail pointer write resumes a suspended RX DMA and clears RBU.
+         * RBU is set again if the frame waiting in the queue still finds
+         * no free descriptor.
+         */
+        val = chreg(s, ch, CH_STATUS) & ~ST_RBU;
+        chset(s, ch, CH_STATUS,
+              (val & (ST_TBU | ST_RBU)) ? val : (val & ~ST_AIS));
+        geth_update_irq(s);
+        rx_kick(s);
+        break;
+    case CH_RX_CONTROL:
+        rx_kick(s);
+        break;
+    case CH_INTERRUPT_ENABLE:
+        geth_update_irq(s);
+        break;
+    }
+}
+
+static void geth_write_word(Tc4xGethState *s, uint32_t off, uint32_t val)
+{
+    if (off == R_RST_CTRLA || off == R_RST_CTRLB) {
+        if (off == R_RST_CTRLB && (val & RST_CTRLB_STATCLR)) {
+            sreg(s, R_RST_STAT, 0);
+        }
+        sreg(s, off, val & RST_KRST);
+        if ((greg(s, R_RST_CTRLA) & RST_KRST) &&
+            (greg(s, R_RST_CTRLB) & RST_KRST)) {
+            geth_core_reset(s);
+            sreg(s, R_RST_CTRLA, 0);
+            sreg(s, R_RST_CTRLB, 0);
+            sreg(s, R_RST_STAT, RST_KRST);
+        }
+        return;
+    }
+    if (off == R_RST_STAT || off == DMA_INTERRUPT_STATUS) {
+        return;
+    }
+    if (off == DMA_MODE) {
+        if (val & DMA_MODE_SWR) {
+            geth_core_reset(s);
+        }
+        sreg(s, off, val & ~DMA_MODE_SWR);
+        return;
+    }
+    if (off >= DMA_CH_BASE && off < DMA_CH_END) {
+        geth_dma_ch_write(s, (off - DMA_CH_BASE) / DMA_CH_STRIDE,
+                          (off - DMA_CH_BASE) % DMA_CH_STRIDE, val);
+        return;
+    }
+    if (off >= PORT_BASE(0) && off < PORT_BASE(TC4X_GETH_NUM_PORTS)) {
+        int p = PORT_OF(off);
+        uint32_t r = off - PORT_BASE(p);
+
+        switch (r) {
+        case MDIO_DATA:
+            sreg(s, off, val);
+            if (val & MDIO_SBUSY) {
+                mdio_command(s, p, val);
+            }
+            return;
+        case MAC_VLAN_TAG_CTRL:
+            sreg(s, off, val & ~BIT(0));        /* OB: busy self-clears */
+            return;
+        case MAC_VERSION:
+        case MAC_HW_FEATURE0:
+        case MAC_HW_FEATURE1:
+        case MAC_HW_FEATURE2:
+        case MAC_INTERRUPT_STATUS:
+            return;
+        case MAC_INTERRUPT_ENABLE:
+            sreg(s, off, val);
+            geth_update_irq(s);
+            return;
+        case MAC_RX_CONFIGURATION:
+            sreg(s, off, val);
+            rx_kick(s);
+            return;
+        }
+        if (r >= MTL_TCQ_BASE && r < MTL_TCQ_END &&
+            (r - MTL_TCQ_BASE) % MTL_TCQ_STRIDE == 0) {
+            val &= ~BIT(0);                     /* FTQ: flush completes */
+        }
+    }
+    sreg(s, off, val);
+}
+
+/*
+ * Reads of registers without side effects (all but CLC and the MAC port
+ * registers) are served without the BQL, so busy-polling the DMA channel
+ * status does not contend for it.
+ */
+static bool geth_read_is_plain(uint32_t off)
+{
+    return off != R_CLC &&
+           (off < PORT_BASE(0) || off >= PORT_BASE(TC4X_GETH_NUM_PORTS));
+}
+
+
+static uint64_t geth_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Tc4xGethState *s = opaque;
+    uint32_t off = addr & ~3u;
+    uint32_t word;
+
+    if (geth_read_is_plain(off)) {
+        word = greg(s, off);
+    } else {
+        BQL_LOCK_GUARD();
+        word = geth_read_word(s, off);
+    }
+    return extract32(word, (addr & 3) * 8, size * 8);
+}
+
+static void geth_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    Tc4xGethState *s = opaque;
+    uint32_t off = addr & ~3u;
+    uint32_t word = val;
+
+    BQL_LOCK_GUARD();
+    if (size < 4) {
+        /* the bytes not written clear no channel status bits */
+        bool w1c = off >= DMA_CH_BASE && off < DMA_CH_END &&
+                   (off - DMA_CH_BASE) % DMA_CH_STRIDE == CH_STATUS;
+
+        word = deposit32(w1c ? 0 : greg(s, off), (addr & 3) * 8, size * 8,
+                         val);
+    }
+    geth_write_word(s, off, word);
+}
+
+static const MemoryRegionOps geth_ops = {
+    .read = geth_read,
+    .write = geth_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static NetClientInfo geth_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = geth_can_receive,
+    .receive = geth_receive,
+};
+
+static void geth_realize(DeviceState *dev, Error **errp)
+{
+    Tc4xGethState *s = TC4X_GETH(dev);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    memory_region_init_io(&s->geth_mr, OBJECT(s), &geth_ops, s, "geth0",
+                          TC4X_GETH_SIZE);
+    memory_region_enable_lockless_io(&s->geth_mr);
+    sysbus_init_mmio(sbd, &s->geth_mr);
+    for (int i = 0; i < TC4X_GETH_NUM_IRQ; i++) {
+        sysbus_init_irq(sbd, &s->irq[i]);
+    }
+
+    for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
+        Tc4xGethPort *port = &s->port[p];
+        g_autofree char *id = g_strdup_printf("%s.port%d",
+                                              dev->id ? dev->id : "geth0", p);
+
+        port->s = s;
+        port->index = p;
+        if (p > 0 && !port->conf.peers.ncs[0]) {
+            continue;                   /* unused extra port: no NIC */
+        }
+        qemu_macaddr_default_if_unset(&port->conf.macaddr);
+        port->nic = qemu_new_nic(&geth_net_info, &port->conf,
+                                 object_get_typename(OBJECT(dev)), id,
+                                 &dev->mem_reentrancy_guard, port);
+        qemu_format_nic_info_str(qemu_get_queue(port->nic),
+                                 port->conf.macaddr.a);
+    }
+}
+
+static const Property geth_properties[] = {
+    DEFINE_NIC_PROPERTIES(Tc4xGethState, port[0].conf),
+    DEFINE_PROP_MACADDR("mac1", Tc4xGethState, port[1].conf.macaddr),
+    DEFINE_PROP_NETDEV("netdev1", Tc4xGethState, port[1].conf.peers),
+};
+
+static void geth_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+
+    dc->desc = "TC4x GETH Ethernet controller";
+    dc->realize = geth_realize;
+    rc->phases.hold = geth_reset_hold;
+    device_class_set_props(dc, geth_properties);
+    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+}
+
+static const TypeInfo geth_types[] = {
+    {
+        .name = TYPE_TC4X_GETH,
+        .parent = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(Tc4xGethState),
+        .class_init = geth_class_init,
+    },
+};
+
+DEFINE_TYPES(geth_types)
+
+void tc4x_geth_attach_phy(DeviceState *dev, unsigned port, uint8_t addr,
+                          const Tc4xGethPhyOps *ops, void *opaque)
+{
+    Tc4xGethState *s = TC4X_GETH(dev);
+    Tc4xGethPort *p;
+
+    assert(port < TC4X_GETH_NUM_PORTS);
+    p = &s->port[port];
+    p->phy_addr = addr;
+    p->phy = ops;
+    p->phy_opaque = opaque;
+}
+
+DeviceState *tc4x_geth_create(MemoryRegion *sysmem)
+{
+    DeviceState *dev = qdev_new(TYPE_TC4X_GETH);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    NICInfo *nd;
+
+    qemu_configure_nic_device(dev, true, NULL);
+    nd = qemu_find_nic_info(TC4X_GETH_PORT1_MODEL, false, NULL);
+    if (nd) {
+        qdev_prop_set_macaddr(dev, "mac1", nd->macaddr.a);
+        if (nd->netdev) {
+            qdev_prop_set_netdev(dev, "netdev1", nd->netdev);
+        }
+        nd->instantiated = 1;
+    }
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    memory_region_add_subregion_overlap(sysmem, TC4X_GETH_BASE,
+                                        sysbus_mmio_get_region(sbd, 0), 1);
+    return dev;
+}

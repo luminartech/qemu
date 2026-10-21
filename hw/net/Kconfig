@@ -119,6 +119,9 @@ config COLDFIRE
 config XILINX_ETHLITE
     bool
 
+config TC4X_GETH
+    bool
+
 config VIRTIO_NET
     bool
     default y

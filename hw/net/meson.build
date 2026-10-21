@@ -43,6 +43,7 @@ system_ss.add(when: 'CONFIG_NPCM8XX', if_true: files('npcm_pcs.c'))
 system_ss.add(when: 'CONFIG_COLDFIRE', if_true: files('mcf_fec.c'))
 specific_ss.add(when: 'CONFIG_PSERIES', if_true: files('spapr_llan.c'))
 system_ss.add(when: 'CONFIG_XILINX_ETHLITE', if_true: files('xilinx_ethlite.c'))
+system_ss.add(when: 'CONFIG_TC4X_GETH', if_true: files('tc4x_geth.c'))
 
 system_ss.add(when: 'CONFIG_VIRTIO_NET', if_true: files('net_rx_pkt.c'))
 system_ss.add(when: 'CONFIG_VIRTIO_NET', if_true: files('virtio-net.c'))
