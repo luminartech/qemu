@@ -40,4 +40,15 @@ void tc4x_qspi_set_rx_fed(Tc4xSoc *soc, unsigned module, bool fed);
 void tc4x_qspi_lock(Tc4xSoc *soc);
 void tc4x_qspi_unlock(Tc4xSoc *soc);
 
+/*
+ * Sim-bridge and sfr-script commands whose name starts with @prefix.  @fn
+ * returns false for a command it does not know, else appends its reply
+ * lines (ending in "ok ..." or "err ...") to @out.  With @qspi_lock the
+ * command runs under the QSPI lock (it touches QSPI slave state).
+ */
+typedef bool (*Tc4xSimCommandFn)(void *opaque, int argc, char **argv,
+                                 GString *out);
+void tc4x_sim_add_command(Tc4xSoc *soc, const char *prefix,
+                          Tc4xSimCommandFn fn, void *opaque, bool qspi_lock);
+
 #endif

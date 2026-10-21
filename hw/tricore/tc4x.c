@@ -29,6 +29,7 @@
 #include "hw/core/qdev-properties.h"
 #include "chardev/char-fe.h"
 #include "system/system.h"
+#include "system/runstate.h"
 #include "system/reset.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
@@ -292,6 +293,7 @@ typedef struct Tc4xSfrForces {
 
 typedef struct Tc4xSfrPage {
     uint32_t val[SFR_PAGE_WORDS];
+    uint32_t reads[SFR_PAGE_WORDS];     /* since the last "hot" query */
     /* written, or its first read logged as unimplemented */
     unsigned long known[BITS_TO_LONGS(SFR_PAGE_WORDS)];
     Tc4xSfrForces *forces;
@@ -301,6 +303,13 @@ typedef struct Tc4xQspiSlave {
     const Tc4xQspiSlaveOps *ops;
     void *opaque;
 } Tc4xQspiSlave;
+
+typedef struct Tc4xSimCommand {
+    const char *prefix;
+    Tc4xSimCommandFn fn;
+    void *opaque;
+    bool qspi_lock;
+} Tc4xSimCommand;
 
 struct Tc4xSoc {
     MachineState parent_obj;
@@ -319,6 +328,7 @@ struct Tc4xSoc {
 
     Tc4xSfrPage **sfr_l1[SFR_L1_SIZE];
     GHashTable *tom_cn0;   /* TOM CN0 addr -> Tc4xTomCounter */
+    GHashTable *watches;
     /*
      * Interrupt router.  Cores acknowledge interrupts without the BQL, so
      * pending, cpu_prio and the SRC registers' SRR bits are under ir_lock.
@@ -333,6 +343,10 @@ struct Tc4xSoc {
     CharFrontend uart;
     uint8_t rx_fifo[ASCLIN_RXFIFO_DEPTH];
     unsigned rx_head, rx_count;
+
+    CharFrontend sim;
+    GString *sim_line;
+    GArray *sim_commands;   /* Tc4xSimCommand */
 
     GQueue *qspi_rx[QSPI_COUNT];
     Tc4xQspiSlave qspi_slave[QSPI_COUNT][QSPI_CS_COUNT];
@@ -350,6 +364,7 @@ struct Tc4xSoc {
     uint32_t cmd_class;
 
     uint32_t boot_pc;
+    char *sfr_script;
 };
 
 static void *sfr_publish(void **slot, size_t size)
@@ -422,6 +437,20 @@ static uint32_t reg_apply_force(Tc4xSfrPage *pg, unsigned w, uint32_t v)
     uint32_t mask = f ? qatomic_read(&f->mask[w]) : 0;
 
     return mask ? (v & ~mask) | (qatomic_read(&f->value[w]) & mask) : v;
+}
+
+static void G_GNUC_PRINTF(2, 3) sim_printf(Tc4xSoc *s, const char *fmt, ...)
+{
+    va_list ap;
+    g_autofree char *line = NULL;
+
+    if (!qemu_chr_fe_backend_connected(&s->sim)) {
+        return;
+    }
+    va_start(ap, fmt);
+    line = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    qemu_chr_fe_write_all(&s->sim, (const uint8_t *)line, strlen(line));
 }
 
 static void ir_update(Tc4xSoc *s)
@@ -1519,6 +1548,11 @@ static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
     }
 }
 
+static void sfr_count_read(Tc4xSoc *s, uint32_t addr)
+{
+    qatomic_inc(&sfr_page(s, addr, true)->reads[sfr_word(addr)]);
+}
+
 static uint64_t sfr_read(void *opaque, hwaddr offset, unsigned size,
                          uint32_t base)
 {
@@ -1527,6 +1561,7 @@ static uint64_t sfr_read(void *opaque, hwaddr offset, unsigned size,
     uint32_t shift = (addr & 3) * 8;
     uint32_t word = sfr_read_word(s, addr & ~3u);
 
+    sfr_count_read(s, addr);
     return extract32(word, shift, size * 8);
 }
 
@@ -1541,6 +1576,10 @@ static void sfr_write(void *opaque, hwaddr offset, uint64_t val,
 
     if (size < 4) {
         word = deposit32(reg_get(s, aligned), shift, size * 8, val);
+    }
+    if (g_hash_table_contains(s->watches, GUINT_TO_POINTER(aligned))) {
+        sim_printf(s, "ev w 0x%08x 0x%08x %u %d\n", aligned, word,
+                   size, current_cpu ? current_cpu->cpu_index : -1);
     }
     sfr_write_word(s, aligned, word);
 }
@@ -1580,6 +1619,174 @@ static const MemoryRegionOps sfr_f_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 8 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
+
+void tc4x_sim_add_command(Tc4xSoc *s, const char *prefix, Tc4xSimCommandFn fn,
+                          void *opaque, bool qspi_lock)
+{
+    Tc4xSimCommand c = {
+        .prefix = prefix, .fn = fn, .opaque = opaque, .qspi_lock = qspi_lock,
+    };
+
+    g_array_append_val(s->sim_commands, c);
+}
+
+/*
+ * Only commands registered with qspi_lock take the QSPI lock: vmstop waits
+ * for vCPUs, which may wait for it.
+ */
+static bool sim_needs_qspi_lock(Tc4xSoc *s, const char *name)
+{
+    for (guint i = 0; i < s->sim_commands->len; i++) {
+        Tc4xSimCommand *c = &g_array_index(s->sim_commands, Tc4xSimCommand, i);
+
+        if (c->qspi_lock && g_str_has_prefix(name, c->prefix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
+{
+    uint64_t a[4] = { 0 };
+
+    for (int i = 1; i < argc && i <= 3; i++) {
+        a[i] = g_ascii_strtoull(argv[i], NULL, 0);
+    }
+
+    if (!strcmp(argv[0], "r") && argc >= 2) {
+        uint32_t size = argc >= 3 ? a[2] : 4;
+        uint32_t v = 0;
+
+        if (size != 1 && size != 2 && size != 4) {
+            sim_printf(s, "err size must be 1, 2 or 4\n");
+            return;
+        }
+        address_space_read(&address_space_memory, a[1],
+                           MEMTXATTRS_UNSPECIFIED, &v, size);
+        sim_printf(s, "ok 0x%08x\n", le32_to_cpu(v));
+    } else if (!strcmp(argv[0], "w") && argc >= 3) {
+        uint32_t size = argc >= 4 ? a[3] : 4;
+        uint32_t v = cpu_to_le32(a[2]);
+
+        if (size != 1 && size != 2 && size != 4) {
+            sim_printf(s, "err size must be 1, 2 or 4\n");
+            return;
+        }
+        address_space_write(&address_space_memory, a[1],
+                            MEMTXATTRS_UNSPECIFIED, &v, size);
+        sim_printf(s, "ok\n");
+    } else if (!strcmp(argv[0], "poke") && argc >= 3) {
+        reg_set(s, a[1] & ~3u, a[2]);
+        sim_printf(s, "ok\n");
+    } else if (!strcmp(argv[0], "force") && argc >= 3) {
+        reg_force(s, a[1] & ~3u, a[2], argc >= 4 ? a[3] : 0xFFFFFFFFu);
+        sim_printf(s, "ok\n");
+    } else if (!strcmp(argv[0], "unforce") && argc >= 2) {
+        reg_force(s, a[1] & ~3u, 0, 0);
+        sim_printf(s, "ok\n");
+    } else if (!strcmp(argv[0], "irq") && argc >= 2) {
+        src_set_srr(s, a[1] & ~3u, true);
+        sim_printf(s, "ok\n");
+    } else if (!strcmp(argv[0], "watch") && argc >= 2) {
+        g_hash_table_add(s->watches, GUINT_TO_POINTER(a[1] & ~3u));
+        sim_printf(s, "ok\n");
+    } else if (!strcmp(argv[0], "unwatch") && argc >= 2) {
+        g_hash_table_remove(s->watches, GUINT_TO_POINTER(a[1] & ~3u));
+        sim_printf(s, "ok\n");
+    } else if (!strcmp(argv[0], "cores")) {
+        for (int c = 0; c < TC4X_NUM_CORES; c++) {
+            CPUTriCoreState *env = &s->cpu[c]->env;
+
+            sim_printf(s, "core %d pc 0x%08x %s icr 0x%08x prio %u "
+                       "d4 0x%08x d5 0x%08x d6 0x%08x a11 0x%08x\n",
+                       c, env->PC,
+                       env->boot_halted ? "bhalt" :
+                       CPU(s->cpu[c])->halted ? "wait" : "run",
+                       env->ICR, env->pending_irq_prio, env->gpr_d[4],
+                       env->gpr_d[5], env->gpr_d[6], env->gpr_a[11]);
+        }
+        sim_printf(s, "ok\n");
+    } else if (!strcmp(argv[0], "hot")) {
+        uint32_t min = argc >= 2 ? a[1] : 100;
+
+        for (uint32_t i1 = 0; i1 < SFR_L1_SIZE; i1++) {
+            Tc4xSfrPage **l2 = qatomic_load_acquire(&s->sfr_l1[i1]);
+
+            for (uint32_t i2 = 0; l2 && i2 < SFR_L2_SIZE; i2++) {
+                Tc4xSfrPage *pg = qatomic_load_acquire(&l2[i2]);
+                uint32_t page = (i1 << (SFR_PAGE_BITS + SFR_L2_BITS)) |
+                                (i2 << SFR_PAGE_BITS);
+
+                for (uint32_t w = 0; pg && w < SFR_PAGE_WORDS; w++) {
+                    uint32_t n = qatomic_xchg(&pg->reads[w], 0);
+
+                    if (n >= min) {
+                        sim_printf(s, "hot 0x%08x %u 0x%08x\n",
+                                   page + w * 4, n,
+                                   qatomic_read(&pg->val[w]));
+                    }
+                }
+            }
+        }
+        sim_printf(s, "ok\n");
+    } else if (!strcmp(argv[0], "vmstop")) {
+        vm_stop(RUN_STATE_PAUSED);
+        sim_printf(s, "ok\n");
+    } else if (!strcmp(argv[0], "vmcont")) {
+        vm_start();
+        sim_printf(s, "ok\n");
+    } else {
+        g_autoptr(GString) out = g_string_new(NULL);
+
+        for (guint i = 0; i < s->sim_commands->len; i++) {
+            Tc4xSimCommand *c = &g_array_index(s->sim_commands,
+                                               Tc4xSimCommand, i);
+
+            if (g_str_has_prefix(argv[0], c->prefix) &&
+                c->fn(c->opaque, argc, argv, out)) {
+                sim_printf(s, "%s", out->str);
+                return;
+            }
+        }
+        sim_printf(s, "err unknown command '%s'\n", argv[0]);
+    }
+}
+
+static void sim_exec(Tc4xSoc *s, char *line)
+{
+    g_auto(GStrv) argv = g_strsplit_set(g_strstrip(line), " \t", -1);
+    int argc = g_strv_length(argv);
+
+    if (argc == 0 || argv[0][0] == '\0' || argv[0][0] == '#') {
+        return;
+    }
+    if (sim_needs_qspi_lock(s, argv[0])) {
+        QEMU_LOCK_GUARD(&s->qspi_lock);
+        sim_exec_argv(s, argc, argv);
+        return;
+    }
+    sim_exec_argv(s, argc, argv);
+}
+
+static int sim_can_receive(void *opaque)
+{
+    return 256;
+}
+
+static void sim_receive(void *opaque, const uint8_t *buf, int size)
+{
+    Tc4xSoc *s = opaque;
+
+    for (int i = 0; i < size; i++) {
+        if (buf[i] == '\n') {
+            sim_exec(s, s->sim_line->str);
+            g_string_truncate(s->sim_line, 0);
+        } else if (buf[i] != '\r') {
+            g_string_append_c(s->sim_line, buf[i]);
+        }
+    }
+}
 
 static void add_ram(Tc4xSoc *s, MemoryRegion *mr, const char *name,
                     hwaddr base, uint64_t size)
@@ -1654,11 +1861,14 @@ static void tc4x_init(MachineState *ms)
 {
     Tc4xSoc *s = TC4X_MACHINE(ms);
     MemoryRegion *sysmem = get_system_memory();
+    s->watches = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->tom_cn0 = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                        NULL, g_free);
     s->pending = g_hash_table_new(g_direct_hash, g_direct_equal);
     qemu_rec_mutex_init(&s->ir_lock);
     qemu_rec_mutex_init(&s->qspi_lock);
+    s->sim_line = g_string_new(NULL);
+    s->sim_commands = g_array_new(false, false, sizeof(Tc4xSimCommand));
     for (int n = 0; n < QSPI_COUNT; n++) {
         s->qspi_rx[n] = g_queue_new();
         s->qspi_cs[n] = -1;
@@ -1729,6 +1939,25 @@ static void tc4x_init(MachineState *ms)
     qemu_chr_fe_init(&s->uart, serial_hd(0), &error_abort);
     qemu_chr_fe_set_handlers(&s->uart, uart_can_receive, uart_receive, NULL,
                              NULL, s, NULL, true);
+    if (serial_hd(1)) {
+        qemu_chr_fe_init(&s->sim, serial_hd(1), &error_abort);
+        qemu_chr_fe_set_handlers(&s->sim, sim_can_receive, sim_receive, NULL,
+                                 NULL, s, NULL, true);
+    }
+
+    if (s->sfr_script) {
+        g_autofree char *text = NULL;
+        g_auto(GStrv) lines = NULL;
+
+        if (!g_file_get_contents(s->sfr_script, &text, NULL, NULL)) {
+            error_report("tc4x: cannot read sfr-script '%s'", s->sfr_script);
+            exit(1);
+        }
+        lines = g_strsplit(text, "\n", -1);
+        for (int i = 0; lines[i]; i++) {
+            sim_exec(s, lines[i]);
+        }
+    }
 
     if (ms->kernel_filename) {
         g_auto(GStrv) files = g_strsplit(ms->kernel_filename, ",", -1);
@@ -1739,9 +1968,27 @@ static void tc4x_init(MachineState *ms)
     }
 }
 
+static char *tc4x_get_sfr_script(Object *obj, Error **errp)
+{
+    return g_strdup(TC4X_MACHINE(obj)->sfr_script);
+}
+
+static void tc4x_set_sfr_script(Object *obj, const char *value, Error **errp)
+{
+    Tc4xSoc *s = TC4X_MACHINE(obj);
+
+    g_free(s->sfr_script);
+    s->sfr_script = g_strdup(value);
+}
+
 static void tc4x_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+
+    object_class_property_add_str(oc, "sfr-script", tc4x_get_sfr_script,
+                                  tc4x_set_sfr_script);
+    object_class_property_set_description(oc, "sfr-script",
+        "File of sim-bridge commands (force/poke/watch) run at machine init");
 
     mc->desc = "Infineon AURIX TC4Dx (6x TriCore 1.8)";
     mc->init = tc4x_init;
