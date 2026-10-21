@@ -116,8 +116,8 @@ int64_t tc4x_guest_ns(Tc4xSoc *soc);
 int64_t tc4x_host_ns_for_guest(Tc4xSoc *soc, int64_t guest_ns);
 
 /*
- * Guest time changed its rate: @fn re-arms timers that wait for a guest
- * time (with tc4x_host_ns_for_guest())
+ * Guest time changed its rate or stood still: @fn re-arms timers that wait
+ * for a guest time (with tc4x_host_ns_for_guest())
  */
 typedef void (*Tc4xRetimeFn)(void *opaque);
 void tc4x_time_add_retime_notifier(Tc4xSoc *soc, Tc4xRetimeFn fn,

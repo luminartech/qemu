@@ -42,6 +42,7 @@
 #include "trace.h"
 #include "hw/core/irq.h"
 #include "hw/net/tc4x_geth.h"
+#include "hw/tricore/tc4x_pacer.h"
 #include "tc4x_soc.h"
 
 #define TC4X_NUM_CORES      6
@@ -258,6 +259,7 @@
 #define VMT_MEMDONE         0x8Cu
 #define VMT_MEMDONECS       0xC0u
 
+#define TC4X_ACK_LISTENERS_MAX  8
 #define TC4X_RETIME_MAX         16
 
 #define TYPE_TC4X_MACHINE MACHINE_TYPE_NAME("tc4x")
@@ -282,6 +284,7 @@ typedef struct Tc4xStmTimer {
     uint8_t cmp;
     bool fired;
     uint64_t fired_target;  /* compare value of the last match */
+    uint64_t due;           /* STM count the timer is armed for */
 } Tc4xStmTimer;
 
 /*
@@ -319,6 +322,14 @@ typedef struct Tc4xQspiSlave {
     const Tc4xQspiSlaveOps *ops;
     void *opaque;
 } Tc4xQspiSlave;
+
+typedef void (*Tc4xAckFn)(void *opaque, uint32_t src);
+
+typedef struct Tc4xAckListener {
+    uint32_t src;
+    Tc4xAckFn fn;
+    void *opaque;
+} Tc4xAckListener;
 
 typedef struct Tc4xRetimeNotifier {
     Tc4xRetimeFn fn;
@@ -359,19 +370,27 @@ struct Tc4xSoc {
     DeviceState *geth;
     /*
      * Interrupt router.  Cores acknowledge interrupts without the BQL, so
-     * pending, cpu_prio and the SRC registers' SRR bits are under ir_lock.
+     * pending, cpu_prio and the SRC registers' SRR bits are under ir_lock;
+     * acknowledges of listened SRCs reach their listeners later, under the
+     * BQL (ack_bh).
      */
     QemuRecMutex ir_lock;
     GHashTable *pending;   /* SRC addrs with SRR set */
     uint32_t cpu_prio[TC4X_NUM_CORES];
+    GArray *acked;         /* SRC addrs acknowledged since the last ack_bh */
+    QEMUBH *ack_bh;
+    /* set up at machine init, before the vCPUs run */
+    Tc4xAckListener ack_listeners[TC4X_ACK_LISTENERS_MAX];
+    unsigned n_ack_listeners;
 
     /*
-     * Guest time: the STM and eGTM run at 1/time_scale of QEMU virtual
-     * time.  Read on any thread under time_lock.
+     * Guest time: the STM and eGTM run at 1/time_scale of QEMU virtual time
+     * and stop at time_barrier.  Read on any thread under time_lock.
      */
     uint32_t time_scale;
     int64_t time_base_host;
     int64_t time_base_guest;
+    int64_t time_barrier;
     QemuSeqLock time_lock;
     GPtrArray *time_requests;
     Tc4xTimeRequest *bridge_time_request;
@@ -595,6 +614,47 @@ void tc4x_irq_raise(Tc4xSoc *s, uint32_t src)
     src_set_srr(s, src, true);
 }
 
+static bool ir_listened(Tc4xSoc *s, uint32_t src)
+{
+    for (unsigned i = 0; i < s->n_ack_listeners; i++) {
+        if (s->ack_listeners[i].src == src) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ir_ack_bh(void *opaque)
+{
+    Tc4xSoc *s = opaque;
+    g_autoptr(GArray) acked = g_array_new(false, false, sizeof(uint32_t));
+
+    WITH_QEMU_LOCK_GUARD(&s->ir_lock) {
+        g_array_append_vals(acked, s->acked->data, s->acked->len);
+        g_array_set_size(s->acked, 0);
+    }
+    for (guint i = 0; i < acked->len; i++) {
+        uint32_t src = g_array_index(acked, uint32_t, i);
+
+        for (unsigned k = 0; k < s->n_ack_listeners; k++) {
+            if (s->ack_listeners[k].src == src) {
+                s->ack_listeners[k].fn(s->ack_listeners[k].opaque, src);
+            }
+        }
+    }
+}
+
+/* @fn sees every acknowledge of @src, in the main loop */
+static void ir_add_ack_listener(Tc4xSoc *s, uint32_t src, Tc4xAckFn fn,
+                                void *opaque)
+{
+    QEMU_LOCK_GUARD(&s->ir_lock);
+    assert(s->n_ack_listeners < TC4X_ACK_LISTENERS_MAX);
+    s->ack_listeners[s->n_ack_listeners++] = (Tc4xAckListener) {
+        .src = src, .fn = fn, .opaque = opaque,
+    };
+}
+
 /* Called by a core taking an interrupt, without the BQL */
 static void ir_ack(void *opaque, uint32_t core, uint32_t prio)
 {
@@ -611,6 +671,10 @@ static void ir_ack(void *opaque, uint32_t core, uint32_t prio)
         if ((v & SRC_SRE) && (v & SRC_SRPN_MASK) == prio &&
             ((v >> SRC_TOS_SHIFT) & SRC_TOS_MASK) == core) {
             src_set_srr(s, src, false);
+            if (ir_listened(s, src)) {
+                g_array_append_val(s->acked, src);
+                qemu_bh_schedule(s->ack_bh);
+            }
             return;
         }
     }
@@ -638,7 +702,8 @@ static void src_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
 
 /*
  * Slowing guest time gives external processes more wall time per emulated
- * millisecond.
+ * millisecond.  Guest time does not run past time_barrier: an interrupt
+ * pacer stops it at its next tick, which the main loop raises late.
  */
 /* Guest time at QEMU virtual time @virt_ns, before any barrier */
 static int64_t guest_at(Tc4xSoc *s, int64_t virt_ns)
@@ -656,6 +721,7 @@ static int64_t guest_ns(Tc4xSoc *s)
     do {
         start = seqlock_read_begin(&s->time_lock);
         ns = guest_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        ns = MIN(ns, qatomic_read(&s->time_barrier));
     } while (seqlock_read_retry(&s->time_lock, start));
     return ns;
 }
@@ -726,6 +792,7 @@ static void stm_schedule(Tc4xSoc *s, int core, int vm, int cmp)
         delta = 1;
     }
     due = (now >> mstart << mstart) + (delta << mstart);
+    t->due = due;
     timer_mod(t->timer, host_ns_for_guest(s, muldiv64(due,
                                                       NANOSECONDS_PER_SECOND,
                                                       TC4X_STM_HZ)));
@@ -739,6 +806,10 @@ static void stm_fire(void *opaque)
     uint32_t icr = reg_get(s, stm_vm_reg(t->core, t->vm, STM_ICR));
     uint32_t os = (icr >> (t->cmp ? 5 : 1)) & 1;
 
+    if (stm_now(s) < t->due) {
+        /* guest time stands at a barrier, which re-arms it when it moves */
+        return;
+    }
     reg_set(s, isr_addr, reg_get(s, isr_addr) | BIT(t->cmp));
     t->fired = true;
     t->fired_target = reg_get(s, stm_vm_reg(t->core, t->vm,
@@ -2102,6 +2173,45 @@ void tc4x_time_add_retime_notifier(Tc4xSoc *s, Tc4xRetimeFn fn, void *opaque)
     s->retime[s->n_retime++] = (Tc4xRetimeNotifier) { fn, opaque };
 }
 
+/*
+ * Move the guest-time barrier to @barrier (INT64_MAX: none).  If guest time
+ * stood at the old barrier, it resumes from there (the wall time it stood
+ * still is not made up), so the mapping changes and timers are re-armed.
+ */
+static void time_barrier(Tc4xSoc *s, int64_t barrier)
+{
+    int64_t v, old, unclamped, now;
+    bool stood, held = false;
+
+    /*
+     * One clock sample inside the write section, so readers see guest time
+     * continue from the same instant across the update.  Guest time never
+     * runs backwards: a barrier behind it (a slot guest time ran past while
+     * the barrier was lifted, e.g. during a long tick hold) holds guest time
+     * where it is instead.
+     */
+    seqlock_write_begin(&s->time_lock);
+    v = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    old = qatomic_read(&s->time_barrier);
+    unclamped = guest_at(s, v);
+    stood = unclamped > old;
+    now = MIN(unclamped, old);
+    if (barrier < now) {
+        barrier = now;
+        held = true;
+    }
+    if (stood) {
+        qatomic_set(&s->time_base_host, v);
+        qatomic_set(&s->time_base_guest, now);
+    }
+    qatomic_set(&s->time_barrier, barrier);
+    seqlock_write_end(&s->time_lock);
+    trace_tc4x_time_barrier(barrier, held, stood);
+    if (stood) {
+        retime_all(s);
+    }
+}
+
 /* Guest time runs at 1/N of virtual time, continuous across the change */
 static void set_timescale(Tc4xSoc *s, uint32_t n)
 {
@@ -2109,7 +2219,7 @@ static void set_timescale(Tc4xSoc *s, uint32_t n)
 
     seqlock_write_begin(&s->time_lock);
     v = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    now = guest_at(s, v);
+    now = MIN(guest_at(s, v), qatomic_read(&s->time_barrier));
     qatomic_set(&s->time_base_host, v);
     qatomic_set(&s->time_base_guest, now);
     qatomic_set(&s->time_scale, MAX(1, n));
@@ -2141,6 +2251,162 @@ static void time_request(Tc4xSoc *s, Tc4xTimeRequest *r, uint32_t n)
     if (eff != s->time_scale) {
         set_timescale(s, eff);
     }
+}
+
+typedef struct Tc4xSocPacer {
+    Tc4xSoc *soc;
+    Tc4xPacer *pacer;
+    Tc4xTimeRequest *time_request;
+    QEMUTimer *timer[TC4X_PACER_TIMERS];
+} Tc4xSocPacer;
+
+static int64_t pacer_guest_ns(void *opaque)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    return guest_ns(sp->soc);
+}
+
+static int64_t pacer_host_ns(void *opaque)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+static int64_t pacer_host_ns_for_guest(void *opaque, int64_t ns)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    return host_ns_for_guest(sp->soc, ns);
+}
+
+static void pacer_barrier(void *opaque, int64_t ns)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    time_barrier(sp->soc, ns);
+}
+
+static void pacer_request_scale(void *opaque, uint32_t scale)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    time_request(sp->soc, sp->time_request, scale);
+}
+
+static uint32_t pacer_requested_scale(void *opaque)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    return sp->time_request->scale;
+}
+
+static bool pacer_pending(void *opaque, uint32_t src)
+{
+    Tc4xSocPacer *sp = opaque;
+    uint32_t v = reg_get(sp->soc, src);
+
+    return (v & (SRC_SRE | SRC_SRR)) == (SRC_SRE | SRC_SRR);
+}
+
+static void pacer_raise(void *opaque, uint32_t src)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    src_set_srr(sp->soc, src, true);
+}
+
+static uint32_t pacer_cpu_prio(void *opaque, unsigned core)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    return sp->soc->cpu[core]->env.ICR & 0xFFu;
+}
+
+static void pacer_timer_mod(void *opaque, Tc4xPacerTimer t, int64_t ns)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    timer_mod(sp->timer[t], ns);
+}
+
+static void pacer_timer_del(void *opaque, Tc4xPacerTimer t)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    timer_del(sp->timer[t]);
+}
+
+static const Tc4xPacerHost pacer_host = {
+    .guest_ns = pacer_guest_ns,
+    .host_ns = pacer_host_ns,
+    .host_ns_for_guest = pacer_host_ns_for_guest,
+    .barrier = pacer_barrier,
+    .request_scale = pacer_request_scale,
+    .requested_scale = pacer_requested_scale,
+    .pending = pacer_pending,
+    .raise = pacer_raise,
+    .cpu_prio = pacer_cpu_prio,
+    .timer_mod = pacer_timer_mod,
+    .timer_del = pacer_timer_del,
+};
+
+static void pacer_tick_timer(void *opaque)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    tc4x_pacer_timer(sp->pacer, TC4X_PACER_TIMER_TICK);
+}
+
+static void pacer_check_timer(void *opaque)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    tc4x_pacer_timer(sp->pacer, TC4X_PACER_TIMER_CHECK);
+}
+
+static void pacer_hold_timer(void *opaque)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    tc4x_pacer_timer(sp->pacer, TC4X_PACER_TIMER_HOLD);
+}
+
+static void pacer_acked(void *opaque, uint32_t src)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    tc4x_pacer_acked(sp->pacer, src);
+}
+
+static void pacer_retime(void *opaque)
+{
+    Tc4xSocPacer *sp = opaque;
+
+    tc4x_pacer_retime(sp->pacer);
+}
+
+Tc4xPacer *tc4x_pacer_new(Tc4xSoc *s, const Tc4xPacerConfig *cfg,
+                          const Tc4xPacerOps *ops, void *opaque)
+{
+    Tc4xSocPacer *sp = g_new0(Tc4xSocPacer, 1);
+
+    sp->soc = s;
+    sp->time_request = time_request_new(s);
+    sp->timer[TC4X_PACER_TIMER_TICK] =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, pacer_tick_timer, sp);
+    sp->timer[TC4X_PACER_TIMER_CHECK] =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, pacer_check_timer, sp);
+    sp->timer[TC4X_PACER_TIMER_HOLD] =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, pacer_hold_timer, sp);
+    sp->pacer = tc4x_pacer_create(&pacer_host, sp, cfg, ops, opaque);
+    for (unsigned i = 0; i < cfg->n_srcs; i++) {
+        ir_add_ack_listener(s, cfg->srcs[i], pacer_acked, sp);
+    }
+    if (cfg->hold_src) {
+        ir_add_ack_listener(s, cfg->hold_src, pacer_acked, sp);
+    }
+    tc4x_time_add_retime_notifier(s, pacer_retime, sp);
+    return sp->pacer;
 }
 
 void tc4x_sim_add_command(Tc4xSoc *s, const char *prefix, Tc4xSimCommandFn fn,
@@ -2437,6 +2703,8 @@ static void tc4x_init(MachineState *ms)
     s->pending = g_hash_table_new(g_direct_hash, g_direct_equal);
     qemu_rec_mutex_init(&s->ir_lock);
     qemu_rec_mutex_init(&s->qspi_lock);
+    s->acked = g_array_new(false, false, sizeof(uint32_t));
+    s->ack_bh = qemu_bh_new(ir_ack_bh, s);
     s->qspi_kick_bh = qemu_bh_new(qspi_kick_bh, s);
     s->sim_line = g_string_new(NULL);
     s->sim_commands = g_array_new(false, false, sizeof(Tc4xSimCommand));
@@ -2445,6 +2713,7 @@ static void tc4x_init(MachineState *ms)
         s->qspi_cs[n] = -1;
     }
     s->time_scale = 1;
+    s->time_barrier = INT64_MAX;
     seqlock_init(&s->time_lock);
     s->time_requests = g_ptr_array_new_with_free_func(g_free);
     s->bridge_time_request = time_request_new(s);
