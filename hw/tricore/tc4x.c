@@ -33,6 +33,7 @@
 #include "system/reset.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "migration/vmstate.h"
 #include "elf.h"
 #include "cpu.h"
 #include "trace.h"
@@ -365,6 +366,7 @@ struct Tc4xSoc {
 
     uint32_t boot_pc;
     char *sfr_script;
+    char *shm_dir;
 };
 
 static void *sfr_publish(void **slot, size_t size)
@@ -1788,10 +1790,23 @@ static void sim_receive(void *opaque, const uint8_t *buf, int size)
     }
 }
 
+/*
+ * With shm-dir set, every RAM is a shared file "<shm-dir>/<name>" that
+ * external processes can map.
+ */
 static void add_ram(Tc4xSoc *s, MemoryRegion *mr, const char *name,
                     hwaddr base, uint64_t size)
 {
-    memory_region_init_ram(mr, NULL, name, size, &error_fatal);
+    if (s->shm_dir) {
+        g_autofree char *path = g_strdup_printf("%s/%s", s->shm_dir, name);
+
+        g_mkdir_with_parents(s->shm_dir, 0700);
+        memory_region_init_ram_from_file(mr, NULL, name, size, 0, RAM_SHARED,
+                                         path, 0, &error_fatal);
+        vmstate_register_ram_global(mr);
+    } else {
+        memory_region_init_ram(mr, NULL, name, size, &error_fatal);
+    }
     memory_region_add_subregion(get_system_memory(), base, mr);
 }
 
@@ -1981,9 +1996,27 @@ static void tc4x_set_sfr_script(Object *obj, const char *value, Error **errp)
     s->sfr_script = g_strdup(value);
 }
 
+static char *tc4x_get_shm_dir(Object *obj, Error **errp)
+{
+    return g_strdup(TC4X_MACHINE(obj)->shm_dir);
+}
+
+static void tc4x_set_shm_dir(Object *obj, const char *value, Error **errp)
+{
+    Tc4xSoc *s = TC4X_MACHINE(obj);
+
+    g_free(s->shm_dir);
+    s->shm_dir = g_strdup(value);
+}
+
 static void tc4x_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+
+    object_class_property_add_str(oc, "shm-dir", tc4x_get_shm_dir,
+                                  tc4x_set_shm_dir);
+    object_class_property_set_description(oc, "shm-dir",
+        "Directory (e.g. /dev/shm/tc4x) for file-backed shared guest RAM");
 
     object_class_property_add_str(oc, "sfr-script", tc4x_get_sfr_script,
                                   tc4x_set_sfr_script);
