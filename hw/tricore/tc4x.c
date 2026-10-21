@@ -37,7 +37,7 @@
 #include "elf.h"
 #include "cpu.h"
 #include "trace.h"
-#include "hw/tricore/tc4x.h"
+#include "tc4x_soc.h"
 
 #define TC4X_NUM_CORES      6
 #define TC4X_CORE_RAM_SIZE  (2 * MiB)       /* DSPR + PSPR (at +1 MiB) */
@@ -357,6 +357,8 @@ struct Tc4xSoc {
     /* QSPI registers, RX queues and slaves, taken after the BQL */
     QemuRecMutex qspi_lock;
 
+    Tc4xGpio *gpio;
+
     uint8_t page_buf[DMU_PAGE_BUF_SIZE];
     unsigned page_len;
     uint32_t cmd_addr;
@@ -368,6 +370,11 @@ struct Tc4xSoc {
     char *sfr_script;
     char *shm_dir;
 };
+
+Tc4xGpio *tc4x_soc_gpio(Tc4xSoc *s)
+{
+    return s->gpio;
+}
 
 static void *sfr_publish(void **slot, size_t size)
 {
@@ -420,6 +427,16 @@ static void reg_set(Tc4xSoc *s, uint32_t addr, uint32_t val)
 
     qatomic_set(&pg->val[sfr_word(addr)], val);
     set_bit_atomic(sfr_word(addr), pg->known);
+}
+
+uint32_t tc4x_reg_get(Tc4xSoc *s, uint32_t addr)
+{
+    return reg_get(s, addr);
+}
+
+void tc4x_reg_set(Tc4xSoc *s, uint32_t addr, uint32_t val)
+{
+    reg_set(s, addr, val);
 }
 
 /* Pin the bits in @mask of @addr to @value for every read (mask 0: release) */
@@ -1383,7 +1400,9 @@ static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr)
     uint32_t off;
     int core;
 
-    if (addr == EGTM_TBU_CH0) {
+    if (tc4x_gpio_read(s->gpio, addr, &v)) {
+        /* served by the GPIO model */
+    } else if (addr == EGTM_TBU_CH0) {
         v = stm_now(s) & EGTM_TBU_MASK;
     } else if (sfr_is_cpu(addr, &core, &off)) {
         if (off == CPU_STM_ABS) {
@@ -1498,7 +1517,7 @@ static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
     if (asclin_write(s, addr, val)) {
         return;
     }
-    if (dma_write(s, addr, val)) {
+    if (dma_write(s, addr, val) || tc4x_gpio_write(s->gpio, addr, val)) {
         return;
     }
     if (tom_is_cn0(addr)) {
@@ -1888,6 +1907,8 @@ static void tc4x_init(MachineState *ms)
         s->qspi_rx[n] = g_queue_new();
         s->qspi_cs[n] = -1;
     }
+
+    s->gpio = tc4x_gpio_new(s);
     tc4x_force_soc_status(s);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {

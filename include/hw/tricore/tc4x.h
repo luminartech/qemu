@@ -16,6 +16,12 @@
 
 typedef struct Tc4xSoc Tc4xSoc;
 
+/* Stored value of the SFR at @addr (any thread) */
+uint32_t tc4x_reg_get(Tc4xSoc *soc, uint32_t addr);
+
+/* Store @val at @addr, no side effects (any thread) */
+void tc4x_reg_set(Tc4xSoc *soc, uint32_t addr, uint32_t val);
+
 /*
  * A slave on one chip select of a QSPI module.  BACONENTRY writes that
  * select it start a frame (@bacon: word length, bit order); every TX word
@@ -39,6 +45,19 @@ void tc4x_qspi_set_rx_fed(Tc4xSoc *soc, unsigned module, bool fed);
 /* The lock QSPI slaves run under, for board code that shares their state */
 void tc4x_qspi_lock(Tc4xSoc *soc);
 void tc4x_qspi_unlock(Tc4xSoc *soc);
+
+/* Output latch of P@port.@pin (any thread) */
+bool tc4x_gpio_out(Tc4xSoc *soc, unsigned port, unsigned pin);
+
+/* Drive (level 0/1) or release (level < 0) an input */
+void tc4x_gpio_set_input(Tc4xSoc *soc, unsigned port, unsigned pin,
+                         int level);
+
+/* @fn sees every change of port @port's output latch, @old to @new */
+typedef void (*Tc4xGpioListenerFn)(void *opaque, unsigned port, uint32_t old,
+                                   uint32_t new);
+void tc4x_gpio_add_listener(Tc4xSoc *soc, unsigned port,
+                            Tc4xGpioListenerFn fn, void *opaque);
 
 /*
  * Sim-bridge and sfr-script commands whose name starts with @prefix.  @fn
