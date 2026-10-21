@@ -124,6 +124,44 @@
 #define DMU_PF_WORDLINE     1024u
 #define DMU_PAGE_BUF_SIZE   512     /* IFXFLASH_PFLASH_BURST_LENGTH */
 
+/*
+ * TMADC kernels: MODSTAT follows the clock enable and MODCFG.RUN;
+ * IfxAdc_Tmadc_runModule() waits for the calibration phase (CALPH)
+ */
+#define ADC_CLKEN_TMADC     0xF5000890u
+#define TMADC_BASE          0xF5020000u
+#define TMADC_STRIDE        0x800u
+#define TMADC_COUNT         8u
+#define TMADC_MODCFG        0x000u
+#define TMADC_RUN           BIT(1)
+#define TMADC_MODSTAT       0x1D4u
+#define TMADC_MODSTAT_DIS   BIT(0)
+#define TMADC_MODSTAT_RUN   BIT(1)
+#define TMADC_MODSTAT_CALPH_DONE (2u << 2)
+
+/*
+ * Start-up status reported as done: CLOCK_RAMPSTAT.ACTIVE (IfxClock.c),
+ * VMTn_MEMDONE(CS) (the memory test sequence of IfxVmt.h)
+ */
+#define CLOCK_RAMPSTAT      0xF006420Cu
+/*
+ * PLLs: STAT.PWRSTAT and STAT.PLLLOCK follow CON0.PLLPWR (lock at once);
+ * IfxClock.c waits for both while it powers the PLLs up
+ */
+#define CLOCK_SYSPLLCON0    0xF0064300u
+#define CLOCK_SYSPLLSTAT    0xF006430Cu
+#define CLOCK_PERPLLCON0    0xF0064380u
+#define CLOCK_PERPLLSTAT    0xF006438Cu
+#define CLOCK_PLLCON0_PLLPWR BIT(0)
+#define CLOCK_PLLSTAT_PWRSTAT BIT(0)
+#define CLOCK_PLLSTAT_PLLLOCK BIT(1)
+#define CLOCK_RAMPSTAT_ACTIVE BIT(23)
+#define VMT_BASE            0xF0400000u
+#define VMT_STRIDE          0x20000u
+#define VMT_COUNT           7u
+#define VMT_MEMDONE         0x8Cu
+#define VMT_MEMDONECS       0xC0u
+
 #define TYPE_TC4X_MACHINE MACHINE_TYPE_NAME("tc4x")
 OBJECT_DECLARE_SIMPLE_TYPE(Tc4xSoc, TC4X_MACHINE)
 
@@ -148,10 +186,17 @@ typedef struct Tc4xStmTimer {
 #define SFR_L2_SIZE         (1u << SFR_L2_BITS)
 #define SFR_L1_SIZE         (1u << (32 - SFR_PAGE_BITS - SFR_L2_BITS))
 
+/* Bits pinned for reads whatever the register holds */
+typedef struct Tc4xSfrForces {
+    uint32_t value[SFR_PAGE_WORDS];
+    uint32_t mask[SFR_PAGE_WORDS];
+} Tc4xSfrForces;
+
 typedef struct Tc4xSfrPage {
     uint32_t val[SFR_PAGE_WORDS];
     /* written, or its first read logged as unimplemented */
     unsigned long known[BITS_TO_LONGS(SFR_PAGE_WORDS)];
+    Tc4xSfrForces *forces;
 } Tc4xSfrPage;
 
 struct Tc4xSoc {
@@ -246,6 +291,25 @@ static void reg_set(Tc4xSoc *s, uint32_t addr, uint32_t val)
 
     qatomic_set(&pg->val[sfr_word(addr)], val);
     set_bit_atomic(sfr_word(addr), pg->known);
+}
+
+/* Pin the bits in @mask of @addr to @value for every read (mask 0: release) */
+static void reg_force(Tc4xSoc *s, uint32_t addr, uint32_t value,
+                      uint32_t mask)
+{
+    Tc4xSfrPage *pg = sfr_page(s, addr, true);
+    Tc4xSfrForces *f = sfr_publish((void **)&pg->forces, sizeof(*f));
+
+    qatomic_set(&f->value[sfr_word(addr)], value);
+    qatomic_set(&f->mask[sfr_word(addr)], mask);
+}
+
+static uint32_t reg_apply_force(Tc4xSfrPage *pg, unsigned w, uint32_t v)
+{
+    Tc4xSfrForces *f = pg ? qatomic_load_acquire(&pg->forces) : NULL;
+    uint32_t mask = f ? qatomic_read(&f->mask[w]) : 0;
+
+    return mask ? (v & ~mask) | (qatomic_read(&f->value[w]) & mask) : v;
 }
 
 static void ir_update(Tc4xSoc *s)
@@ -701,6 +765,26 @@ static uint32_t sfr_read_word(Tc4xSoc *s, uint32_t addr)
         } else if (off == CPU_HRA_BOOTCON) {
             v = (v & ~1u) | (s->cpu[core]->env.boot_halted ? 1 : 0);
         }
+    } else if (addr >= TMADC_BASE &&
+               addr < TMADC_BASE + TMADC_COUNT * TMADC_STRIDE &&
+               (addr - TMADC_BASE) % TMADC_STRIDE == TMADC_MODSTAT) {
+        uint32_t n = (addr - TMADC_BASE) / TMADC_STRIDE;
+        bool clk = reg_get(s, ADC_CLKEN_TMADC) & BIT(n);
+        bool run = reg_get(s, TMADC_BASE + n * TMADC_STRIDE + TMADC_MODCFG) &
+                   TMADC_RUN;
+
+        /*
+         * The power-on calibration phase completes at once: MODSTAT.CALPH
+         * reads 10B (calibration completed) as soon as the clock runs.
+         */
+        v = (clk ? TMADC_MODSTAT_CALPH_DONE : TMADC_MODSTAT_DIS) |
+            (clk && run ? TMADC_MODSTAT_RUN : 0);
+    } else if (addr == CLOCK_SYSPLLSTAT || addr == CLOCK_PERPLLSTAT) {
+        uint32_t con0 = reg_get(s, addr == CLOCK_SYSPLLSTAT ?
+                                CLOCK_SYSPLLCON0 : CLOCK_PERPLLCON0);
+        uint32_t on = CLOCK_PLLSTAT_PWRSTAT | CLOCK_PLLSTAT_PLLLOCK;
+
+        v = (v & ~on) | ((con0 & CLOCK_PLLCON0_PLLPWR) ? on : 0);
     } else if (asclin_read(s, addr, &v)) {
         /* served by the ASCLIN model */
     } else {
@@ -713,7 +797,7 @@ static uint32_t sfr_read_word(Tc4xSoc *s, uint32_t addr)
         }
     }
 
-    return v;
+    return reg_apply_force(sfr_page(s, addr, false), sfr_word(addr), v);
 }
 
 static void sfr_write_word(Tc4xSoc *s, uint32_t addr, uint32_t val)
@@ -886,12 +970,25 @@ static void tc4x_reset(MachineState *ms, ResetType type)
     }
 }
 
+static void tc4x_force_soc_status(Tc4xSoc *s)
+{
+    reg_force(s, CLOCK_RAMPSTAT, CLOCK_RAMPSTAT_ACTIVE,
+              CLOCK_RAMPSTAT_ACTIVE);
+    for (unsigned n = 0; n < VMT_COUNT; n++) {
+        reg_force(s, VMT_BASE + n * VMT_STRIDE + VMT_MEMDONE, UINT32_MAX,
+                  UINT32_MAX);
+        reg_force(s, VMT_BASE + n * VMT_STRIDE + VMT_MEMDONECS, UINT32_MAX,
+                  UINT32_MAX);
+    }
+}
+
 static void tc4x_init(MachineState *ms)
 {
     Tc4xSoc *s = TC4X_MACHINE(ms);
     MemoryRegion *sysmem = get_system_memory();
     s->pending = g_hash_table_new(g_direct_hash, g_direct_equal);
     qemu_rec_mutex_init(&s->ir_lock);
+    tc4x_force_soc_status(s);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         g_autofree char *name = g_strdup_printf("core%d.spr", c);
