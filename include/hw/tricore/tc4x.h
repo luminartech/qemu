@@ -14,6 +14,8 @@
 #ifndef HW_TRICORE_TC4X_H
 #define HW_TRICORE_TC4X_H
 
+#include "hw/net/tc4x_geth.h"
+
 typedef struct Tc4xSoc Tc4xSoc;
 
 /* Stored value of the SFR at @addr (any thread) */
@@ -45,6 +47,10 @@ void tc4x_qspi_set_rx_fed(Tc4xSoc *soc, unsigned module, bool fed);
 /* The lock QSPI slaves run under, for board code that shares their state */
 void tc4x_qspi_lock(Tc4xSoc *soc);
 void tc4x_qspi_unlock(Tc4xSoc *soc);
+
+/* Attach a PHY at MDIO address @addr of GETH0 @port (see tc4x_geth.h) */
+void tc4x_geth_attach(Tc4xSoc *soc, unsigned port, uint8_t addr,
+                      const Tc4xGethPhyOps *ops, void *opaque);
 
 /* Output latch of P@port.@pin (any thread) */
 bool tc4x_gpio_out(Tc4xSoc *soc, unsigned port, unsigned pin);

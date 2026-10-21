@@ -37,6 +37,8 @@
 #include "elf.h"
 #include "cpu.h"
 #include "trace.h"
+#include "hw/core/irq.h"
+#include "hw/net/tc4x_geth.h"
 #include "tc4x_soc.h"
 
 #define TC4X_NUM_CORES      6
@@ -330,6 +332,7 @@ struct Tc4xSoc {
     Tc4xSfrPage **sfr_l1[SFR_L1_SIZE];
     GHashTable *tom_cn0;   /* TOM CN0 addr -> Tc4xTomCounter */
     GHashTable *watches;
+    DeviceState *geth;
     /*
      * Interrupt router.  Cores acknowledge interrupts without the BQL, so
      * pending, cpu_prio and the SRC registers' SRR bits are under ir_lock.
@@ -1879,6 +1882,34 @@ static void tc4x_reset(MachineState *ms, ResetType type)
     }
 }
 
+/* GETH0 lines 0..15 -> SRC_GETH0_DMA0..15, 16 -> SRC_GETH0_INTR */
+#define SRC_GETH0_DMA0      (SRC_BASE + 0xB90u)
+#define SRC_GETH0_INTR      (SRC_BASE + 0xBE0u)
+
+static void tc4x_geth_irq(void *opaque, int n, int level)
+{
+    if (level) {
+        src_set_srr(opaque, n == TC4X_GETH_IRQ_MAC ? SRC_GETH0_INTR :
+                    SRC_GETH0_DMA0 + 4 * n, true);
+    }
+}
+
+static void tc4x_geth_init(Tc4xSoc *s, MemoryRegion *sysmem)
+{
+    qemu_irq *lines = qemu_allocate_irqs(tc4x_geth_irq, s, TC4X_GETH_NUM_IRQ);
+
+    s->geth = tc4x_geth_create(sysmem);
+    for (int i = 0; i < TC4X_GETH_NUM_IRQ; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->geth), i, lines[i]);
+    }
+}
+
+void tc4x_geth_attach(Tc4xSoc *s, unsigned port, uint8_t addr,
+                      const Tc4xGethPhyOps *ops, void *opaque)
+{
+    tc4x_geth_attach_phy(s->geth, port, addr, ops, opaque);
+}
+
 static void tc4x_force_soc_status(Tc4xSoc *s)
 {
     reg_force(s, CLOCK_RAMPSTAT, CLOCK_RAMPSTAT_ACTIVE,
@@ -1971,6 +2002,7 @@ static void tc4x_init(MachineState *ms)
             }
         }
     }
+    tc4x_geth_init(s, sysmem);
 
     qemu_chr_fe_init(&s->uart, serial_hd(0), &error_abort);
     qemu_chr_fe_set_handlers(&s->uart, uart_can_receive, uart_receive, NULL,
