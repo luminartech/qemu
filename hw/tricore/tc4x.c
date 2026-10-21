@@ -272,6 +272,9 @@ typedef struct Tc4xStmPage {
     uint32_t base;
 } Tc4xStmPage;
 
+#define RST_KRST            BIT(0)
+#define RST_CTRLB_STATCLR   BIT(31)
+
 typedef struct Tc4xTomCounter {
     uint32_t start;     /* CN0 value written by software */
     int64_t t0_ns;      /* guest time of that write */
@@ -371,6 +374,8 @@ struct Tc4xSoc {
     MemoryRegion sfr_e, sfr_f;
 
     Tc4xSfrPage **sfr_l1[SFR_L1_SIZE];
+    GHashTable *reg_semantics;  /* addr -> const Tc4xRegSemantics */
+    GHashTable *kresets;   /* RST_CTRLB addr -> const Tc4xKernelReset */
     GHashTable *tom_cn0;   /* TOM CN0 addr -> Tc4xTomCounter */
     GHashTable *watches;
     DeviceState *geth;
@@ -1709,6 +1714,54 @@ static bool sfr_write_hook(Tc4xSoc *s, uint32_t addr, uint32_t val)
     return h && h->fn(h->opaque, addr, val);
 }
 
+/*
+ * Store @val through the register's write semantics.  Returns whether the
+ * register is plain storage, with the bits a write changes in @persist.
+ */
+static bool sfr_store(Tc4xSoc *s, uint32_t addr, uint32_t val,
+                      uint32_t *persist)
+{
+    const Tc4xRegSemantics *m =
+        g_hash_table_lookup(s->reg_semantics, GUINT_TO_POINTER(addr));
+    uint32_t v;
+
+    if (!m) {
+        reg_set(s, addr, val);
+        return true;
+    }
+    v = (reg_get(s, addr) & ~m->persist) | (val & m->persist);
+    v &= ~(val & m->w1c);
+    v &= ~(~val & m->w0c);
+    v |= val & m->w1s;
+    reg_set(s, addr, v);
+    *persist = m->persist;
+    return !m->w1c && !m->w0c && !m->w1s;
+}
+
+/*
+ * A write to a kernel reset CTRLB completes at once; false for others.
+ * The iLLD resetModule() functions wait for RST_STAT.KRST to set.
+ */
+static bool sfr_kernel_reset(Tc4xSoc *s, uint32_t addr, uint32_t val)
+{
+    const Tc4xKernelReset *k =
+        g_hash_table_lookup(s->kresets, GUINT_TO_POINTER(addr));
+
+    if (!k) {
+        return false;
+    }
+    if (val & RST_KRST) {
+        reg_set(s, k->stat, reg_get(s, k->stat) | RST_KRST);
+        reg_set(s, k->ctrla, reg_get(s, k->ctrla) & ~RST_KRST);
+        reg_set(s, addr, reg_get(s, addr) & ~RST_KRST);
+    }
+    if (val & RST_CTRLB_STATCLR) {
+        reg_set(s, k->stat, reg_get(s, k->stat) & ~RST_KRST);
+        reg_set(s, addr, reg_get(s, addr) & ~RST_CTRLB_STATCLR);
+    }
+    return true;
+}
+
 /* Writes of the QSPI modules: true when the write is consumed */
 static bool qspi_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
 {
@@ -1795,9 +1848,11 @@ static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
         return;
     }
 
-    reg_set(s, addr, val);
-    plain = tom_is_shadow(addr) &&
+    plain = sfr_store(s, addr, val, &persist) && tom_is_shadow(addr) &&
             !test_bit(sfr_word(addr), sfr_page(s, addr, true)->bql_only);
+    if (sfr_kernel_reset(s, addr, val)) {
+        return;
+    }
 
     if (!sfr_is_cpu(addr, &core, &off)) {
         if (plain) {
@@ -1904,7 +1959,16 @@ static void sfr_write(void *opaque, hwaddr offset, uint64_t val,
     uint32_t word = val;
 
     if (size < 4) {
+        const Tc4xRegSemantics *m =
+            g_hash_table_lookup(s->reg_semantics, GUINT_TO_POINTER(aligned));
+        uint32_t others = ~MAKE_64BIT_MASK(shift, size * 8);
+
         word = deposit32(reg_get(s, aligned), shift, size * 8, val);
+        if (m) {
+            /* the bytes not written clear and set nothing */
+            word &= ~(others & (m->w1c | m->w1s));
+            word |= others & m->w0c;
+        }
     }
     if (g_hash_table_contains(s->watches, GUINT_TO_POINTER(aligned))) {
         sim_printf(s, "ev w 0x%08x 0x%08x %u %d\n", aligned, word,
@@ -1987,7 +2051,7 @@ void tc4x_sfr_add_write_hook(Tc4xSoc *s, uint32_t addr, Tc4xSfrWriteFn fn,
 /*
  * TOM shadow registers without the BQL: a full-word write to an SR0/SR1
  * whose earlier write (under the BQL) took the default store path (no
- * watch) is plain storage.
+ * watch, no bits that clear or set on write) is plain storage.
  */
 static bool sfr_write_lockless(Tc4xSoc *s, uint32_t addr, uint32_t val,
                                unsigned size)
@@ -2745,6 +2809,21 @@ static Tc4xBoard *tc4x_board_create(const char *name)
     return TC4X_BOARD(object_new(type));
 }
 
+/* Register write semantics and kernel resets; later entries replace earlier */
+static void tc4x_add_semantics(Tc4xSoc *s, const Tc4xRegSemantics *sem,
+                               size_t n_sem, const Tc4xKernelReset *kr,
+                               size_t n_kr)
+{
+    for (size_t i = 0; i < n_sem; i++) {
+        g_hash_table_insert(s->reg_semantics, GUINT_TO_POINTER(sem[i].addr),
+                            (gpointer)&sem[i]);
+    }
+    for (size_t i = 0; i < n_kr; i++) {
+        g_hash_table_insert(s->kresets, GUINT_TO_POINTER(kr[i].ctrlb),
+                            (gpointer)&kr[i]);
+    }
+}
+
 static void tc4x_apply_board(Tc4xSoc *s, const Tc4xBoardClass *bc)
 {
     for (unsigned i = 0; i < bc->n_inputs; i++) {
@@ -2752,6 +2831,8 @@ static void tc4x_apply_board(Tc4xSoc *s, const Tc4xBoardClass *bc)
 
         tc4x_gpio_set_input(s, in->port, in->pin, in->level);
     }
+    tc4x_add_semantics(s, bc->reg_semantics, bc->n_reg_semantics,
+                       bc->kernel_resets, bc->n_kernel_resets);
 }
 
 static void tc4x_force_soc_status(Tc4xSoc *s)
@@ -2777,6 +2858,8 @@ static void tc4x_init(MachineState *ms)
     assert(bc->console < ASCLIN_COUNT);
     s->console = bc->console;
     s->watches = g_hash_table_new(g_direct_hash, g_direct_equal);
+    s->reg_semantics = g_hash_table_new(g_direct_hash, g_direct_equal);
+    s->kresets = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->tom_cn0 = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                        NULL, g_free);
     s->write_hooks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
@@ -2802,6 +2885,9 @@ static void tc4x_init(MachineState *ms)
     s->gpio = tc4x_gpio_new(s);
     s->adc = tc4x_adc_new(s);
     s->i2c = tc4x_i2c_new(s);
+    /* the SoC's own, from the iLLD SFR headers (tc4x_sfr_tables.c) */
+    tc4x_add_semantics(s, tc4x_reg_semantics, tc4x_n_reg_semantics,
+                       tc4x_kernel_resets, tc4x_n_kernel_resets);
     tc4x_apply_board(s, bc);
     tc4x_force_soc_status(s);
 
