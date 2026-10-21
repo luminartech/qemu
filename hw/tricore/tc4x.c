@@ -97,6 +97,33 @@
 #define ASCLIN_FLAGS_RFL    BIT(28)
 #define ASCLIN_RXFIFO_DEPTH 16
 
+/* DMU flash commands: the command sequences of the iLLD IfxFlash.h */
+#define DMU_HCI_STATUS      0xF8040004u
+#define DMU_HCI_ERR         0xF8040010u
+#define DMU_HCI_CLRERR      0xF8040014u
+#define DMU_CMD_BASE        0xF8080000u
+#define DMU_CMD_SIZE        0x10000u
+#define DMU_CMD_5554        0x5554u
+#define DMU_CMD_55F0        0x55F0u
+#define DMU_CMD_55F4        0x55F4u
+#define DMU_CMD_AA50        0xAA50u
+#define DMU_CMD_AA58        0xAA58u
+#define DMU_CMD_AAA8        0xAAA8u
+#define DMU_STATUS_DFPAGE   BIT(24)
+#define DMU_STATUS_PFPAGE   BIT(25)
+#define DMU_STATUS_REQDONE  BIT(31)
+#define DMU_ERR_SQER        BIT(1)
+#define DMU_ERR_PVER        BIT(6)
+#define DMU_ERR_EVER        BIT(7)
+#define DMU_DFLASH_BASE     0xAE000000u
+#define DMU_DF_SECTOR       (2 * KiB)
+#define DMU_PF_SECTOR       (16 * KiB)
+#define DMU_DF_PAGE         8u
+#define DMU_PF_PAGE         32u
+#define DMU_DF_WORDLINE     512u
+#define DMU_PF_WORDLINE     1024u
+#define DMU_PAGE_BUF_SIZE   512     /* IFXFLASH_PFLASH_BURST_LENGTH */
+
 #define TYPE_TC4X_MACHINE MACHINE_TYPE_NAME("tc4x")
 OBJECT_DECLARE_SIMPLE_TYPE(Tc4xSoc, TC4X_MACHINE)
 
@@ -157,6 +184,13 @@ struct Tc4xSoc {
     CharFrontend uart;
     uint8_t rx_fifo[ASCLIN_RXFIFO_DEPTH];
     unsigned rx_head, rx_count;
+
+    uint8_t page_buf[DMU_PAGE_BUF_SIZE];
+    unsigned page_len;
+    uint32_t cmd_addr;
+    uint32_t cmd_count;
+    bool cmd_armed;     /* AAA8 <- 0xA0 / 0x80 seen, waiting for the opcode */
+    uint32_t cmd_class;
 
     uint32_t boot_pc;
 };
@@ -480,6 +514,166 @@ static bool asclin_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
     return true;
 }
 
+static void dmu_status(Tc4xSoc *s, uint32_t set, uint32_t clr)
+{
+    reg_set(s, DMU_HCI_STATUS, (reg_get(s, DMU_HCI_STATUS) & ~clr) | set);
+}
+
+static void dmu_error(Tc4xSoc *s, uint32_t err)
+{
+    reg_set(s, DMU_HCI_ERR, reg_get(s, DMU_HCI_ERR) | err);
+}
+
+/* A command fails with SQER unless its range lies in one flash */
+static bool dmu_in_flash(Tc4xSoc *s, uint32_t addr, uint64_t len)
+{
+    MemoryRegionSection sec;
+    bool ok;
+
+    if (len == 0) {
+        return true;
+    }
+    sec = memory_region_find(get_system_memory(), addr, len);
+    ok = (sec.mr == &s->pflash || sec.mr == &s->dflash) &&
+         int128_get64(sec.size) == len;
+    if (sec.mr) {
+        memory_region_unref(sec.mr);
+    }
+    return ok;
+}
+
+static bool dmu_range_is(uint32_t addr, uint64_t len, uint8_t value)
+{
+    uint8_t buf[256];
+
+    while (len) {
+        uint32_t n = MIN(len, sizeof(buf));
+
+        address_space_read(&address_space_memory, addr,
+                           MEMTXATTRS_UNSPECIFIED, buf, n);
+        for (uint32_t i = 0; i < n; i++) {
+            if (buf[i] != value) {
+                return false;
+            }
+        }
+        addr += n;
+        len -= n;
+    }
+    return true;
+}
+
+static uint32_t dmu_sector_size(uint32_t addr)
+{
+    return (addr & 0x0F000000u) == (DMU_DFLASH_BASE & 0x0F000000u) ?
+           DMU_DF_SECTOR : DMU_PF_SECTOR;
+}
+
+static void dmu_execute(Tc4xSoc *s, uint32_t class, uint32_t opcode)
+{
+    uint32_t addr = s->cmd_addr;
+
+    if (class == 0xA0 && (opcode == 0xAA || opcode == 0xA6)) {
+        /* Write page / write burst: program the loaded page buffer */
+        if (!dmu_in_flash(s, addr, s->page_len)) {
+            dmu_error(s, DMU_ERR_SQER);
+        } else {
+            if (!dmu_range_is(addr, s->page_len, 0)) {
+                dmu_error(s, DMU_ERR_PVER);
+            }
+            address_space_write(&address_space_memory, addr,
+                                MEMTXATTRS_UNSPECIFIED, s->page_buf,
+                                s->page_len);
+        }
+        s->page_len = 0;
+        dmu_status(s, DMU_STATUS_REQDONE,
+                   DMU_STATUS_DFPAGE | DMU_STATUS_PFPAGE);
+    } else if (class == 0x80 && opcode == 0x50) {
+        /* Erase logical sector range: erased flash reads as zero */
+        uint64_t len = (uint64_t)s->cmd_count * dmu_sector_size(addr);
+
+        if (dmu_in_flash(s, addr, len)) {
+            address_space_set(&address_space_memory, addr, 0, len,
+                              MEMTXATTRS_UNSPECIFIED);
+        } else {
+            dmu_error(s, DMU_ERR_SQER);
+        }
+        dmu_status(s, DMU_STATUS_REQDONE, 0);
+    } else if (class == 0x80 &&
+               (opcode == 0x56 || opcode == 0x58 || opcode == 0x5F)) {
+        /*
+         * Verify erased page (0x56) / wordline (0x58) / logical sector
+         * range (0x5F); the page form takes count 0
+         */
+        bool df = dmu_sector_size(addr) == DMU_DF_SECTOR;
+        uint32_t page = df ? DMU_DF_PAGE : DMU_PF_PAGE;
+        uint32_t wordline = df ? DMU_DF_WORDLINE : DMU_PF_WORDLINE;
+        uint64_t len = opcode == 0x56 ? page :
+                       opcode == 0x58 ? wordline :
+                       (uint64_t)s->cmd_count * dmu_sector_size(addr);
+
+        if (!dmu_in_flash(s, addr, len)) {
+            dmu_error(s, DMU_ERR_SQER);
+        } else if (!dmu_range_is(addr, len, 0)) {
+            dmu_error(s, DMU_ERR_EVER);
+        }
+        dmu_status(s, DMU_STATUS_REQDONE, 0);
+    } else {
+        qemu_log_mask(LOG_UNIMP, "tc4x-dmu: command 0x%02x/0x%02x at 0x%08x "
+                      "completes without effect\n", class, opcode, addr);
+        dmu_status(s, DMU_STATUS_REQDONE, 0);
+    }
+}
+
+static void dmu_cmd_write(Tc4xSoc *s, uint32_t off, uint32_t val)
+{
+    switch (off) {
+    case DMU_CMD_5554:
+        if (val == 0xF0) {              /* reset to read */
+            s->page_len = 0;
+            s->cmd_armed = false;
+            dmu_status(s, 0, DMU_STATUS_DFPAGE | DMU_STATUS_PFPAGE);
+        } else if (val == 0xFA) {       /* clear status (F5: resume protection) */
+            dmu_status(s, 0, DMU_STATUS_REQDONE);
+            reg_set(s, DMU_HCI_ERR, 0);
+        } else if (val == 0x5D || val == 0x50) {  /* enter page mode */
+            s->page_len = 0;
+            dmu_status(s, val == 0x5D ? DMU_STATUS_DFPAGE : DMU_STATUS_PFPAGE,
+                       DMU_STATUS_REQDONE);
+        }
+        break;
+    case DMU_CMD_55F0:
+    case DMU_CMD_55F4:                  /* load page, 64-bit as two words */
+        if (s->page_len + 4 <= DMU_PAGE_BUF_SIZE) {
+            stl_le_p(&s->page_buf[s->page_len], val);
+            s->page_len += 4;
+        } else {
+            dmu_error(s, DMU_ERR_SQER);
+        }
+        break;
+    case DMU_CMD_AA50:
+        s->cmd_addr = val;
+        s->cmd_armed = false;
+        break;
+    case DMU_CMD_AA58:
+        s->cmd_count = val;
+        break;
+    case DMU_CMD_AAA8:
+        if (!s->cmd_armed) {
+            s->cmd_class = val;
+            s->cmd_armed = true;
+        } else {
+            s->cmd_armed = false;
+            dmu_status(s, 0, DMU_STATUS_REQDONE);
+            dmu_execute(s, s->cmd_class, val);
+        }
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "tc4x-dmu: command cycle +0x%04x <- 0x%08x\n",
+                      off, val);
+        break;
+    }
+}
+
 static bool sfr_is_cpu(uint32_t addr, int *core, uint32_t *off)
 {
     if (addr < CPU_SFR_BASE ||
@@ -532,6 +726,14 @@ static void sfr_write_word(Tc4xSoc *s, uint32_t addr, uint32_t val)
         return;
     }
     if (asclin_write(s, addr, val)) {
+        return;
+    }
+    if (addr >= DMU_CMD_BASE && addr < DMU_CMD_BASE + DMU_CMD_SIZE) {
+        dmu_cmd_write(s, addr - DMU_CMD_BASE, val);
+        return;
+    }
+    if (addr == DMU_HCI_CLRERR) {
+        reg_set(s, DMU_HCI_ERR, reg_get(s, DMU_HCI_ERR) & ~val);
         return;
     }
 
