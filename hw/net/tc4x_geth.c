@@ -5,11 +5,15 @@
  * ports.  No PHY is attached by default, so MDIO reads of a port return all
  * ones; board code attaches PHYs with tc4x_geth_attach_phy().
  * The PTP system time stamps frames in TX status and RX context descriptors.
+ * The on-chip HSPHY reports its calibration and DLL-lock status as done.
  *
- * Sources, all public: the GETH registers of the iLLD SFR headers and the
- * iLLD Ethernet driver (IfxGeth) bundled with the TC4D7 projects of
+ * Sources, all public: the GETH and HSPHY registers of the iLLD SFR headers
+ * and the iLLD Ethernet driver (IfxGeth) bundled with the TC4D7 projects of
  * https://github.com/Infineon/AURIX_code_examples; the DWC Ethernet QoS
- * descriptor and DMA behaviour as Linux's stmmac driver programs it.
+ * descriptor and DMA behaviour as Linux's stmmac driver programs it.  The
+ * HSPHY status completed at once is what the iLLD waits for: INITDONE in
+ * IfxHsphy.c, the DLL LOCKSTAT in IfxHsphy_Dll.c and the common calibration
+ * status read through PHYREG in IfxPcie.c.
  *
  * Copyright (c) 2026 MicroVision, Inc.
  *
@@ -174,6 +178,30 @@ OBJECT_DECLARE_SIMPLE_TYPE(Tc4xGethState, TC4X_GETH)
 /* TSA as it appears in RDES3 of the RX context descriptor */
 #define RDES3_CTX_TSA         BIT(4)
 
+#define HS_PHY_CTRL1(n)       (0x214u + (n) * 8u)
+#define HS_PHYREG_CTRL(n)     (0x230u + (n) * 8u)
+#define HS_PHYREG_DATA(n)     (0x234u + (n) * 8u)
+#define HS_DLL_CFG            0x628u
+#define HS_XPCS_FIRST         0x800000u
+#define HS_XPCS_STRIDE        0x800000u
+#define HS_PMA_TX_GENCTRL2    0x600C8u
+#define HS_PMA_RX_GENCTRL2    0x60148u
+#define HS_PCS_SR_XS_CTRL1    0xC0000u
+#define HS_PCS_VR_DIG_CTRL1   0xE0000u
+#define HS_PCS_VR_DIG_STS     0xE0040u
+#define HS_PHY_INITDONE       BIT(3)
+#define HS_PHYREG_ACT         BIT(19)
+#define HS_PHYREG_READ        BIT(17)
+#define HS_CMNCAL_DONE        BIT(1)
+#define HS_DLL_LOCKSTAT       BIT(30)
+#define HS_GENCTRL2_REQ       BIT(0)
+#define HS_SR_LPM             BIT(11)
+#define HS_SR_RST             BIT(15)
+#define HS_DIG_CTRL1_SELFCLR  (BIT(8) | BIT(10) | BIT(15))
+#define HS_PSEQ_SHIFT         2
+#define HS_PSEQ_NORMAL        4u
+#define HS_PSEQ_LPM           6u
+
 #define MAX_FRAME             16384
 #define MIN_FRAME             60
 #define VLAN_HLEN             4
@@ -209,6 +237,8 @@ struct Tc4xGethState {
 
     MemoryRegion geth_mr;
     uint32_t regs[TC4X_GETH_SIZE / 4];
+    MemoryRegion hsphy_mr;
+    GHashTable *hsphy;
     Tc4xGethPort port[TC4X_GETH_NUM_PORTS];
     Tc4xGethDma dma[TC4X_GETH_NUM_DMA];
     qemu_irq irq[TC4X_GETH_NUM_IRQ];
@@ -777,6 +807,7 @@ static void geth_reset_hold(Object *obj, ResetType type)
 
     memset(s->regs, 0, sizeof(s->regs));
     sreg(s, R_CLC, CLC_DISR | CLC_DISS);
+    g_hash_table_remove_all(s->hsphy);
     for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
         Tc4xGethPort *port = &s->port[p];
 
@@ -1033,6 +1064,94 @@ static const MemoryRegionOps geth_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+static uint32_t hs_get(Tc4xGethState *s, uint32_t off)
+{
+    return GPOINTER_TO_UINT(g_hash_table_lookup(s->hsphy,
+                                                GUINT_TO_POINTER(off)));
+}
+
+static void hs_set(Tc4xGethState *s, uint32_t off, uint32_t v)
+{
+    g_hash_table_insert(s->hsphy, GUINT_TO_POINTER(off), GUINT_TO_POINTER(v));
+}
+
+static uint32_t hsphy_read_word(Tc4xGethState *s, uint32_t off)
+{
+    uint32_t v = hs_get(s, off);
+
+    if (off == HS_PHY_CTRL1(0) || off == HS_PHY_CTRL1(1) ||
+        off == HS_PHY_CTRL1(2)) {
+        return v | HS_PHY_INITDONE;
+    }
+    if (off == HS_DLL_CFG) {
+        return v | HS_DLL_LOCKSTAT;
+    }
+    if (off >= HS_XPCS_FIRST && off < HS_XPCS_FIRST + 3 * HS_XPCS_STRIDE) {
+        uint32_t r = (off - HS_XPCS_FIRST) % HS_XPCS_STRIDE;
+        uint32_t base = off - r;
+
+        if (r == HS_PCS_VR_DIG_STS) {
+            bool lpm = hs_get(s, base + HS_PCS_SR_XS_CTRL1) & HS_SR_LPM;
+
+            return deposit32(v, HS_PSEQ_SHIFT, 3,
+                             lpm ? HS_PSEQ_LPM : HS_PSEQ_NORMAL);
+        }
+    }
+    return v;
+}
+
+static void hsphy_write_word(Tc4xGethState *s, uint32_t off, uint32_t val)
+{
+    if (off == HS_PHYREG_CTRL(0) || off == HS_PHYREG_CTRL(1) ||
+        off == HS_PHYREG_CTRL(2)) {
+        if ((val & HS_PHYREG_ACT) && (val & HS_PHYREG_READ)) {
+            /* on-chip HSPHY register read: report calibration done */
+            hs_set(s, off + 4, HS_CMNCAL_DONE);
+        }
+        val &= ~HS_PHYREG_ACT;
+    } else if (off >= HS_XPCS_FIRST &&
+               off < HS_XPCS_FIRST + 3 * HS_XPCS_STRIDE) {
+        uint32_t r = (off - HS_XPCS_FIRST) % HS_XPCS_STRIDE;
+
+        if (r == HS_PMA_TX_GENCTRL2 || r == HS_PMA_RX_GENCTRL2) {
+            val &= ~HS_GENCTRL2_REQ;
+        } else if (r == HS_PCS_VR_DIG_CTRL1) {
+            val &= ~HS_DIG_CTRL1_SELFCLR;
+        } else if (r == HS_PCS_SR_XS_CTRL1) {
+            val &= ~HS_SR_RST;
+        }
+    }
+    hs_set(s, off, val);
+}
+
+static uint64_t hsphy_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint32_t word = hsphy_read_word(opaque, addr & ~3u);
+
+    return extract32(word, (addr & 3) * 8, size * 8);
+}
+
+static void hsphy_write(void *opaque, hwaddr addr, uint64_t val,
+                        unsigned size)
+{
+    Tc4xGethState *s = opaque;
+    uint32_t off = addr & ~3u;
+    uint32_t word = val;
+
+    if (size < 4) {
+        word = deposit32(hs_get(s, off), (addr & 3) * 8, size * 8, val);
+    }
+    hsphy_write_word(s, off, word);
+}
+
+static const MemoryRegionOps hsphy_ops = {
+    .read = hsphy_read,
+    .write = hsphy_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 static NetClientInfo geth_net_info = {
     .type = NET_CLIENT_DRIVER_NIC,
     .size = sizeof(NICState),
@@ -1049,10 +1168,14 @@ static void geth_realize(DeviceState *dev, Error **errp)
                           TC4X_GETH_SIZE);
     memory_region_enable_lockless_io(&s->geth_mr);
     sysbus_init_mmio(sbd, &s->geth_mr);
+    memory_region_init_io(&s->hsphy_mr, OBJECT(s), &hsphy_ops, s, "hsphy",
+                          TC4X_HSPHY_SIZE);
+    sysbus_init_mmio(sbd, &s->hsphy_mr);
     for (int i = 0; i < TC4X_GETH_NUM_IRQ; i++) {
         sysbus_init_irq(sbd, &s->irq[i]);
     }
 
+    s->hsphy = g_hash_table_new(g_direct_hash, g_direct_equal);
     for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
         Tc4xGethPort *port = &s->port[p];
         g_autofree char *id = g_strdup_printf("%s.port%d",
@@ -1132,5 +1255,7 @@ DeviceState *tc4x_geth_create(MemoryRegion *sysmem)
     sysbus_realize_and_unref(sbd, &error_fatal);
     memory_region_add_subregion_overlap(sysmem, TC4X_GETH_BASE,
                                         sysbus_mmio_get_region(sbd, 0), 1);
+    memory_region_add_subregion_overlap(sysmem, TC4X_HSPHY_BASE,
+                                        sysbus_mmio_get_region(sbd, 1), 1);
     return dev;
 }

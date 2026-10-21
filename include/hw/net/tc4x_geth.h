@@ -31,6 +31,8 @@ typedef struct Tc4xGethPhyOps {
 
 #define TC4X_GETH_BASE        0xF9000000u
 #define TC4X_GETH_SIZE        0x20000u
+#define TC4X_HSPHY_BASE       0xF2000000u
+#define TC4X_HSPHY_SIZE       0x2000000u
 
 #define TC4X_GETH_NUM_PORTS   2
 #define TC4X_GETH_NUM_DMA     8
