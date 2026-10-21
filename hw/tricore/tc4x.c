@@ -35,6 +35,7 @@
 #include "elf.h"
 #include "cpu.h"
 #include "trace.h"
+#include "hw/tricore/tc4x.h"
 
 #define TC4X_NUM_CORES      6
 #define TC4X_CORE_RAM_SIZE  (2 * MiB)       /* DSPR + PSPR (at +1 MiB) */
@@ -139,6 +140,8 @@
 #define DMA_NUM_CH          (DMA_NUM_INST * DMA_CH_PER_INST)
 #define SRC_DMA0_CH_BASE    (SRC_BASE + 0x730u)
 #define SRC_DMA1_CH_BASE    (SRC_BASE + 0x980u)
+/* one lap of a circular hardware-request list */
+#define DMA_HW_MAX_TCS      64u
 #define DMA_RDCRCR          0x00u
 #define DMA_SDCRCR          0x04u
 #define DMA_SADR            0x08u
@@ -193,6 +196,37 @@
 #define EGTM_TOM_CN0        0x14u
 #define EGTM_TOM_CN0_MASK   0xFFFFFFu
 #define EGTM_CMU_HZ         100000000ULL
+
+#define QSPI_BASE           0xF4401000u
+#define QSPI_STRIDE         0x200u
+#define QSPI_COUNT          8u
+#define QSPI_CS_COUNT       16u
+#define QSPI_STATUS         0x140u
+#define QSPI_BACONENTRY     0x15Cu
+#define QSPI_DATAENTRY      0x160u
+#define QSPI_RXEXIT         0x180u
+#define QSPI_RXEXIT_END     0x1A0u
+#define QSPI_STATUS_TXF     BIT(9)
+#define QSPI_STATUS_RXF     BIT(10)
+#define QSPI_STATUS_PT1F    BIT(11)
+#define QSPI_STATUS_PT2F    BIT(12)
+#define QSPI_BACON_CS_SHIFT 28
+#define QSPI_RXLEVEL_SHIFT  20
+#define QSPI_RXLEVEL_MAX    15u
+#define QSPI_GLOBALCON1     0x114u
+#define QSPI_GLOBALCON1_TXEN BIT(9)
+#define QSPI_GLOBALCON1_RXEN BIT(10)
+#define QSPI_GLOBALCON1_PT2EN BIT(12)
+#define SRC_QSPI0_TX        (SRC_BASE + 0x460u)
+#define SRC_QSPI0_RX        (SRC_BASE + 0x464u)
+#define SRC_QSPI0_PT        (SRC_BASE + 0x46Cu)
+#define SRC_QSPI0_U         (SRC_BASE + 0x470u)   /* move counter IAL/IBL */
+#define QSPI_MCCON          0x1B8u
+#define QSPI_MCCON_IALEN    BIT(20)
+#define QSPI_MCCON_IALF     BIT(21)
+#define QSPI_MCCON_IALC     BIT(22)
+#define QSPI_MCCON_IALS     BIT(23)
+#define SRC_QSPI_STRIDE     0x14u
 
 /* eGTM TBU channel 0: 27 bits of the STM time base */
 #define EGTM_TBU_CH0        0xF9080108u
@@ -263,6 +297,11 @@ typedef struct Tc4xSfrPage {
     Tc4xSfrForces *forces;
 } Tc4xSfrPage;
 
+typedef struct Tc4xQspiSlave {
+    const Tc4xQspiSlaveOps *ops;
+    void *opaque;
+} Tc4xQspiSlave;
+
 struct Tc4xSoc {
     MachineState parent_obj;
 
@@ -294,6 +333,14 @@ struct Tc4xSoc {
     CharFrontend uart;
     uint8_t rx_fifo[ASCLIN_RXFIFO_DEPTH];
     unsigned rx_head, rx_count;
+
+    GQueue *qspi_rx[QSPI_COUNT];
+    Tc4xQspiSlave qspi_slave[QSPI_COUNT][QSPI_CS_COUNT];
+    int qspi_cs[QSPI_COUNT];          /* chip select of the frame, -1: none */
+    bool qspi_rx_fed[QSPI_COUNT];     /* receive data fed by board code */
+    bool qspi_dma_busy[QSPI_COUNT];   /* hardware-request DMA job in progress */
+    /* QSPI registers, RX queues and slaves, taken after the BQL */
+    QemuRecMutex qspi_lock;
 
     uint8_t page_buf[DMU_PAGE_BUF_SIZE];
     unsigned page_len;
@@ -814,6 +861,11 @@ static uint32_t dma_reg(uint32_t ch, uint32_t off)
            (ch % DMA_CH_PER_INST) * DMA_CH_STRIDE + off;
 }
 
+static uint32_t dma_tsr(uint32_t ch)
+{
+    return dma_base(ch) + DMA_TSR_OFF + (ch % DMA_CH_PER_INST) * 4;
+}
+
 static uint32_t dma_src(uint32_t ch)
 {
     return (ch < DMA_CH_PER_INST ? SRC_DMA0_CH_BASE : SRC_DMA1_CH_BASE) +
@@ -942,6 +994,35 @@ static void dma_run(Tc4xSoc *s, uint32_t ch)
     }
 }
 
+/*
+ * Hardware requests (TSR.HTRE): the peripheral keeps requesting, so every
+ * linked TCS runs until the list ends or wraps around (circular lists run
+ * one lap per trigger).  Single-mode channels drop HTRE when they finish.
+ */
+static void dma_run_hw(Tc4xSoc *s, uint32_t ch)
+{
+    uint32_t seen[DMA_HW_MAX_TCS];
+    uint32_t n = 0;
+    bool unused;
+
+    dma_trace_start(s, ch, true);
+    for (;;) {
+        uint32_t next = reg_get(s, dma_reg(ch, DMA_SHADR));
+        bool lap = false;
+
+        for (uint32_t i = 0; i < n; i++) {
+            lap |= seen[i] == next;
+        }
+        if (!dma_transaction(s, ch, &unused) || lap || n >= DMA_HW_MAX_TCS) {
+            break;
+        }
+        seen[n++] = next;
+    }
+    if (!extract32(reg_get(s, dma_reg(ch, DMA_CHCFGR)), 20, 1)) {
+        reg_set(s, dma_tsr(ch), reg_get(s, dma_tsr(ch)) & ~DMA_TSR_HTRE);
+    }
+}
+
 static bool dma_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
 {
     uint32_t ch, off;
@@ -987,6 +1068,169 @@ static bool dma_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
         return true;
     }
     return false;
+}
+
+static bool qspi_decode(uint32_t addr, uint32_t *n, uint32_t *off)
+{
+    if (addr < QSPI_BASE || addr >= QSPI_BASE + QSPI_COUNT * QSPI_STRIDE) {
+        return false;
+    }
+    *n = (addr - QSPI_BASE) / QSPI_STRIDE;
+    *off = (addr - QSPI_BASE) % QSPI_STRIDE;
+    return true;
+}
+
+/*
+ * TX / RX FIFO events of QSPIn as CPU interrupts: with TXEN / RXEN set and
+ * the service request routed to a CPU, each word (sent at once, answered at
+ * once) raises TX (FIFO empty again) and RX (word received), as an
+ * interrupt-driven SPI master expects.  Requests routed to the DMA are left
+ * to qspi_dma_kick.
+ */
+static void qspi_cpu_events(Tc4xSoc *s, uint32_t n)
+{
+    uint32_t con1 = reg_get(s, QSPI_BASE + n * QSPI_STRIDE + QSPI_GLOBALCON1);
+    static const struct {
+        uint32_t enable, src;
+    } ev[] = {
+        { QSPI_GLOBALCON1_TXEN, SRC_QSPI0_TX },
+        { QSPI_GLOBALCON1_RXEN, SRC_QSPI0_RX },
+    };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(ev); i++) {
+        uint32_t src = ev[i].src + n * SRC_QSPI_STRIDE;
+        uint32_t tos = (reg_get(s, src) >> SRC_TOS_SHIFT) & SRC_TOS_MASK;
+
+        if ((con1 & ev[i].enable) && (reg_get(s, src) & SRC_SRE) &&
+            tos < TC4X_NUM_CORES) {
+            src_set_srr(s, src, true);
+        }
+    }
+}
+
+/* The slave of the current frame of QSPIn, NULL when none answers */
+static Tc4xQspiSlave *qspi_selected(Tc4xSoc *s, uint32_t n)
+{
+    Tc4xQspiSlave *sl;
+
+    if (s->qspi_cs[n] < 0) {
+        return NULL;
+    }
+    sl = &s->qspi_slave[n][s->qspi_cs[n]];
+    return sl->ops ? sl : NULL;
+}
+
+/* BACONENTRY starts a frame on the chip select it names */
+static void qspi_bacon(Tc4xSoc *s, uint32_t n, uint32_t bacon)
+{
+    Tc4xQspiSlave *sl;
+
+    s->qspi_cs[n] = bacon >> QSPI_BACON_CS_SHIFT;
+    sl = qspi_selected(s, n);
+    if (sl) {
+        sl->ops->frame(sl->opaque, bacon);
+    }
+}
+
+static void qspi_transmit(Tc4xSoc *s, uint32_t n, uint32_t val)
+{
+    Tc4xQspiSlave *sl = qspi_selected(s, n);
+    uint32_t reply = 0;
+
+    if (sl) {
+        reply = sl->ops->word(sl->opaque, val);
+    }
+    g_queue_push_tail(s->qspi_rx[n], GUINT_TO_POINTER(reply));
+    qspi_cpu_events(s, n);
+}
+
+/*
+ * DMA-driven SPI jobs: the TX and RX DMA channels wait for QSPI hardware
+ * requests (TSR.HTRE) and the CPU starts the frame by writing BACONENTRY.
+ * Run the TX list (feeding DATAENTRY/BACONENTRY), then the RX list (draining
+ * RXEXIT), then signal end of job with the phase-transition-2 interrupt.
+ */
+static bool qspi_dma_side(Tc4xSoc *s, uint32_t ch, uint32_t n, bool tx)
+{
+    uint32_t base = QSPI_BASE + n * QSPI_STRIDE;
+    uint32_t a;
+
+    if (!(reg_get(s, dma_tsr(ch)) & DMA_TSR_HTRE)) {
+        return false;
+    }
+    a = reg_get(s, dma_reg(ch, tx ? DMA_DADR : DMA_SADR));
+    return tx ? a >= base + QSPI_BACONENTRY && a < base + QSPI_RXEXIT
+              : a >= base + QSPI_RXEXIT && a < base + QSPI_RXEXIT_END;
+}
+
+static void qspi_dma_kick(Tc4xSoc *s, uint32_t n)
+{
+    uint32_t base = QSPI_BASE + n * QSPI_STRIDE;
+    uint32_t mccon;
+    bool ran = false;
+
+    if (s->qspi_dma_busy[n] || s->qspi_rx_fed[n]) {
+        return;     /* written by the TX list itself / fed by board code */
+    }
+    s->qspi_dma_busy[n] = true;
+    for (uint32_t ch = 0; ch < DMA_NUM_CH; ch++) {
+        if (qspi_dma_side(s, ch, n, true)) {
+            dma_run_hw(s, ch);
+            ran = true;
+        }
+    }
+    if (ran) {
+        for (uint32_t ch = 0; ch < DMA_NUM_CH; ch++) {
+            if (qspi_dma_side(s, ch, n, false)) {
+                dma_run_hw(s, ch);
+            }
+        }
+        mccon = reg_get(s, base + QSPI_MCCON);
+        /* Frame-based CS jobs end with IAL (move counter), others with PT2 */
+        if (reg_get(s, base + QSPI_GLOBALCON1) & QSPI_GLOBALCON1_PT2EN) {
+            src_set_srr(s, SRC_QSPI0_PT + n * SRC_QSPI_STRIDE, true);
+        } else if (mccon & QSPI_MCCON_IALEN) {
+            reg_set(s, base + QSPI_MCCON, mccon | QSPI_MCCON_IALF);
+            src_set_srr(s, SRC_QSPI0_U + n * SRC_QSPI_STRIDE, true);
+        }
+    }
+    s->qspi_dma_busy[n] = false;
+}
+
+static uint32_t qspi_status(Tc4xSoc *s, uint32_t n, uint32_t stored)
+{
+    uint32_t level = MIN(g_queue_get_length(s->qspi_rx[n]), QSPI_RXLEVEL_MAX);
+
+    stored &= ~(0xFu << QSPI_RXLEVEL_SHIFT) & ~(0xFu << 16);
+    /* TX completes instantly: TX FIFO empty, phase transitions done */
+    stored |= QSPI_STATUS_TXF | QSPI_STATUS_PT1F | QSPI_STATUS_PT2F;
+    return stored | (level << QSPI_RXLEVEL_SHIFT) |
+           (level ? QSPI_STATUS_RXF : 0);
+}
+
+void tc4x_qspi_attach(Tc4xSoc *s, unsigned module, unsigned cs,
+                      const Tc4xQspiSlaveOps *ops, void *opaque)
+{
+    assert(module < QSPI_COUNT && cs < QSPI_CS_COUNT);
+    QEMU_LOCK_GUARD(&s->qspi_lock);
+    s->qspi_slave[module][cs] = (Tc4xQspiSlave) { ops, opaque };
+}
+
+void tc4x_qspi_set_rx_fed(Tc4xSoc *s, unsigned module, bool fed)
+{
+    assert(module < QSPI_COUNT);
+    QEMU_LOCK_GUARD(&s->qspi_lock);
+    s->qspi_rx_fed[module] = fed;
+}
+
+void tc4x_qspi_lock(Tc4xSoc *s)
+{
+    qemu_rec_mutex_lock(&s->qspi_lock);
+}
+
+void tc4x_qspi_unlock(Tc4xSoc *s)
+{
+    qemu_rec_mutex_unlock(&s->qspi_lock);
 }
 
 /* Offset of @addr in its TOM cluster; false outside the TOMs */
@@ -1088,8 +1332,22 @@ static bool sfr_is_cpu(uint32_t addr, int *core, uint32_t *off)
     return true;
 }
 
+static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr);
+
 static uint32_t sfr_read_word(Tc4xSoc *s, uint32_t addr)
 {
+    uint32_t qn, qoff;
+
+    if (qspi_decode(addr, &qn, &qoff)) {
+        QEMU_LOCK_GUARD(&s->qspi_lock);
+        return sfr_read_word_locked(s, addr);
+    }
+    return sfr_read_word_locked(s, addr);
+}
+
+static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr)
+{
+    uint32_t qn, qoff;
     uint32_t v = reg_get(s, addr);
     uint32_t off;
     int core;
@@ -1122,6 +1380,12 @@ static uint32_t sfr_read_word(Tc4xSoc *s, uint32_t addr)
             (clk && run ? TMADC_MODSTAT_RUN : 0);
     } else if (tom_is_cn0(addr)) {
         v = tom_cn0_read(s, addr);
+    } else if (qspi_decode(addr, &qn, &qoff) && qoff == QSPI_STATUS) {
+        v = qspi_status(s, qn, v);
+    } else if (qspi_decode(addr, &qn, &qoff) && qoff >= QSPI_RXEXIT &&
+               qoff < QSPI_RXEXIT_END) {
+        v = g_queue_is_empty(s->qspi_rx[qn]) ? 0 :
+            GPOINTER_TO_UINT(g_queue_pop_head(s->qspi_rx[qn]));
     } else if (addr == CLOCK_SYSPLLSTAT || addr == CLOCK_PERPLLSTAT) {
         uint32_t con0 = reg_get(s, addr == CLOCK_SYSPLLSTAT ?
                                 CLOCK_SYSPLLCON0 : CLOCK_PERPLLCON0);
@@ -1143,7 +1407,55 @@ static uint32_t sfr_read_word(Tc4xSoc *s, uint32_t addr)
     return reg_apply_force(sfr_page(s, addr, false), sfr_word(addr), v);
 }
 
+/* Writes of the QSPI modules: true when the write is consumed */
+static bool qspi_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
+{
+    uint32_t n, off;
+
+    if (!qspi_decode(addr, &n, &off)) {
+        return false;
+    }
+    if (off >= QSPI_DATAENTRY && off < QSPI_RXEXIT) {
+        qspi_transmit(s, n, val);
+        return true;
+    }
+    if (off == QSPI_MCCON) {
+        uint32_t flags = reg_get(s, addr) & QSPI_MCCON_IALF;
+
+        if (val & QSPI_MCCON_IALC) {
+            flags = 0;
+        }
+        if (val & QSPI_MCCON_IALS) {
+            flags = QSPI_MCCON_IALF;
+        }
+        reg_set(s, addr, (val & ~(QSPI_MCCON_IALF | QSPI_MCCON_IALC |
+                                  QSPI_MCCON_IALS)) | flags);
+        return true;
+    }
+    if (off == QSPI_BACONENTRY) {
+        qspi_bacon(s, n, val);
+        qspi_dma_kick(s, n);
+    }
+    return false;
+}
+
+static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
+                                  uint32_t val);
+
 static void sfr_write_word(Tc4xSoc *s, uint32_t addr, uint32_t val)
+{
+    uint32_t qn, qoff;
+
+    if (qspi_decode(addr, &qn, &qoff)) {
+        QEMU_LOCK_GUARD(&s->qspi_lock);
+        sfr_write_word_locked(s, addr, val);
+        return;
+    }
+    sfr_write_word_locked(s, addr, val);
+}
+
+static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
+                                  uint32_t val)
 {
     uint32_t off;
     int core;
@@ -1164,6 +1476,9 @@ static void sfr_write_word(Tc4xSoc *s, uint32_t addr, uint32_t val)
     }
     if (tom_is_glb_ctrl(addr)) {
         tom_glb_ctrl_write(s, addr, val);       /* then stored as written */
+    }
+    if (qspi_write(s, addr, val)) {
+        return;
     }
     if (addr >= DMU_CMD_BASE && addr < DMU_CMD_BASE + DMU_CMD_SIZE) {
         dmu_cmd_write(s, addr - DMU_CMD_BASE, val);
@@ -1343,6 +1658,11 @@ static void tc4x_init(MachineState *ms)
                                        NULL, g_free);
     s->pending = g_hash_table_new(g_direct_hash, g_direct_equal);
     qemu_rec_mutex_init(&s->ir_lock);
+    qemu_rec_mutex_init(&s->qspi_lock);
+    for (int n = 0; n < QSPI_COUNT; n++) {
+        s->qspi_rx[n] = g_queue_new();
+        s->qspi_cs[n] = -1;
+    }
     tc4x_force_soc_status(s);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
