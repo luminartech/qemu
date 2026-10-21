@@ -139,6 +139,28 @@
 #define TMADC_MODSTAT_RUN   BIT(1)
 #define TMADC_MODSTAT_CALPH_DONE (2u << 2)
 
+/* eGTM TOM channels: CN0 counts up at the CMU clock and wraps at CM0 */
+#define EGTM_TOM_BASE       0xF9081000u
+#define EGTM_CLS_STRIDE     0x20000u
+#define EGTM_CLS_COUNT      8u
+#define EGTM_TOM_CH_STRIDE  0x40u
+#define EGTM_TOM_CH_COUNT   16u
+#define EGTM_TOM_SR0        0x04u
+#define EGTM_TOM_SR1        0x08u
+#define EGTM_TOM_CM0        0x0Cu
+#define EGTM_TOM_CM1        0x10u
+#define EGTM_TOM_TGC_GLB_CTRL(tgc)  (0x430u + (tgc) * 0x80u)
+#define EGTM_TOM_TGC_CHANNELS       8u
+#define EGTM_TOM_UPEN_SHIFT         16      /* 2 bits per channel */
+#define EGTM_TOM_UPEN_ENABLE        2u
+#define EGTM_TOM_CN0        0x14u
+#define EGTM_TOM_CN0_MASK   0xFFFFFFu
+#define EGTM_CMU_HZ         100000000ULL
+
+/* eGTM TBU channel 0: 27 bits of the STM time base */
+#define EGTM_TBU_CH0        0xF9080108u
+#define EGTM_TBU_MASK       0x07FFFFFFu
+
 /*
  * Start-up status reported as done: CLOCK_RAMPSTAT.ACTIVE (IfxClock.c),
  * VMTn_MEMDONE(CS) (the memory test sequence of IfxVmt.h)
@@ -164,6 +186,11 @@
 
 #define TYPE_TC4X_MACHINE MACHINE_TYPE_NAME("tc4x")
 OBJECT_DECLARE_SIMPLE_TYPE(Tc4xSoc, TC4X_MACHINE)
+
+typedef struct Tc4xTomCounter {
+    uint32_t start;     /* CN0 value written by software */
+    int64_t t0_ns;      /* guest time of that write */
+} Tc4xTomCounter;
 
 typedef struct Tc4xStmTimer {
     struct Tc4xSoc *s;
@@ -215,6 +242,7 @@ struct Tc4xSoc {
     MemoryRegion sfr_e, sfr_f;
 
     Tc4xSfrPage **sfr_l1[SFR_L1_SIZE];
+    GHashTable *tom_cn0;   /* TOM CN0 addr -> Tc4xTomCounter */
     /*
      * Interrupt router.  Cores acknowledge interrupts without the BQL, so
      * pending, cpu_prio and the SRC registers' SRR bits are under ir_lock.
@@ -738,6 +766,94 @@ static void dmu_cmd_write(Tc4xSoc *s, uint32_t off, uint32_t val)
     }
 }
 
+/* Offset of @addr in its TOM cluster; false outside the TOMs */
+static bool tom_offset(uint32_t addr, uint32_t *off)
+{
+    if (addr < EGTM_TOM_BASE ||
+        addr >= EGTM_TOM_BASE + EGTM_CLS_COUNT * EGTM_CLS_STRIDE) {
+        return false;
+    }
+    *off = (addr - EGTM_TOM_BASE) % EGTM_CLS_STRIDE;
+    return true;
+}
+
+/* Offset of @addr in its TOM channel; false outside the channels */
+static bool tom_ch_offset(uint32_t addr, uint32_t *off)
+{
+    if (!tom_offset(addr, off) ||
+        *off >= EGTM_TOM_CH_COUNT * EGTM_TOM_CH_STRIDE) {
+        return false;
+    }
+    *off %= EGTM_TOM_CH_STRIDE;
+    return true;
+}
+
+static bool tom_is_cn0(uint32_t addr)
+{
+    uint32_t off;
+
+    return tom_ch_offset(addr, &off) && off == EGTM_TOM_CN0;
+}
+
+static uint32_t tom_cn0_read(Tc4xSoc *s, uint32_t addr)
+{
+    Tc4xTomCounter *c = g_hash_table_lookup(s->tom_cn0, GUINT_TO_POINTER(addr));
+    uint64_t period = reg_get(s, addr - EGTM_TOM_CN0 + EGTM_TOM_CM0) &
+                      EGTM_TOM_CN0_MASK;
+    int64_t now = guest_ns(s);
+    uint64_t ticks;
+
+    if (!c) {
+        c = g_new0(Tc4xTomCounter, 1);
+        c->t0_ns = now;
+        g_hash_table_insert(s->tom_cn0, GUINT_TO_POINTER(addr), c);
+    }
+    ticks = c->start + muldiv64(now - c->t0_ns, EGTM_CMU_HZ,
+                                NANOSECONDS_PER_SECOND);
+    return period ? ticks % period : ticks & EGTM_TOM_CN0_MASK;
+}
+
+/*
+ * TGC GLB_CTRL with UPEN_CTRLn = enable: the channel copies its shadow
+ * registers SR0/SR1 to CM0/CM1 at the end of the period.  The copy happens
+ * at once here.
+ */
+static void tom_glb_ctrl_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
+{
+    uint32_t off = (addr - EGTM_TOM_BASE) % EGTM_CLS_STRIDE;
+    uint32_t cls_base = addr - off;
+    unsigned tgc = off == EGTM_TOM_TGC_GLB_CTRL(1);
+
+    for (unsigned k = 0; k < EGTM_TOM_TGC_CHANNELS; k++) {
+        uint32_t ch;
+
+        if (extract32(val, EGTM_TOM_UPEN_SHIFT + 2 * k, 2) !=
+            EGTM_TOM_UPEN_ENABLE) {
+            continue;
+        }
+        ch = cls_base + (tgc * EGTM_TOM_TGC_CHANNELS + k) * EGTM_TOM_CH_STRIDE;
+        reg_set(s, ch + EGTM_TOM_CM0, reg_get(s, ch + EGTM_TOM_SR0));
+        reg_set(s, ch + EGTM_TOM_CM1, reg_get(s, ch + EGTM_TOM_SR1));
+    }
+}
+
+static bool tom_is_glb_ctrl(uint32_t addr)
+{
+    uint32_t off;
+
+    return tom_offset(addr, &off) &&
+           (off == EGTM_TOM_TGC_GLB_CTRL(0) || off == EGTM_TOM_TGC_GLB_CTRL(1));
+}
+
+static void tom_cn0_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
+{
+    Tc4xTomCounter *c = g_new0(Tc4xTomCounter, 1);
+
+    c->start = val & EGTM_TOM_CN0_MASK;
+    c->t0_ns = guest_ns(s);
+    g_hash_table_insert(s->tom_cn0, GUINT_TO_POINTER(addr), c);
+}
+
 static bool sfr_is_cpu(uint32_t addr, int *core, uint32_t *off)
 {
     if (addr < CPU_SFR_BASE ||
@@ -755,7 +871,9 @@ static uint32_t sfr_read_word(Tc4xSoc *s, uint32_t addr)
     uint32_t off;
     int core;
 
-    if (sfr_is_cpu(addr, &core, &off)) {
+    if (addr == EGTM_TBU_CH0) {
+        v = stm_now(s) & EGTM_TBU_MASK;
+    } else if (sfr_is_cpu(addr, &core, &off)) {
         if (off == CPU_STM_ABS) {
             v = (uint32_t)stm_now(s);
         } else if (off == CPU_STM_ABS + 4) {
@@ -779,6 +897,8 @@ static uint32_t sfr_read_word(Tc4xSoc *s, uint32_t addr)
          */
         v = (clk ? TMADC_MODSTAT_CALPH_DONE : TMADC_MODSTAT_DIS) |
             (clk && run ? TMADC_MODSTAT_RUN : 0);
+    } else if (tom_is_cn0(addr)) {
+        v = tom_cn0_read(s, addr);
     } else if (addr == CLOCK_SYSPLLSTAT || addr == CLOCK_PERPLLSTAT) {
         uint32_t con0 = reg_get(s, addr == CLOCK_SYSPLLSTAT ?
                                 CLOCK_SYSPLLCON0 : CLOCK_PERPLLCON0);
@@ -811,6 +931,13 @@ static void sfr_write_word(Tc4xSoc *s, uint32_t addr, uint32_t val)
     }
     if (asclin_write(s, addr, val)) {
         return;
+    }
+    if (tom_is_cn0(addr)) {
+        tom_cn0_write(s, addr, val);
+        return;
+    }
+    if (tom_is_glb_ctrl(addr)) {
+        tom_glb_ctrl_write(s, addr, val);       /* then stored as written */
     }
     if (addr >= DMU_CMD_BASE && addr < DMU_CMD_BASE + DMU_CMD_SIZE) {
         dmu_cmd_write(s, addr - DMU_CMD_BASE, val);
@@ -986,6 +1113,8 @@ static void tc4x_init(MachineState *ms)
 {
     Tc4xSoc *s = TC4X_MACHINE(ms);
     MemoryRegion *sysmem = get_system_memory();
+    s->tom_cn0 = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                       NULL, g_free);
     s->pending = g_hash_table_new(g_direct_hash, g_direct_equal);
     qemu_rec_mutex_init(&s->ir_lock);
     tc4x_force_soc_status(s);
