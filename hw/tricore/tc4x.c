@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/seqlock.h"
 #include "qemu/units.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
@@ -257,6 +258,8 @@
 #define VMT_MEMDONE         0x8Cu
 #define VMT_MEMDONECS       0xC0u
 
+#define TC4X_RETIME_MAX         16
+
 #define TYPE_TC4X_MACHINE MACHINE_TYPE_NAME("tc4x")
 OBJECT_DECLARE_SIMPLE_TYPE(Tc4xSoc, TC4X_MACHINE)
 
@@ -317,6 +320,15 @@ typedef struct Tc4xQspiSlave {
     void *opaque;
 } Tc4xQspiSlave;
 
+typedef struct Tc4xRetimeNotifier {
+    Tc4xRetimeFn fn;
+    void *opaque;
+} Tc4xRetimeNotifier;
+
+typedef struct Tc4xTimeRequest {
+    uint32_t scale;
+} Tc4xTimeRequest;
+
 typedef struct Tc4xSimCommand {
     const char *prefix;
     Tc4xSimCommandFn fn;
@@ -352,6 +364,19 @@ struct Tc4xSoc {
     QemuRecMutex ir_lock;
     GHashTable *pending;   /* SRC addrs with SRR set */
     uint32_t cpu_prio[TC4X_NUM_CORES];
+
+    /*
+     * Guest time: the STM and eGTM run at 1/time_scale of QEMU virtual
+     * time.  Read on any thread under time_lock.
+     */
+    uint32_t time_scale;
+    int64_t time_base_host;
+    int64_t time_base_guest;
+    QemuSeqLock time_lock;
+    GPtrArray *time_requests;
+    Tc4xTimeRequest *bridge_time_request;
+    Tc4xRetimeNotifier retime[TC4X_RETIME_MAX];
+    unsigned n_retime;
 
     Tc4xStmTimer stm[TC4X_NUM_CORES][CPU_STM_VM_COUNT][2];
 
@@ -611,14 +636,33 @@ static void src_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
     }
 }
 
+/*
+ * Slowing guest time gives external processes more wall time per emulated
+ * millisecond.
+ */
+/* Guest time at QEMU virtual time @virt_ns, before any barrier */
+static int64_t guest_at(Tc4xSoc *s, int64_t virt_ns)
+{
+    return qatomic_read(&s->time_base_guest) +
+           (virt_ns - qatomic_read(&s->time_base_host)) /
+           qatomic_read(&s->time_scale);
+}
+
 static int64_t guest_ns(Tc4xSoc *s)
 {
-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t ns;
+    unsigned start;
+
+    do {
+        start = seqlock_read_begin(&s->time_lock);
+        ns = guest_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    } while (seqlock_read_retry(&s->time_lock, start));
+    return ns;
 }
 
 static int64_t host_ns_for_guest(Tc4xSoc *s, int64_t ns)
 {
-    return ns;
+    return s->time_base_host + (ns - s->time_base_guest) * s->time_scale;
 }
 
 int64_t tc4x_guest_ns(Tc4xSoc *s)
@@ -672,8 +716,9 @@ static void stm_schedule(Tc4xSoc *s, int core, int vm, int cmp)
     /*
      * A compare can be found slightly behind the counter without having
      * matched: software that re-arms with CMP = ABS + period can be
-     * preempted for a period in between.  Rather than waiting 8.6 s for the
-     * 32-bit wrap, treat it as due now unless this value already fired.
+     * preempted for a period in between, or a time-scale change reschedules
+     * a timer whose callback had not run yet.  Rather than waiting 8.6 s for
+     * the 32-bit wrap, treat it as due now unless this value already fired.
      */
     if (mask > 2 * STM_LATE_WINDOW &&
         ((cur - target) & mask) < STM_LATE_WINDOW &&
@@ -2038,6 +2083,66 @@ static const MemoryRegionOps tbu_page_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+static void retime_all(Tc4xSoc *s)
+{
+    for (int c = 0; c < TC4X_NUM_CORES; c++) {
+        for (int vm = 0; vm < CPU_STM_VM_COUNT; vm++) {
+            stm_schedule(s, c, vm, 0);
+            stm_schedule(s, c, vm, 1);
+        }
+    }
+    for (unsigned i = 0; i < s->n_retime; i++) {
+        s->retime[i].fn(s->retime[i].opaque);
+    }
+}
+
+void tc4x_time_add_retime_notifier(Tc4xSoc *s, Tc4xRetimeFn fn, void *opaque)
+{
+    assert(s->n_retime < TC4X_RETIME_MAX);
+    s->retime[s->n_retime++] = (Tc4xRetimeNotifier) { fn, opaque };
+}
+
+/* Guest time runs at 1/N of virtual time, continuous across the change */
+static void set_timescale(Tc4xSoc *s, uint32_t n)
+{
+    int64_t v, now;
+
+    seqlock_write_begin(&s->time_lock);
+    v = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    now = guest_at(s, v);
+    qatomic_set(&s->time_base_host, v);
+    qatomic_set(&s->time_base_guest, now);
+    qatomic_set(&s->time_scale, MAX(1, n));
+    seqlock_write_end(&s->time_lock);
+    trace_tc4x_time_scale(n, now);
+    retime_all(s);
+}
+
+/* Guest time runs at the slowest scale any client requests */
+static Tc4xTimeRequest *time_request_new(Tc4xSoc *s)
+{
+    Tc4xTimeRequest *r = g_new(Tc4xTimeRequest, 1);
+
+    r->scale = 1;
+    g_ptr_array_add(s->time_requests, r);
+    return r;
+}
+
+static void time_request(Tc4xSoc *s, Tc4xTimeRequest *r, uint32_t n)
+{
+    uint32_t eff = 1;
+
+    r->scale = MAX(1, n);
+    for (guint i = 0; i < s->time_requests->len; i++) {
+        Tc4xTimeRequest *q = g_ptr_array_index(s->time_requests, i);
+
+        eff = MAX(eff, q->scale);
+    }
+    if (eff != s->time_scale) {
+        set_timescale(s, eff);
+    }
+}
+
 void tc4x_sim_add_command(Tc4xSoc *s, const char *prefix, Tc4xSimCommandFn fn,
                           void *opaque, bool qspi_lock)
 {
@@ -2157,6 +2262,9 @@ static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
     } else if (!strcmp(argv[0], "vmcont")) {
         vm_start();
         sim_printf(s, "ok\n");
+    } else if (!strcmp(argv[0], "timescale") && argc >= 2) {
+        time_request(s, s->bridge_time_request, a[1]);
+        sim_printf(s, "ok %u\n", s->time_scale);
     } else {
         g_autoptr(GString) out = g_string_new(NULL);
 
@@ -2336,6 +2444,10 @@ static void tc4x_init(MachineState *ms)
         s->qspi_rx[n] = g_queue_new();
         s->qspi_cs[n] = -1;
     }
+    s->time_scale = 1;
+    seqlock_init(&s->time_lock);
+    s->time_requests = g_ptr_array_new_with_free_func(g_free);
+    s->bridge_time_request = time_request_new(s);
 
     s->gpio = tc4x_gpio_new(s);
     s->adc = tc4x_adc_new(s);

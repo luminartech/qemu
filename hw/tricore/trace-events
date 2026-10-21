@@ -3,6 +3,7 @@
 
 # tc4x.c
 tc4x_dma_start(uint32_t ch, bool hw, uint32_t sadr, uint32_t dadr, uint32_t chcfgr) "ch %u hw %d sadr 0x%08x dadr 0x%08x chcfgr 0x%08x"
+tc4x_time_scale(uint32_t scale, int64_t guest_ns) "scale %u guest %" PRId64 " ns"
 
 # tc4x_i2c.c
 tc4x_i2c_transfer(unsigned bus, unsigned addr, bool read, unsigned len, bool ack) "bus %u addr 0x%02x read %d len %u ack %d"

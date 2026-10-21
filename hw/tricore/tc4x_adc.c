@@ -136,7 +136,11 @@ static uint32_t adc_result(Tc4xAdc *a, unsigned n, unsigned k)
     return 0;
 }
 
-/* Rounds are due at absolute guest times */
+/*
+ * Rounds are due at absolute guest times: the guest time scale can change
+ * between rounds, and a timer armed relative to the scale of the moment
+ * would land far off once the scale changes again.
+ */
 static void adc_arm(AdcTrigger *t)
 {
     timer_mod(t->timer, tc4x_host_ns_for_guest(t->adc->soc, t->due_ns));
@@ -157,6 +161,19 @@ static void adc_schedule(AdcTrigger *t)
         t->due_ns = now + t->period_ns;
     }
     adc_arm(t);
+}
+
+static void adc_retime(void *opaque)
+{
+    Tc4xAdc *a = opaque;
+
+    for (unsigned n = 0; n < TMADC_COUNT; n++) {
+        for (unsigned i = 0; i < TMADC_SR_COUNT; i++) {
+            if (timer_pending(a->trig[n][i].timer)) {
+                adc_arm(&a->trig[n][i]);
+            }
+        }
+    }
 }
 
 /* One conversion round: the service request sees new results */
@@ -267,6 +284,7 @@ Tc4xAdc *tc4x_adc_new(Tc4xSoc *soc)
             t->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, adc_tick, t);
         }
     }
+    tc4x_time_add_retime_notifier(soc, adc_retime, a);
     tc4x_sim_add_command(soc, "adc", adc_command, a, false);
     return a;
 }
