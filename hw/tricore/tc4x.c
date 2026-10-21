@@ -356,6 +356,7 @@ struct Tc4xSoc {
 
     Tc4xGpio *gpio;
     Tc4xAdc *adc;
+    Tc4xI2c *i2c;
 
     uint8_t page_buf[DMU_PAGE_BUF_SIZE];
     unsigned page_len;
@@ -377,6 +378,11 @@ Tc4xGpio *tc4x_soc_gpio(Tc4xSoc *s)
 Tc4xAdc *tc4x_soc_adc(Tc4xSoc *s)
 {
     return s->adc;
+}
+
+Tc4xI2c *tc4x_soc_i2c(Tc4xSoc *s)
+{
+    return s->i2c;
 }
 
 static void *sfr_publish(void **slot, size_t size)
@@ -1418,7 +1424,8 @@ static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr)
     uint32_t off;
     int core;
 
-    if (tc4x_gpio_read(s->gpio, addr, &v) || tc4x_adc_read(s->adc, addr, &v)) {
+    if (tc4x_gpio_read(s->gpio, addr, &v) || tc4x_i2c_read(s->i2c, addr, &v) ||
+        tc4x_adc_read(s->adc, addr, &v)) {
         /* served by a pin or bus model */
     } else if (addr == EGTM_TBU_CH0) {
         v = stm_now(s) & EGTM_TBU_MASK;
@@ -1536,6 +1543,7 @@ static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
         return;
     }
     if (dma_write(s, addr, val) || tc4x_gpio_write(s->gpio, addr, val) ||
+        tc4x_i2c_write(s->i2c, addr, val) ||
         tc4x_adc_write(s->adc, addr, val)) {
         return;
     }
@@ -1957,6 +1965,7 @@ static void tc4x_init(MachineState *ms)
 
     s->gpio = tc4x_gpio_new(s);
     s->adc = tc4x_adc_new(s);
+    s->i2c = tc4x_i2c_new(s);
     tc4x_force_soc_status(s);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {

@@ -90,6 +90,22 @@ bool tc4x_adc_sr_enabled(Tc4xSoc *soc, unsigned kernel, unsigned sr);
 void tc4x_adc_set_period(Tc4xSoc *soc, unsigned kernel, unsigned sr,
                          int64_t period_ns);
 
+/*
+ * A slave at one address of a bus.  A transfer completes at once: start
+ * (may be NULL) sees the address phase and NACKs it by returning false,
+ * then write or read moves all data bytes and stop (may be NULL) ends it.
+ */
+typedef struct Tc4xI2cSlaveOps {
+    bool (*start)(void *opaque, bool read);
+    void (*write)(void *opaque, const uint8_t *data, unsigned len);
+    void (*read)(void *opaque, uint8_t *data, unsigned len);
+    void (*stop)(void *opaque);
+} Tc4xI2cSlaveOps;
+
+/* Attach a slave at @addr of I2C@bus, replacing the one there */
+void tc4x_i2c_attach(Tc4xSoc *soc, unsigned bus, uint8_t addr,
+                     const Tc4xI2cSlaveOps *ops, void *opaque);
+
 /* Guest time: what the STM and the eGTM count, in ns (any thread) */
 int64_t tc4x_guest_ns(Tc4xSoc *soc);
 

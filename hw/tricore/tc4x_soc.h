@@ -1,6 +1,6 @@
 /*
- * Internals shared by the tc4x SoC models (tc4x.c, tc4x_gpio.c,
- * tc4x_adc.c).
+ * Internals shared by the tc4x SoC models (tc4x.c, tc4x_gpio.c, tc4x_adc.c,
+ * tc4x_i2c.c).
  *
  * Copyright (c) 2026 MicroVision, Inc.
  *
@@ -23,9 +23,11 @@
 
 typedef struct Tc4xGpio Tc4xGpio;
 typedef struct Tc4xAdc Tc4xAdc;
+typedef struct Tc4xI2c Tc4xI2c;
 
 Tc4xGpio *tc4x_soc_gpio(Tc4xSoc *soc);
 Tc4xAdc *tc4x_soc_adc(Tc4xSoc *soc);
+Tc4xI2c *tc4x_soc_i2c(Tc4xSoc *soc);
 
 /*
  * The SoC models.  _read and _write return true when the model owns
@@ -38,5 +40,9 @@ bool tc4x_gpio_write(Tc4xGpio *g, uint32_t addr, uint32_t val);
 Tc4xAdc *tc4x_adc_new(Tc4xSoc *soc);
 bool tc4x_adc_read(Tc4xAdc *a, uint32_t addr, uint32_t *val);
 bool tc4x_adc_write(Tc4xAdc *a, uint32_t addr, uint32_t val);
+
+Tc4xI2c *tc4x_i2c_new(Tc4xSoc *soc);
+bool tc4x_i2c_read(Tc4xI2c *c, uint32_t addr, uint32_t *val);
+bool tc4x_i2c_write(Tc4xI2c *c, uint32_t addr, uint32_t val);
 
 #endif
