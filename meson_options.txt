@@ -385,3 +385,6 @@ option('rust', type: 'feature', value: 'disabled',
        description: 'Rust support')
 option('strict_rust_lints', type: 'boolean', value: false,
        description: 'Enable stricter set of Rust warnings')
+
+option('tc4x_boards', type: 'array', value: [],
+       description: 'TC4x boards to build from hw/tricore/boards')

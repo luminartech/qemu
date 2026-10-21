@@ -42,6 +42,7 @@
 #include "trace.h"
 #include "hw/core/irq.h"
 #include "hw/net/tc4x_geth.h"
+#include "hw/tricore/tc4x_board.h"
 #include "hw/tricore/tc4x_pacer.h"
 #include "tc4x_soc.h"
 
@@ -444,6 +445,8 @@ struct Tc4xSoc {
 
     uint32_t boot_pc;
     char *sfr_script;
+    char *board_name;
+    Tc4xBoard *board;
     char *shm_dir;
 };
 
@@ -2708,6 +2711,49 @@ void tc4x_geth_attach(Tc4xSoc *s, unsigned port, uint8_t addr,
     tc4x_geth_attach_phy(s->geth, port, addr, ops, opaque);
 }
 
+static void tc4x_board_list(void)
+{
+    g_autoptr(GSList) list = object_class_get_list_sorted(TYPE_TC4X_BOARD,
+                                                          false);
+
+    printf("Supported boards are:\n");
+    for (GSList *el = list; el; el = el->next) {
+        Tc4xBoardClass *bc = el->data;
+        const char *type = object_class_get_name(OBJECT_CLASS(bc));
+        g_autofree char *name = g_strndup(type, strlen(type) -
+                                          strlen("-" TYPE_TC4X_BOARD));
+
+        printf("%-20s %s\n", name, bc->desc);
+    }
+}
+
+static Tc4xBoard *tc4x_board_create(const char *name)
+{
+    g_autofree char *type = g_strdup_printf("%s-" TYPE_TC4X_BOARD, name);
+    ObjectClass *oc = object_class_by_name(type);
+
+    if (!strcmp(name, "help")) {
+        tc4x_board_list();
+        exit(0);
+    }
+    if (!oc || !object_class_dynamic_cast(oc, TYPE_TC4X_BOARD) ||
+        object_class_is_abstract(oc)) {
+        error_report("tc4x: unknown board '%s' (board=help lists them)",
+                     name);
+        exit(1);
+    }
+    return TC4X_BOARD(object_new(type));
+}
+
+static void tc4x_apply_board(Tc4xSoc *s, const Tc4xBoardClass *bc)
+{
+    for (unsigned i = 0; i < bc->n_inputs; i++) {
+        const Tc4xBoardInput *in = &bc->inputs[i];
+
+        tc4x_gpio_set_input(s, in->port, in->pin, in->level);
+    }
+}
+
 static void tc4x_force_soc_status(Tc4xSoc *s)
 {
     reg_force(s, CLOCK_RAMPSTAT, CLOCK_RAMPSTAT_ACTIVE,
@@ -2724,6 +2770,12 @@ static void tc4x_init(MachineState *ms)
 {
     Tc4xSoc *s = TC4X_MACHINE(ms);
     MemoryRegion *sysmem = get_system_memory();
+    Tc4xBoardClass *bc;
+
+    s->board = tc4x_board_create(s->board_name ? s->board_name : "generic");
+    bc = TC4X_BOARD_GET_CLASS(s->board);
+    assert(bc->console < ASCLIN_COUNT);
+    s->console = bc->console;
     s->watches = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->tom_cn0 = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                        NULL, g_free);
@@ -2750,6 +2802,7 @@ static void tc4x_init(MachineState *ms)
     s->gpio = tc4x_gpio_new(s);
     s->adc = tc4x_adc_new(s);
     s->i2c = tc4x_i2c_new(s);
+    tc4x_apply_board(s, bc);
     tc4x_force_soc_status(s);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
@@ -2844,6 +2897,10 @@ static void tc4x_init(MachineState *ms)
                                  NULL, s, NULL, true);
     }
 
+    if (bc->init) {
+        bc->init(s->board, s);
+    }
+
     if (s->sfr_script) {
         g_autofree char *text = NULL;
         g_auto(GStrv) lines = NULL;
@@ -2880,6 +2937,19 @@ static void tc4x_set_sfr_script(Object *obj, const char *value, Error **errp)
     s->sfr_script = g_strdup(value);
 }
 
+static char *tc4x_get_board(Object *obj, Error **errp)
+{
+    return g_strdup(TC4X_MACHINE(obj)->board_name);
+}
+
+static void tc4x_set_board(Object *obj, const char *value, Error **errp)
+{
+    Tc4xSoc *s = TC4X_MACHINE(obj);
+
+    g_free(s->board_name);
+    s->board_name = g_strdup(value);
+}
+
 static char *tc4x_get_shm_dir(Object *obj, Error **errp)
 {
     return g_strdup(TC4X_MACHINE(obj)->shm_dir);
@@ -2902,6 +2972,11 @@ static void tc4x_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "shm-dir",
         "Directory (e.g. /dev/shm/tc4x) for file-backed shared guest RAM");
 
+    object_class_property_add_str(oc, "board", tc4x_get_board,
+                                  tc4x_set_board);
+    object_class_property_set_description(oc, "board",
+        "Board around the SoC (default generic, board=help lists them)");
+
     object_class_property_add_str(oc, "sfr-script", tc4x_get_sfr_script,
                                   tc4x_set_sfr_script);
     object_class_property_set_description(oc, "sfr-script",
@@ -2916,12 +2991,29 @@ static void tc4x_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = TRICORE_CPU_TYPE_NAME("tc4x");
 }
 
+static void tc4x_generic_board_class_init(ObjectClass *oc, const void *data)
+{
+    Tc4xBoardClass *bc = TC4X_BOARD_CLASS(oc);
+
+    bc->desc = "SoC only: console on ASCLIN0, no board inputs, no PHY";
+}
+
 static const TypeInfo tc4x_types[] = {
     {
         .name = TYPE_TC4X_MACHINE,
         .parent = TYPE_MACHINE,
         .instance_size = sizeof(Tc4xSoc),
         .class_init = tc4x_class_init,
+    }, {
+        .name = TYPE_TC4X_BOARD,
+        .parent = TYPE_OBJECT,
+        .abstract = true,
+        .instance_size = sizeof(Tc4xBoard),
+        .class_size = sizeof(Tc4xBoardClass),
+    }, {
+        .name = TC4X_BOARD_TYPE_NAME("generic"),
+        .parent = TYPE_TC4X_BOARD,
+        .class_init = tc4x_generic_board_class_init,
     },
 };
 

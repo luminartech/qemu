@@ -3,8 +3,8 @@
  *
  * OMR/OMSR/OMCR and the per-pin PADCFGn_GPIO SET/CLR/OUT bits update the
  * port's OUT register; IN and PADCFGn_GPIO.IN read back the output levels,
- * except for pins driven from outside (tc4x_gpio_set_input) or by the sim
- * bridge.
+ * except for pins held by the board (Tc4xBoardClass.inputs) or driven by
+ * board code or the sim bridge.
  * Output changes go to the listeners of the port (bit-banged buses).
  *
  * Copyright (c) 2026 MicroVision, Inc.
