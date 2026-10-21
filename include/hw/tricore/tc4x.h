@@ -24,6 +24,9 @@ uint32_t tc4x_reg_get(Tc4xSoc *soc, uint32_t addr);
 /* Store @val at @addr, no side effects (any thread) */
 void tc4x_reg_set(Tc4xSoc *soc, uint32_t addr, uint32_t val);
 
+/* Hardware-set SRR of the service request node at @src (any thread) */
+void tc4x_irq_raise(Tc4xSoc *soc, uint32_t src);
+
 /*
  * A slave on one chip select of a QSPI module.  BACONENTRY writes that
  * select it start a frame (@bacon: word length, bit order); every TX word
@@ -64,6 +67,34 @@ typedef void (*Tc4xGpioListenerFn)(void *opaque, unsigned port, uint32_t old,
                                    uint32_t new);
 void tc4x_gpio_add_listener(Tc4xSoc *soc, unsigned port,
                             Tc4xGpioListenerFn fn, void *opaque);
+
+/* Pin voltage of channel @ch of kernel @kernel */
+double tc4x_adc_volts(Tc4xSoc *soc, unsigned kernel, unsigned ch);
+
+/* Set the pin voltage of channel @ch of kernel @kernel */
+void tc4x_adc_set_volts(Tc4xSoc *soc, unsigned kernel, unsigned ch,
+                        double volts);
+
+/*
+ * @fn supplies the pin voltage of channel @ch of kernel @kernel at each
+ * conversion, in place of the voltage set (any thread)
+ */
+typedef double (*Tc4xAdcInputFn)(void *opaque, unsigned kernel, unsigned ch);
+void tc4x_adc_set_input(Tc4xSoc *soc, unsigned kernel, unsigned ch,
+                        Tc4xAdcInputFn fn, void *opaque);
+
+/* Kernel running and service request line @sr enabled */
+bool tc4x_adc_sr_enabled(Tc4xSoc *soc, unsigned kernel, unsigned sr);
+
+/* Conversion period of service request line @sr (0: no periodic rounds) */
+void tc4x_adc_set_period(Tc4xSoc *soc, unsigned kernel, unsigned sr,
+                         int64_t period_ns);
+
+/* Guest time: what the STM and the eGTM count, in ns (any thread) */
+int64_t tc4x_guest_ns(Tc4xSoc *soc);
+
+/* QEMU_CLOCK_VIRTUAL time at which guest time reaches @guest_ns */
+int64_t tc4x_host_ns_for_guest(Tc4xSoc *soc, int64_t guest_ns);
 
 /*
  * Sim-bridge and sfr-script commands whose name starts with @prefix.  @fn

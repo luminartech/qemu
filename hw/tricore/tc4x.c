@@ -172,12 +172,6 @@
  * TMADC kernels: MODSTAT follows the clock enable and MODCFG.RUN;
  * IfxAdc_Tmadc_runModule() waits for the calibration phase (CALPH)
  */
-#define ADC_CLKEN_TMADC     0xF5000890u
-#define TMADC_BASE          0xF5020000u
-#define TMADC_STRIDE        0x800u
-#define TMADC_COUNT         8u
-#define TMADC_MODCFG        0x000u
-#define TMADC_RUN           BIT(1)
 #define TMADC_MODSTAT       0x1D4u
 #define TMADC_MODSTAT_DIS   BIT(0)
 #define TMADC_MODSTAT_RUN   BIT(1)
@@ -361,6 +355,7 @@ struct Tc4xSoc {
     QemuRecMutex qspi_lock;
 
     Tc4xGpio *gpio;
+    Tc4xAdc *adc;
 
     uint8_t page_buf[DMU_PAGE_BUF_SIZE];
     unsigned page_len;
@@ -377,6 +372,11 @@ struct Tc4xSoc {
 Tc4xGpio *tc4x_soc_gpio(Tc4xSoc *s)
 {
     return s->gpio;
+}
+
+Tc4xAdc *tc4x_soc_adc(Tc4xSoc *s)
+{
+    return s->adc;
 }
 
 static void *sfr_publish(void **slot, size_t size)
@@ -520,6 +520,11 @@ static void src_set_srr(Tc4xSoc *s, uint32_t addr, bool set)
     ir_update(s);
 }
 
+void tc4x_irq_raise(Tc4xSoc *s, uint32_t src)
+{
+    src_set_srr(s, src, true);
+}
+
 /* Called by a core taking an interrupt, without the BQL */
 static void ir_ack(void *opaque, uint32_t core, uint32_t prio)
 {
@@ -569,6 +574,16 @@ static int64_t guest_ns(Tc4xSoc *s)
 static int64_t host_ns_for_guest(Tc4xSoc *s, int64_t ns)
 {
     return ns;
+}
+
+int64_t tc4x_guest_ns(Tc4xSoc *s)
+{
+    return guest_ns(s);
+}
+
+int64_t tc4x_host_ns_for_guest(Tc4xSoc *s, int64_t guest_ns)
+{
+    return host_ns_for_guest(s, guest_ns);
 }
 
 static uint64_t stm_now(Tc4xSoc *s)
@@ -1403,8 +1418,8 @@ static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr)
     uint32_t off;
     int core;
 
-    if (tc4x_gpio_read(s->gpio, addr, &v)) {
-        /* served by the GPIO model */
+    if (tc4x_gpio_read(s->gpio, addr, &v) || tc4x_adc_read(s->adc, addr, &v)) {
+        /* served by a pin or bus model */
     } else if (addr == EGTM_TBU_CH0) {
         v = stm_now(s) & EGTM_TBU_MASK;
     } else if (sfr_is_cpu(addr, &core, &off)) {
@@ -1520,7 +1535,8 @@ static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
     if (asclin_write(s, addr, val)) {
         return;
     }
-    if (dma_write(s, addr, val) || tc4x_gpio_write(s->gpio, addr, val)) {
+    if (dma_write(s, addr, val) || tc4x_gpio_write(s->gpio, addr, val) ||
+        tc4x_adc_write(s->adc, addr, val)) {
         return;
     }
     if (tom_is_cn0(addr)) {
@@ -1940,6 +1956,7 @@ static void tc4x_init(MachineState *ms)
     }
 
     s->gpio = tc4x_gpio_new(s);
+    s->adc = tc4x_adc_new(s);
     tc4x_force_soc_status(s);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
