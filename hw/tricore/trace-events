@@ -1,0 +1,5 @@
+# See docs/devel/tracing.rst for syntax documentation.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# tc4x.c
+tc4x_dma_start(uint32_t ch, bool hw, uint32_t sadr, uint32_t dadr, uint32_t chcfgr) "ch %u hw %d sadr 0x%08x dadr 0x%08x chcfgr 0x%08x"

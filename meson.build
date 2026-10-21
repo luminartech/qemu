@@ -3653,6 +3653,7 @@ if have_system
     'hw/ssi',
     'hw/timer',
     'hw/tpm',
+    'hw/tricore',
     'hw/uefi',
     'hw/ufs',
     'hw/usb',

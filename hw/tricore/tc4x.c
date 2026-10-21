@@ -34,6 +34,7 @@
 #include "system/memory.h"
 #include "elf.h"
 #include "cpu.h"
+#include "trace.h"
 
 #define TC4X_NUM_CORES      6
 #define TC4X_CORE_RAM_SIZE  (2 * MiB)       /* DSPR + PSPR (at +1 MiB) */
@@ -123,6 +124,42 @@
 #define DMU_DF_WORDLINE     512u
 #define DMU_PF_WORDLINE     1024u
 #define DMU_PAGE_BUF_SIZE   512     /* IFXFLASH_PFLASH_BURST_LENGTH */
+
+/*
+ * DMA0/DMA1 move engines.  Channels are numbered 0..127 on DMA0 and
+ * 128..255 on DMA1 (bit 7 selects the instance).
+ */
+#define DMA0_BASE           0xF4410000u
+#define DMA_INST_STRIDE     0x4000u
+#define DMA_NUM_INST        2u
+#define DMA_TSR_OFF         0x1E00u
+#define DMA_CH_OFF          0x2000u
+#define DMA_CH_STRIDE       0x20u
+#define DMA_CH_PER_INST     128u
+#define DMA_NUM_CH          (DMA_NUM_INST * DMA_CH_PER_INST)
+#define SRC_DMA0_CH_BASE    (SRC_BASE + 0x730u)
+#define SRC_DMA1_CH_BASE    (SRC_BASE + 0x980u)
+#define DMA_RDCRCR          0x00u
+#define DMA_SDCRCR          0x04u
+#define DMA_SADR            0x08u
+#define DMA_DADR            0x0Cu
+#define DMA_ADICR           0x10u
+#define DMA_CHCFGR          0x14u
+#define DMA_SHADR           0x18u
+#define DMA_CHCSR           0x1Cu
+#define DMA_CHCSR_ICH       BIT(18)
+#define DMA_CHCSR_CICH      BIT(26)
+#define DMA_CHCSR_SIT       BIT(27)
+#define DMA_CHCSR_SCH       BIT(31)
+#define DMA_TSR_RST         BIT(0)
+#define DMA_TSR_HTRE        BIT(1)
+#define DMA_TSR_ECH         BIT(16)
+#define DMA_TSR_DCH         BIT(17)
+#define DMA_TSR_HLTREQ      BIT(8)
+#define DMA_TSR_HLTACK      BIT(9)
+#define DMA_TSR_HLTCLR      BIT(24)
+#define DMA_SHCT_LINKED     0xCu
+#define DMA_MAX_CHAIN       4096u
 
 /*
  * TMADC kernels: MODSTAT follows the clock enable and MODCFG.RUN;
@@ -766,6 +803,192 @@ static void dmu_cmd_write(Tc4xSoc *s, uint32_t off, uint32_t val)
     }
 }
 
+static uint32_t dma_base(uint32_t ch)
+{
+    return DMA0_BASE + (ch / DMA_CH_PER_INST) * DMA_INST_STRIDE;
+}
+
+static uint32_t dma_reg(uint32_t ch, uint32_t off)
+{
+    return dma_base(ch) + DMA_CH_OFF +
+           (ch % DMA_CH_PER_INST) * DMA_CH_STRIDE + off;
+}
+
+static uint32_t dma_src(uint32_t ch)
+{
+    return (ch < DMA_CH_PER_INST ? SRC_DMA0_CH_BASE : SRC_DMA1_CH_BASE) +
+           (ch % DMA_CH_PER_INST) * 4;
+}
+
+static bool dma_decode(uint32_t addr, uint32_t *ch, uint32_t *off, bool *tsr)
+{
+    uint32_t inst, rel;
+
+    if (addr < DMA0_BASE ||
+        addr >= DMA0_BASE + DMA_NUM_INST * DMA_INST_STRIDE) {
+        return false;
+    }
+    inst = (addr - DMA0_BASE) / DMA_INST_STRIDE;
+    rel = (addr - DMA0_BASE) % DMA_INST_STRIDE;
+    if (rel >= DMA_TSR_OFF && rel < DMA_TSR_OFF + DMA_CH_PER_INST * 4) {
+        *ch = inst * DMA_CH_PER_INST + (rel - DMA_TSR_OFF) / 4;
+        *off = 0;
+        *tsr = true;
+        return true;
+    }
+    if (rel >= DMA_CH_OFF &&
+        rel < DMA_CH_OFF + DMA_CH_PER_INST * DMA_CH_STRIDE) {
+        *ch = inst * DMA_CH_PER_INST + (rel - DMA_CH_OFF) / DMA_CH_STRIDE;
+        *off = (rel - DMA_CH_OFF) % DMA_CH_STRIDE;
+        *tsr = false;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Next address of one side of a move (INCx direction, xMF factor, circular
+ * buffer)
+ */
+static uint32_t dma_next_addr(uint32_t addr, uint32_t width, bool inc,
+                              uint32_t mf, bool cb_enable, uint32_t cbl)
+{
+    uint32_t step = width << mf;
+    uint32_t next = inc ? addr + step : addr - step;
+
+    if (cb_enable) {
+        uint32_t mask = (1u << cbl) - 1;
+
+        next = (addr & ~mask) | (next & mask);
+    }
+    return next;
+}
+
+/*
+ * Execute one transaction of channel ch.  Returns true if the channel reloaded
+ * a linked TCS from SHADR; *auto_start reports that the loaded TCS has SCH set.
+ */
+static bool dma_transaction(Tc4xSoc *s, uint32_t ch, bool *auto_start)
+{
+    static const uint32_t blkm_moves[8] = { 1, 2, 4, 8, 16, 3, 5, 9 };
+    uint32_t adicr = reg_get(s, dma_reg(ch, DMA_ADICR));
+    uint32_t cfg = reg_get(s, dma_reg(ch, DMA_CHCFGR));
+    uint32_t sadr = reg_get(s, dma_reg(ch, DMA_SADR));
+    uint32_t dadr = reg_get(s, dma_reg(ch, DMA_DADR));
+    uint32_t trel = extract32(cfg, 0, 14);
+    uint32_t moves = (trel ? trel : 1) * blkm_moves[extract32(cfg, 16, 3)];
+    uint32_t width = 1u << extract32(cfg, 21, 3);
+    uint8_t buf[1u << 7];   /* CHDW 6 and 7 are reserved but encodable */
+
+    *auto_start = false;
+    for (uint32_t i = 0; i < moves; i++) {
+        address_space_read(&address_space_memory, sadr, MEMTXATTRS_UNSPECIFIED,
+                           buf, width);
+        address_space_write(&address_space_memory, dadr, MEMTXATTRS_UNSPECIFIED,
+                            buf, width);
+        sadr = dma_next_addr(sadr, width, extract32(adicr, 3, 1),
+                             extract32(adicr, 0, 3), extract32(adicr, 20, 1),
+                             extract32(adicr, 8, 4));
+        dadr = dma_next_addr(dadr, width, extract32(adicr, 7, 1),
+                             extract32(adicr, 4, 3), extract32(adicr, 21, 1),
+                             extract32(adicr, 12, 4));
+    }
+    reg_set(s, dma_reg(ch, DMA_SADR), sadr);
+    reg_set(s, dma_reg(ch, DMA_DADR), dadr);
+    reg_set(s, dma_reg(ch, DMA_CHCSR),
+            reg_get(s, dma_reg(ch, DMA_CHCSR)) & ~(DMA_CHCSR_SCH | 0x3FFFu));
+
+    if (extract32(adicr, 26, 2) & 2) {
+        reg_set(s, dma_reg(ch, DMA_CHCSR),
+                reg_get(s, dma_reg(ch, DMA_CHCSR)) | DMA_CHCSR_ICH);
+        src_set_srr(s, dma_src(ch), true);
+    }
+
+    if (extract32(adicr, 16, 4) == DMA_SHCT_LINKED) {
+        uint32_t tcs[8];
+
+        address_space_read(&address_space_memory,
+                           reg_get(s, dma_reg(ch, DMA_SHADR)),
+                           MEMTXATTRS_UNSPECIFIED, tcs, sizeof(tcs));
+        for (int w = 0; w < 8; w++) {
+            reg_set(s, dma_reg(ch, w * 4), le32_to_cpu(tcs[w]));
+        }
+        *auto_start = (le32_to_cpu(tcs[7]) & DMA_CHCSR_SCH) != 0;
+        return true;
+    }
+    return false;
+}
+
+static void dma_trace_start(Tc4xSoc *s, uint32_t ch, bool hw)
+{
+    trace_tc4x_dma_start(ch, hw, reg_get(s, dma_reg(ch, DMA_SADR)),
+                         reg_get(s, dma_reg(ch, DMA_DADR)),
+                         reg_get(s, dma_reg(ch, DMA_CHCFGR)));
+}
+
+/* Software request (CHCSR.SCH): follow the linked list while TCSs set SCH */
+static void dma_run(Tc4xSoc *s, uint32_t ch)
+{
+    uint32_t n = 0;
+    bool more;
+
+    dma_trace_start(s, ch, false);
+    while (dma_transaction(s, ch, &more) && more && ++n < DMA_MAX_CHAIN) {
+        /* follow the linked list while TCSs request continuation */
+    }
+    if (n >= DMA_MAX_CHAIN) {
+        qemu_log_mask(LOG_GUEST_ERROR, "tc4x-dma: ch %u linked list did not "
+                      "stop after %u transactions\n", ch, n);
+    }
+}
+
+static bool dma_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
+{
+    uint32_t ch, off;
+    bool is_tsr;
+
+    if (!dma_decode(addr, &ch, &off, &is_tsr)) {
+        return false;
+    }
+    if (is_tsr) {
+        uint32_t tsr = reg_get(s, addr);
+
+        if (val & DMA_TSR_ECH) {
+            tsr |= DMA_TSR_HTRE;
+        }
+        if (val & DMA_TSR_DCH) {
+            tsr &= ~DMA_TSR_HTRE;
+        }
+        if (val & DMA_TSR_HLTREQ) {
+            tsr |= DMA_TSR_HLTREQ | DMA_TSR_HLTACK;
+        }
+        if (val & DMA_TSR_HLTCLR) {
+            tsr &= ~(DMA_TSR_HLTREQ | DMA_TSR_HLTACK);
+        }
+        if (val & DMA_TSR_RST) {
+            tsr = 0;
+        }
+        reg_set(s, addr, tsr);
+        return true;
+    }
+    if (off == DMA_CHCSR) {
+        uint32_t csr = reg_get(s, addr) & ~DMA_CHCSR_SCH;
+
+        if (val & DMA_CHCSR_CICH) {
+            csr &= ~DMA_CHCSR_ICH;
+        }
+        if (val & DMA_CHCSR_SIT) {
+            csr |= DMA_CHCSR_ICH;
+        }
+        reg_set(s, addr, csr | (val & DMA_CHCSR_SCH));
+        if (val & DMA_CHCSR_SCH) {
+            dma_run(s, ch);
+        }
+        return true;
+    }
+    return false;
+}
+
 /* Offset of @addr in its TOM cluster; false outside the TOMs */
 static bool tom_offset(uint32_t addr, uint32_t *off)
 {
@@ -930,6 +1153,9 @@ static void sfr_write_word(Tc4xSoc *s, uint32_t addr, uint32_t val)
         return;
     }
     if (asclin_write(s, addr, val)) {
+        return;
+    }
+    if (dma_write(s, addr, val)) {
         return;
     }
     if (tom_is_cn0(addr)) {
