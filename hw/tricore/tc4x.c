@@ -318,6 +318,11 @@ typedef struct Tc4xSfrPage {
     Tc4xSfrForces *forces;
 } Tc4xSfrPage;
 
+typedef struct Tc4xSfrWriteHook {
+    Tc4xSfrWriteFn fn;
+    void *opaque;
+} Tc4xSfrWriteHook;
+
 typedef struct Tc4xQspiSlave {
     const Tc4xQspiSlaveOps *ops;
     void *opaque;
@@ -368,6 +373,7 @@ struct Tc4xSoc {
     GHashTable *tom_cn0;   /* TOM CN0 addr -> Tc4xTomCounter */
     GHashTable *watches;
     DeviceState *geth;
+    GHashTable *write_hooks;    /* addr -> Tc4xSfrWriteHook */
     /*
      * Interrupt router.  Cores acknowledge interrupts without the BQL, so
      * pending, cpu_prio and the SRC registers' SRR bits are under ir_lock;
@@ -1692,6 +1698,14 @@ static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr)
     return reg_apply_force(sfr_page(s, addr, false), sfr_word(addr), v);
 }
 
+static bool sfr_write_hook(Tc4xSoc *s, uint32_t addr, uint32_t val)
+{
+    Tc4xSfrWriteHook *h = g_hash_table_lookup(s->write_hooks,
+                                              GUINT_TO_POINTER(addr));
+
+    return h && h->fn(h->opaque, addr, val);
+}
+
 /* Writes of the QSPI modules: true when the write is consumed */
 static bool qspi_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
 {
@@ -1756,7 +1770,7 @@ static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
     }
     if (dma_write(s, addr, val) || tc4x_gpio_write(s->gpio, addr, val) ||
         tc4x_i2c_write(s->i2c, addr, val) ||
-        tc4x_adc_write(s->adc, addr, val)) {
+        tc4x_adc_write(s->adc, addr, val) || sfr_write_hook(s, addr, val)) {
         return;
     }
     if (tom_is_cn0(addr)) {
@@ -1934,7 +1948,7 @@ static void sfr_watch_clear(Tc4xSoc *s, uint32_t addr)
 {
     Tc4xSfrPage *pg = sfr_page(s, addr, false);
 
-    if (pg) {
+    if (pg && !g_hash_table_contains(s->write_hooks, GUINT_TO_POINTER(addr))) {
         clear_bit_atomic(sfr_word(addr), pg->bql_only);
     }
 }
@@ -1952,6 +1966,19 @@ static void sfr_set_bql_only(Tc4xSoc *s, uint32_t addr)
 {
     set_bit_atomic(sfr_word(addr), sfr_page(s, addr, true)->bql_only);
     sfr_plain_write_forget(s, addr);
+}
+
+void tc4x_sfr_add_write_hook(Tc4xSoc *s, uint32_t addr, Tc4xSfrWriteFn fn,
+                             void *opaque)
+{
+    Tc4xSfrWriteHook *h = g_new(Tc4xSfrWriteHook, 1);
+
+    /* vCPU threads look hooks up without a lock */
+    assert(!phase_check(PHASE_MACHINE_READY));
+    h->fn = fn;
+    h->opaque = opaque;
+    g_hash_table_insert(s->write_hooks, GUINT_TO_POINTER(addr), h);
+    sfr_set_bql_only(s, addr);
 }
 
 /*
@@ -2700,6 +2727,8 @@ static void tc4x_init(MachineState *ms)
     s->watches = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->tom_cn0 = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                        NULL, g_free);
+    s->write_hooks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                           NULL, g_free);
     s->pending = g_hash_table_new(g_direct_hash, g_direct_equal);
     qemu_rec_mutex_init(&s->ir_lock);
     qemu_rec_mutex_init(&s->qspi_lock);

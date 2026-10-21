@@ -24,6 +24,15 @@ uint32_t tc4x_reg_get(Tc4xSoc *soc, uint32_t addr);
 /* Store @val at @addr, no side effects (any thread) */
 void tc4x_reg_set(Tc4xSoc *soc, uint32_t addr, uint32_t val);
 
+/*
+ * Guest writes of @addr call @fn first; when it returns true the write is
+ * consumed, else it continues as if there were no hook.  Writes of @addr
+ * always take the BQL.  Hooks are added during machine init only.
+ */
+typedef bool (*Tc4xSfrWriteFn)(void *opaque, uint32_t addr, uint32_t val);
+void tc4x_sfr_add_write_hook(Tc4xSoc *soc, uint32_t addr, Tc4xSfrWriteFn fn,
+                             void *opaque);
+
 /* Hardware-set SRR of the service request node at @src (any thread) */
 void tc4x_irq_raise(Tc4xSoc *soc, uint32_t src);
 
