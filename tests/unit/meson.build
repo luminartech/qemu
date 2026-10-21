@@ -139,6 +139,7 @@ if have_system
     'test-base64': [],
     'test-bufferiszero': [],
     'test-smp-parse': [qom, meson.project_source_root() / 'hw/core/machine-smp.c'],
+    'test-tc4x-pacer': [meson.project_source_root() / 'hw/tricore/tc4x_pacer.c'],
     'test-vmstate': [migration, io],
     'test-yank': ['socket-helpers.c', qom, io, chardev],
     'test-ram-discard-manager': [
