@@ -139,3 +139,34 @@ SFR write hooks, analog inputs, interrupt pacers and sim-bridge commands.
 The ``generic`` board has its console on ASCLIN0, no inputs and no PHY.
 Boards kept outside this tree are built in from ``hw/tricore/boards/``:
 see ``hw/tricore/boards/README.rst``.
+
+Testing with a public example
+-----------------------------
+
+``scripts/tricore/tc4x-public-example.py`` builds an Infineon AURIX code
+example for the TC4x and runs it on the ``generic`` board, from public
+sources only:
+
+- the example comes from https://github.com/Infineon/AURIX_code_examples
+  (default ``iLLD_TC4D7_LK_ADS_Printf``, which prints a banner on ASCLIN0
+  at 115200 baud).  It is an AURIX Development Studio project with its own
+  iLLD, start-up code and GCC linker script; the script compiles it as its
+  ``.cproject`` configuration does, without the IDE;
+- the compiler is the open-source TriCore GCC,
+  https://github.com/NoMore201/tricore-gcc-toolchain (TriCore 1.8,
+  ``-mcpu=tc4DAx``).  The script downloads a release unless
+  ``--toolchain`` names the ``bin`` directory of one.  The prebuilt Linux
+  release needs glibc 2.38 or newer; on older hosts build the toolchain
+  from source (``docs/building.md`` of that repository).
+
+The run passes when the expected text appears on the console:
+
+.. code-block:: console
+
+  $ ./configure --target-list=tricore-softmmu && make -j
+  $ scripts/tricore/tc4x-public-example.py --qemu build/qemu-system-tricore
+  ...
+  iLLD_TC4D7_LK_ADS_Printf: PASS ('Serial Printf' seen on the console)
+
+``--example`` selects another example of the repository and ``--expect``
+the text it prints.
