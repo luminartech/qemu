@@ -177,8 +177,9 @@ the SoC's own.  An ``init``
 hook adds the board code through the services of
 ``include/hw/tricore/tc4x.h``: QSPI slaves, Ethernet PHYs, GPIO listeners,
 SFR write hooks, analog inputs, interrupt pacers, sim-bridge commands, and
-the flashes: their storage, where DMU commands find an address and how
-the PFLASH read windows map the storage.
+the flashes: their storage, where DMU commands find an address, how
+the PFLASH read windows map the storage, and a hook that sees every DMU
+command before it runs.
 
 Boards kept outside this tree are built in from ``hw/tricore/boards/``:
 see ``hw/tricore/boards/README.rst``.

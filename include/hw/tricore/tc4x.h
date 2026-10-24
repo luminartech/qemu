@@ -158,6 +158,38 @@ typedef struct Tc4xPflashMap {
 void tc4x_pflash_set_maps(Tc4xSoc *soc, const Tc4xPflashMap *maps,
                           unsigned n);
 
+/* A DMU command as the board's hook sees it, before it runs */
+typedef enum Tc4xDmuOp {
+    TC4X_DMU_PROGRAM,       /* write page or burst: @len bytes of @data */
+    TC4X_DMU_ERASE,         /* erase logical sectors: @len bytes */
+    TC4X_DMU_VERIFY,        /* verify erased: @len bytes */
+    TC4X_DMU_RESET_TO_READ,
+    TC4X_DMU_OTHER,         /* @code: the 5554 value, or class << 8 | opcode */
+} Tc4xDmuOp;
+
+typedef struct Tc4xDmuCommand {
+    Tc4xDmuOp op;
+    uint32_t addr;          /* command address */
+    uint32_t code;
+    bool located;           /* @flash and @off hold @addr (program..verify) */
+    Tc4xFlash flash;
+    uint64_t off;
+    uint64_t len;
+    const uint8_t *data;
+} Tc4xDmuCommand;
+
+/*
+ * @fn sees every DMU command before it runs and returns true when it
+ * executed or refused the command itself, raising error flags with
+ * tc4x_dmu_error(); false lets the SoC run it.  Either way the SoC
+ * updates the request status.
+ */
+typedef bool (*Tc4xDmuHookFn)(void *opaque, const Tc4xDmuCommand *cmd);
+void tc4x_dmu_set_hook(Tc4xSoc *soc, Tc4xDmuHookFn fn, void *opaque);
+
+/* Set bits of DMU_HCI_ERR */
+void tc4x_dmu_error(Tc4xSoc *soc, uint32_t err);
+
 /* Guest time: what the STM and the eGTM count, in ns (any thread) */
 int64_t tc4x_guest_ns(Tc4xSoc *soc);
 

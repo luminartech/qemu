@@ -377,6 +377,8 @@ struct Tc4xSoc {
     unsigned n_pflash_maps;
     Tc4xFlashLocateFn flash_locate;
     void *flash_locate_opaque;
+    Tc4xDmuHookFn dmu_hook;
+    void *dmu_hook_opaque;
     MemoryRegion lmu, lmu_alias;
     MemoryRegion sfr_e, sfr_f;
 
@@ -1021,9 +1023,60 @@ static uint32_t dmu_sector_size(uint32_t addr)
            DMU_DF_SECTOR : DMU_PF_SECTOR;
 }
 
+/* True when the board's hook executed or refused the command itself */
+static bool dmu_hooked(Tc4xSoc *s, Tc4xDmuOp op, uint32_t addr, uint32_t code,
+                       uint64_t len, const uint8_t *data)
+{
+    Tc4xDmuCommand cmd = {
+        .op = op, .addr = addr, .code = code, .len = len, .data = data,
+    };
+
+    if (!s->dmu_hook) {
+        return false;
+    }
+    if (op == TC4X_DMU_PROGRAM || op == TC4X_DMU_ERASE ||
+        op == TC4X_DMU_VERIFY) {
+        cmd.located = s->flash_locate(s->flash_locate_opaque, addr, len,
+                                      &cmd.flash, &cmd.off);
+    }
+    return s->dmu_hook(s->dmu_hook_opaque, &cmd);
+}
+
+static uint64_t dmu_verify_len(uint32_t addr, uint32_t opcode, uint32_t count)
+{
+    bool df = dmu_sector_size(addr) == DMU_DF_SECTOR;
+
+    return opcode == 0x56 ? (df ? DMU_DF_PAGE : DMU_PF_PAGE) :
+           opcode == 0x58 ? (df ? DMU_DF_WORDLINE : DMU_PF_WORDLINE) :
+           (uint64_t)count * dmu_sector_size(addr);
+}
+
 static void dmu_execute(Tc4xSoc *s, uint32_t class, uint32_t opcode)
 {
     uint32_t addr = s->cmd_addr;
+    bool program = class == 0xA0 && (opcode == 0xAA || opcode == 0xA6);
+    bool erase = class == 0x80 && opcode == 0x50;
+    bool verify = class == 0x80 &&
+                  (opcode == 0x56 || opcode == 0x58 || opcode == 0x5F);
+
+    if (program && dmu_hooked(s, TC4X_DMU_PROGRAM, addr, 0, s->page_len,
+                              s->page_buf)) {
+        s->page_len = 0;
+        dmu_status(s, DMU_STATUS_REQDONE,
+                   DMU_STATUS_DFPAGE | DMU_STATUS_PFPAGE);
+        return;
+    }
+    if ((erase && dmu_hooked(s, TC4X_DMU_ERASE, addr, 0,
+                             (uint64_t)s->cmd_count * dmu_sector_size(addr),
+                             NULL)) ||
+        (verify && dmu_hooked(s, TC4X_DMU_VERIFY, addr, 0,
+                              dmu_verify_len(addr, opcode, s->cmd_count),
+                              NULL)) ||
+        (!program && !erase && !verify &&
+         dmu_hooked(s, TC4X_DMU_OTHER, addr, class << 8 | opcode, 0, NULL))) {
+        dmu_status(s, DMU_STATUS_REQDONE, 0);
+        return;
+    }
 
     if (class == 0xA0 && (opcode == 0xAA || opcode == 0xA6)) {
         /* Write page / write burst: program the loaded page buffer */
@@ -1060,12 +1113,7 @@ static void dmu_execute(Tc4xSoc *s, uint32_t class, uint32_t opcode)
          * Verify erased page (0x56) / wordline (0x58) / logical sector
          * range (0x5F); the page form takes count 0
          */
-        bool df = dmu_sector_size(addr) == DMU_DF_SECTOR;
-        uint32_t page = df ? DMU_DF_PAGE : DMU_PF_PAGE;
-        uint32_t wordline = df ? DMU_DF_WORDLINE : DMU_PF_WORDLINE;
-        uint64_t len = opcode == 0x56 ? page :
-                       opcode == 0x58 ? wordline :
-                       (uint64_t)s->cmd_count * dmu_sector_size(addr);
+        uint64_t len = dmu_verify_len(addr, opcode, s->cmd_count);
         uint64_t off;
         AddressSpace *as = dmu_locate(s, addr, len, &off);
 
@@ -1086,6 +1134,10 @@ static void dmu_cmd_write(Tc4xSoc *s, uint32_t off, uint32_t val)
 {
     switch (off) {
     case DMU_CMD_5554:
+        if (dmu_hooked(s, val == 0xF0 ? TC4X_DMU_RESET_TO_READ : TC4X_DMU_OTHER,
+                       0, val, 0, NULL)) {
+            break;
+        }
         if (val == 0xF0) {              /* reset to read */
             s->page_len = 0;
             s->cmd_armed = false;
@@ -2807,6 +2859,17 @@ void tc4x_flash_set_locate(Tc4xSoc *s, Tc4xFlashLocateFn fn, void *opaque)
 {
     s->flash_locate = fn ? fn : flash_locate_linear;
     s->flash_locate_opaque = fn ? opaque : s;
+}
+
+void tc4x_dmu_set_hook(Tc4xSoc *s, Tc4xDmuHookFn fn, void *opaque)
+{
+    s->dmu_hook = fn;
+    s->dmu_hook_opaque = opaque;
+}
+
+void tc4x_dmu_error(Tc4xSoc *s, uint32_t err)
+{
+    dmu_error(s, err);
 }
 
 void tc4x_pflash_set_maps(Tc4xSoc *s, const Tc4xPflashMap *maps, unsigned n)
