@@ -9,6 +9,7 @@ tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_gpio.c'))
 tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_adc.c'))
 tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_i2c.c'))
 tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_pacer.c'))
+tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_kit.c'))
 
 # Board extensions: each hw/tricore/boards/NAME adds its files to tricore_ss
 foreach board : get_option('tc4x_boards')

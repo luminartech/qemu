@@ -8,3 +8,6 @@ tc4x_time_barrier(int64_t barrier, bool held, bool stood) "barrier %" PRId64 " h
 
 # tc4x_i2c.c
 tc4x_i2c_transfer(unsigned bus, unsigned addr, bool read, unsigned len, bool ack) "bus %u addr 0x%02x read %d len %u ack %d"
+
+# tc4x_kit.c
+tc4x_kit_led(unsigned led, bool on) "led %u on %d"
