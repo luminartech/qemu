@@ -94,6 +94,12 @@ Machine properties:
   Back every RAM with a shared file ``DIR/NAME`` that external processes
   can map.
 
+``flash-dir=DIR``
+  Keep the program and data flash in files ``DIR/pflash`` and
+  ``DIR/dflash`` across runs: files that exist keep their contents and
+  the image only seeds them, so a restart after a guest reset finds what
+  the firmware programmed.
+
 ``imprecise-io=on``
   SFR accesses take effect at the next TB instead of the next instruction
   (no TCG I/O rewind).  Faster for firmware that polls registers in tight

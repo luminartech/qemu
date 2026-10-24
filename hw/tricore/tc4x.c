@@ -453,6 +453,9 @@ struct Tc4xSoc {
     char *board_name;
     Tc4xBoard *board;
     char *shm_dir;
+    char *flash_dir;
+    bool flash_kept;
+    uint8_t *kept_pflash, *kept_dflash;
     bool imprecise_io;      /* SFR accesses skip the TCG I/O rewind */
 };
 
@@ -2679,23 +2682,50 @@ static void sim_receive(void *opaque, const uint8_t *buf, int size)
 }
 
 /*
- * With shm-dir set, every RAM is a shared file "<shm-dir>/<name>" that
- * external processes can map.
+ * With a directory, a RAM is a shared file "<dir>/<name>" that external
+ * processes can map; true when that file already existed at this size.
  */
-static void add_ram(Tc4xSoc *s, MemoryRegion *mr, const char *name,
-                    hwaddr base, uint64_t size)
+static bool init_ram(MemoryRegion *mr, const char *dir, const char *name,
+                     uint64_t size)
 {
-    if (s->shm_dir) {
-        g_autofree char *path = g_strdup_printf("%s/%s", s->shm_dir, name);
+    bool existed = false;
 
-        g_mkdir_with_parents(s->shm_dir, 0700);
+    if (dir) {
+        g_autofree char *path = g_strdup_printf("%s/%s", dir, name);
+        struct stat st;
+
+        existed = stat(path, &st) == 0 && (uint64_t)st.st_size == size;
+        g_mkdir_with_parents(dir, 0700);
         memory_region_init_ram_from_file(mr, NULL, name, size, 0, RAM_SHARED,
                                          path, 0, &error_fatal);
         vmstate_register_ram_global(mr);
     } else {
         memory_region_init_ram(mr, NULL, name, size, &error_fatal);
     }
+    return existed;
+}
+
+static void add_ram(Tc4xSoc *s, MemoryRegion *mr, const char *name,
+                    hwaddr base, uint64_t size)
+{
+    init_ram(mr, s->shm_dir, name, size);
     memory_region_add_subregion(get_system_memory(), base, mr);
+}
+
+/*
+ * The flashes live in flash-dir when it is set (else shm-dir, if any);
+ * flash files that already existed keep their contents over the image.
+ */
+static void add_flashes(Tc4xSoc *s)
+{
+    const char *dir = s->flash_dir ? s->flash_dir : s->shm_dir;
+    bool kept;
+
+    kept = init_ram(&s->pflash, dir, "pflash", 80 * MiB);
+    kept &= init_ram(&s->dflash, dir, "dflash", 32 * MiB);
+    s->flash_kept = s->flash_dir && kept;
+    memory_region_add_subregion(get_system_memory(), 0x80000000u, &s->pflash);
+    memory_region_add_subregion(get_system_memory(), 0xAE000000u, &s->dflash);
 }
 
 static void add_alias(MemoryRegion *alias, const char *name,
@@ -2733,6 +2763,15 @@ static void tc4x_reset(MachineState *ms, ResetType type)
     Tc4xSoc *s = TC4X_MACHINE(ms);
 
     qemu_devices_reset(type);
+    if (s->kept_pflash) {
+        /* the kept flash contents, which the image only seeded the RAMs over */
+        memcpy(memory_region_get_ram_ptr(&s->pflash), s->kept_pflash,
+               memory_region_size(&s->pflash));
+        memcpy(memory_region_get_ram_ptr(&s->dflash), s->kept_dflash,
+               memory_region_size(&s->dflash));
+        g_clear_pointer(&s->kept_pflash, g_free);
+        g_clear_pointer(&s->kept_dflash, g_free);
+    }
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         cpu_reset(CPU(s->cpu[c]));
     }
@@ -2899,9 +2938,8 @@ static void tc4x_init(MachineState *ms)
         add_ram(s, &s->core_ram[c], name, base, TC4X_CORE_RAM_SIZE);
     }
     add_ram(s, &s->seg1_ram, "seg1", 0x10000000u, 16 * MiB);
-    add_ram(s, &s->pflash, "pflash", 0x80000000u, 80 * MiB);
+    add_flashes(s);
     add_alias(&s->pflash_alias, "pflash.nc", &s->pflash, 0xA0000000u);
-    add_ram(s, &s->dflash, "dflash", 0xAE000000u, 32 * MiB);
     add_ram(s, &s->lmu, "lmu", 0x90000000u, 64 * MiB);
     add_alias(&s->lmu_alias, "lmu.nc", &s->lmu, 0xB0000000u);
 
@@ -3009,6 +3047,12 @@ static void tc4x_init(MachineState *ms)
     if (ms->kernel_filename) {
         g_auto(GStrv) files = g_strsplit(ms->kernel_filename, ",", -1);
 
+        if (s->flash_kept) {
+            s->kept_pflash = g_memdup2(memory_region_get_ram_ptr(&s->pflash),
+                                       memory_region_size(&s->pflash));
+            s->kept_dflash = g_memdup2(memory_region_get_ram_ptr(&s->dflash),
+                                       memory_region_size(&s->dflash));
+        }
         for (int i = 0; files[i]; i++) {
             tc4x_load_image(s, files[i]);
         }
@@ -3054,6 +3098,19 @@ static void tc4x_set_shm_dir(Object *obj, const char *value, Error **errp)
     s->shm_dir = g_strdup(value);
 }
 
+static char *tc4x_get_flash_dir(Object *obj, Error **errp)
+{
+    return g_strdup(TC4X_MACHINE(obj)->flash_dir);
+}
+
+static void tc4x_set_flash_dir(Object *obj, const char *value, Error **errp)
+{
+    Tc4xSoc *s = TC4X_MACHINE(obj);
+
+    g_free(s->flash_dir);
+    s->flash_dir = g_strdup(value);
+}
+
 static bool tc4x_get_imprecise_io(Object *obj, Error **errp)
 {
     return TC4X_MACHINE(obj)->imprecise_io;
@@ -3072,6 +3129,12 @@ static void tc4x_class_init(ObjectClass *oc, const void *data)
                                   tc4x_set_shm_dir);
     object_class_property_set_description(oc, "shm-dir",
         "Directory (e.g. /dev/shm/tc4x) for file-backed shared guest RAM");
+
+    object_class_property_add_str(oc, "flash-dir", tc4x_get_flash_dir,
+                                  tc4x_set_flash_dir);
+    object_class_property_set_description(oc, "flash-dir",
+        "Directory for the PFLASH and DFLASH files: kept files keep their "
+        "contents, the image seeding only the RAMs");
 
     object_class_property_add_str(oc, "board", tc4x_get_board,
                                   tc4x_set_board);
