@@ -458,6 +458,8 @@ struct Tc4xSoc {
     uint32_t cmd_class;
 
     uint32_t boot_pc;
+    uint32_t boot_pc_board;     /* this reset's start address from the board */
+    bool boot_hold;             /* this reset leaves core 0 halted */
     char *sfr_script;
     char *board_name;
     Tc4xBoard *board;
@@ -2861,6 +2863,16 @@ void tc4x_flash_set_locate(Tc4xSoc *s, Tc4xFlashLocateFn fn, void *opaque)
     s->flash_locate_opaque = fn ? opaque : s;
 }
 
+void tc4x_set_boot_pc(Tc4xSoc *s, uint32_t pc)
+{
+    s->boot_pc_board = pc;
+}
+
+void tc4x_hold_boot(Tc4xSoc *s)
+{
+    s->boot_hold = true;
+}
+
 void tc4x_dmu_set_hook(Tc4xSoc *s, Tc4xDmuHookFn fn, void *opaque)
 {
     s->dmu_hook = fn;
@@ -2952,7 +2964,16 @@ static void tc4x_reset(MachineState *ms, ResetType type)
         memset(s->cpu_prio, 0, sizeof(s->cpu_prio));
     }
     ir_update(s);
-    s->cpu[0]->env.PC = s->boot_pc;
+    s->boot_pc_board = 0;
+    s->boot_hold = false;
+    if (TC4X_BOARD_GET_CLASS(s->board)->reset) {
+        TC4X_BOARD_GET_CLASS(s->board)->reset(s->board, s);
+    }
+    s->cpu[0]->env.PC = s->boot_pc_board ? s->boot_pc_board : s->boot_pc;
+    if (s->boot_hold) {
+        s->cpu[0]->env.boot_halted = true;
+        CPU(s->cpu[0])->halted = 1;
+    }
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         reg_set(s, CPU_SFR_BASE + c * CPU_SFR_STRIDE + CPU_HRA_BOOTCON,
                 c == 0 ? 0 : 1);

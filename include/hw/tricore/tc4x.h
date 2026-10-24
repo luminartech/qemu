@@ -190,6 +190,14 @@ void tc4x_dmu_set_hook(Tc4xSoc *soc, Tc4xDmuHookFn fn, void *opaque);
 /* Set bits of DMU_HCI_ERR */
 void tc4x_dmu_error(Tc4xSoc *soc, uint32_t err);
 
+/*
+ * From a board's reset hook: core 0 starts at @pc instead of the image's
+ * entry point, or stays halted (as before a debugger releases it through
+ * BOOTCON), for this reset only
+ */
+void tc4x_set_boot_pc(Tc4xSoc *soc, uint32_t pc);
+void tc4x_hold_boot(Tc4xSoc *soc);
+
 /* Guest time: what the STM and the eGTM count, in ns (any thread) */
 int64_t tc4x_guest_ns(Tc4xSoc *soc);
 

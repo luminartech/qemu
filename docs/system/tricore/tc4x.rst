@@ -179,7 +179,8 @@ hook adds the board code through the services of
 SFR write hooks, analog inputs, interrupt pacers, sim-bridge commands, and
 the flashes: their storage, where DMU commands find an address, how
 the PFLASH read windows map the storage, and a hook that sees every DMU
-command before it runs.
+command before it runs.  A ``reset`` hook runs at every machine reset
+before core 0 starts and may set its start address or keep it halted.
 
 Boards kept outside this tree are built in from ``hw/tricore/boards/``:
 see ``hw/tricore/boards/README.rst``.

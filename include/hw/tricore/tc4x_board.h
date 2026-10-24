@@ -75,6 +75,11 @@ struct Tc4xBoardClass {
     size_t n_kernel_resets;
     /* Adds the board code, at the end of machine init before the sfr-script */
     void (*init)(Tc4xBoard *board, Tc4xSoc *soc);
+    /*
+     * At every machine reset, once the flashes hold their contents and
+     * before core 0 starts: may choose where and whether it starts
+     */
+    void (*reset)(Tc4xBoard *board, Tc4xSoc *soc);
 };
 
 #endif
