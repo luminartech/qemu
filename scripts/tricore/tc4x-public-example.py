@@ -8,11 +8,18 @@
 #     GCC linker script), built from its .cproject settings without ADS;
 #   - the compiler: the open-source TriCore GCC,
 #     https://github.com/NoMore201/tricore-gcc-toolchain (TriCore 1.8);
-#   - QEMU: qemu-system-tricore -M tc4x (generic board, console on ASCLIN0).
+#   - QEMU: qemu-system-tricore -M tc4x (generic board unless --board names
+#     another, console on ASCLIN0).
 #
-# The run passes when the expected text appears on the console.
+# The run passes when every expected text appears on the console or in the
+# trace output (--trace enables trace events, e.g. tc4x_kit_led for the LEDs
+# of the kit-tc4d7-lite board).  --sim sends sim-bridge commands to the
+# running machine, one every --sim-delay seconds.
 #
 #   scripts/tricore/tc4x-public-example.py --qemu build/qemu-system-tricore
+#   scripts/tricore/tc4x-public-example.py --board kit-tc4d7-lite \
+#       --example iLLD_TC4D7_LK_ADS_Blinky_LED --trace tc4x_kit_led \
+#       --expect "led 1 on 1" --expect "led 1 on 0"
 #
 # Copyright (c) 2026 MicroVision, Inc.
 #
@@ -21,9 +28,11 @@
 import argparse
 import pathlib
 import re
+import socket
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -114,24 +123,50 @@ def build(example, bindir, out):
     return elf
 
 
-def run_qemu(qemu, elf, console, expect, timeout):
-    """True once expect appears on the console within timeout seconds"""
-    console.unlink(missing_ok=True)
-    proc = subprocess.Popen([qemu, "-M", "tc4x", "-kernel", elf,
-                             "-display", "none", "-monitor", "none",
-                             "-serial", f"file:{console}"])
-    deadline = time.monotonic() + timeout
+def run_qemu(qemu, elf, board, log, expects, traces, sims, sim_delay,
+             timeout):
+    """True once every text of expects appears within timeout seconds"""
+    console = log.with_suffix(".console")
+    trace = log.with_suffix(".trace")
+    # a short directory: socket paths are limited to 107 bytes
+    sim_dir = tempfile.TemporaryDirectory(prefix="tc4x-")
+    sim_path = pathlib.Path(sim_dir.name) / "sim"
+    for f in (console, trace):
+        f.unlink(missing_ok=True)
+    cmd = [qemu, "-M", f"tc4x,board={board}", "-kernel", elf,
+           "-display", "none", "-monitor", "none",
+           "-serial", f"file:{console}",
+           "-serial", f"unix:{sim_path},server=on,wait=off"]
+    for pattern in traces:
+        cmd += ["-trace", pattern]
+    with open(trace, "w") as err:
+        proc = subprocess.Popen([str(c) for c in cmd], stderr=err)
+    start = time.monotonic()
+    deadline = start + timeout
+    sim = None
+    pending = list(sims)
     try:
         while time.monotonic() < deadline and proc.poll() is None:
-            text = (console.read_text(errors="replace")
-                    if console.exists() else "")
-            if expect in text:
+            text = "".join(f.read_text(errors="replace")
+                           for f in (console, trace) if f.exists())
+            log.write_text(text)
+            if all(e in text for e in expects):
                 return True
-            time.sleep(0.5)
+            if pending and time.monotonic() - start >= sim_delay * (
+                    len(sims) - len(pending) + 1):
+                if sim is None:
+                    sim = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sim.connect(str(sim_path))
+                print(f"sim: {pending[0]}", flush=True)
+                sim.sendall((pending.pop(0) + "\n").encode())
+            time.sleep(0.2)
         return False
     finally:
+        if sim is not None:
+            sim.close()
         proc.terminate()
         proc.wait()
+        sim_dir.cleanup()
 
 
 def main():
@@ -142,8 +177,17 @@ def main():
                     help="code_examples/ directory of the public repo")
     ap.add_argument("--example-ref", default="master",
                     help="commit or branch of the public repo")
-    ap.add_argument("--expect", default=DEFAULT_EXPECT,
-                    help="console text that makes the run pass")
+    ap.add_argument("--board", default="generic",
+                    help="tc4x board to run the example on")
+    ap.add_argument("--expect", action="append",
+                    help="text the console or trace output must show "
+                         f"(repeatable, default {DEFAULT_EXPECT!r})")
+    ap.add_argument("--trace", action="append", default=[],
+                    help="trace event pattern to enable (repeatable)")
+    ap.add_argument("--sim", action="append", default=[],
+                    help="sim-bridge command to send (repeatable)")
+    ap.add_argument("--sim-delay", type=float, default=2.0,
+                    help="seconds before each --sim command")
     ap.add_argument("--toolchain", type=pathlib.Path,
                     help="bin/ of a TriCore GCC (default: download one)")
     ap.add_argument("--toolchain-tag", default="13.4.1",
@@ -160,14 +204,16 @@ def main():
     bindir = args.toolchain or get_toolchain(work, args.toolchain_tag)
     example = get_example(work, args.example, args.example_ref)
     elf = build(example, bindir.resolve(), work / "build" / args.example)
-    console = work / f"{args.example}.console"
-    ok = run_qemu(pathlib.Path(args.qemu).resolve(), elf, console, args.expect,
-                  args.timeout)
-    print(console.read_text(errors="replace") if console.exists() else "")
-    print(f"{args.example}: {'PASS' if ok else 'FAIL'} "
-          f"({args.expect!r} {'seen' if ok else 'not seen'} on the console)")
+    expects = args.expect or [DEFAULT_EXPECT]
+    log = work / f"{args.example}.log"
+    ok = run_qemu(pathlib.Path(args.qemu).resolve(), elf, args.board, log,
+                  expects, args.trace, args.sim, args.sim_delay, args.timeout)
+    text = log.read_text(errors="replace") if log.exists() else ""
+    print(text)
+    missing = [e for e in expects if e not in text]
+    print(f"{args.example} on {args.board}: {'PASS' if ok else 'FAIL'}"
+          + (f" (not seen: {missing})" if missing else ""))
     return 0 if ok else 1
-
 
 if __name__ == "__main__":
     sys.exit(main())
