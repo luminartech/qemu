@@ -127,6 +127,8 @@
 #define DMU_ERR_PVER        BIT(6)
 #define DMU_ERR_EVER        BIT(7)
 #define DMU_DFLASH_BASE     0xAE000000u
+#define PFLASH_BASE_C       0x80000000u   /* cached read window */
+#define PFLASH_BASE_NC      0xA0000000u   /* non-cached read window */
 #define DMU_DF_SECTOR       (2 * KiB)
 #define DMU_PF_SECTOR       (16 * KiB)
 #define DMU_DF_PAGE         8u
@@ -368,8 +370,13 @@ struct Tc4xSoc {
     MemoryRegion cpu_local_pspr[TC4X_NUM_CORES];
     MemoryRegion core_ram[TC4X_NUM_CORES];
     MemoryRegion seg1_ram;
-    MemoryRegion pflash, pflash_alias;
-    MemoryRegion dflash;
+    MemoryRegion pflash, dflash;
+    AddressSpace pflash_as, dflash_as;
+    MemoryRegion pflash_win[2], pflash_linear[2], dflash_win;
+    MemoryRegion *pflash_maps[2][TC4X_PFLASH_MAPS_MAX];
+    unsigned n_pflash_maps;
+    Tc4xFlashLocateFn flash_locate;
+    void *flash_locate_opaque;
     MemoryRegion lmu, lmu_alias;
     MemoryRegion sfr_e, sfr_f;
 
@@ -945,39 +952,64 @@ static void dmu_error(Tc4xSoc *s, uint32_t err)
     reg_set(s, DMU_HCI_ERR, reg_get(s, DMU_HCI_ERR) | err);
 }
 
-/* A command fails with SQER unless its range lies in one flash */
-static bool dmu_in_flash(Tc4xSoc *s, uint32_t addr, uint64_t len)
+static AddressSpace *flash_as(Tc4xSoc *s, Tc4xFlash flash)
 {
-    MemoryRegionSection sec;
-    bool ok;
-
-    if (len == 0) {
-        return true;
-    }
-    sec = memory_region_find(get_system_memory(), addr, len);
-    ok = (sec.mr == &s->pflash || sec.mr == &s->dflash) &&
-         int128_get64(sec.size) == len;
-    if (sec.mr) {
-        memory_region_unref(sec.mr);
-    }
-    return ok;
+    return flash == TC4X_PFLASH ? &s->pflash_as : &s->dflash_as;
 }
 
-static bool dmu_range_is(uint32_t addr, uint64_t len, uint8_t value)
+/* Without a board's locate function: PFLASH and DFLASH linear */
+static bool flash_locate_linear(void *opaque, uint32_t addr, uint64_t len,
+                                Tc4xFlash *flash, uint64_t *off)
+{
+    Tc4xSoc *s = opaque;
+    static const struct {
+        uint32_t base;
+        Tc4xFlash flash;
+    } windows[] = {
+        { PFLASH_BASE_C, TC4X_PFLASH },
+        { PFLASH_BASE_NC, TC4X_PFLASH },
+        { DMU_DFLASH_BASE, TC4X_DFLASH },
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(windows); i++) {
+        MemoryRegion *mr = windows[i].flash == TC4X_PFLASH ? &s->pflash :
+                           &s->dflash;
+
+        if (addr >= windows[i].base &&
+            (uint64_t)addr + len <= windows[i].base + memory_region_size(mr)) {
+            *flash = windows[i].flash;
+            *off = addr - windows[i].base;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The flash storage of a command's range, or NULL: the command fails (SQER) */
+static AddressSpace *dmu_locate(Tc4xSoc *s, uint32_t addr, uint64_t len,
+                                uint64_t *off)
+{
+    Tc4xFlash flash;
+
+    return s->flash_locate(s->flash_locate_opaque, addr, len, &flash, off) ?
+           flash_as(s, flash) : NULL;
+}
+
+static bool dmu_range_is(AddressSpace *as, uint64_t off, uint64_t len,
+                         uint8_t value)
 {
     uint8_t buf[256];
 
     while (len) {
         uint32_t n = MIN(len, sizeof(buf));
 
-        address_space_read(&address_space_memory, addr,
-                           MEMTXATTRS_UNSPECIFIED, buf, n);
+        address_space_read(as, off, MEMTXATTRS_UNSPECIFIED, buf, n);
         for (uint32_t i = 0; i < n; i++) {
             if (buf[i] != value) {
                 return false;
             }
         }
-        addr += n;
+        off += n;
         len -= n;
     }
     return true;
@@ -995,14 +1027,16 @@ static void dmu_execute(Tc4xSoc *s, uint32_t class, uint32_t opcode)
 
     if (class == 0xA0 && (opcode == 0xAA || opcode == 0xA6)) {
         /* Write page / write burst: program the loaded page buffer */
-        if (!dmu_in_flash(s, addr, s->page_len)) {
+        uint64_t off;
+        AddressSpace *as = dmu_locate(s, addr, s->page_len, &off);
+
+        if (!as) {
             dmu_error(s, DMU_ERR_SQER);
         } else {
-            if (!dmu_range_is(addr, s->page_len, 0)) {
+            if (!dmu_range_is(as, off, s->page_len, 0)) {
                 dmu_error(s, DMU_ERR_PVER);
             }
-            address_space_write(&address_space_memory, addr,
-                                MEMTXATTRS_UNSPECIFIED, s->page_buf,
+            address_space_write(as, off, MEMTXATTRS_UNSPECIFIED, s->page_buf,
                                 s->page_len);
         }
         s->page_len = 0;
@@ -1011,10 +1045,11 @@ static void dmu_execute(Tc4xSoc *s, uint32_t class, uint32_t opcode)
     } else if (class == 0x80 && opcode == 0x50) {
         /* Erase logical sector range: erased flash reads as zero */
         uint64_t len = (uint64_t)s->cmd_count * dmu_sector_size(addr);
+        uint64_t off;
+        AddressSpace *as = dmu_locate(s, addr, len, &off);
 
-        if (dmu_in_flash(s, addr, len)) {
-            address_space_set(&address_space_memory, addr, 0, len,
-                              MEMTXATTRS_UNSPECIFIED);
+        if (as) {
+            address_space_set(as, off, 0, len, MEMTXATTRS_UNSPECIFIED);
         } else {
             dmu_error(s, DMU_ERR_SQER);
         }
@@ -1031,10 +1066,12 @@ static void dmu_execute(Tc4xSoc *s, uint32_t class, uint32_t opcode)
         uint64_t len = opcode == 0x56 ? page :
                        opcode == 0x58 ? wordline :
                        (uint64_t)s->cmd_count * dmu_sector_size(addr);
+        uint64_t off;
+        AddressSpace *as = dmu_locate(s, addr, len, &off);
 
-        if (!dmu_in_flash(s, addr, len)) {
+        if (!as) {
             dmu_error(s, DMU_ERR_SQER);
-        } else if (!dmu_range_is(addr, len, 0)) {
+        } else if (!dmu_range_is(as, off, len, 0)) {
             dmu_error(s, DMU_ERR_EVER);
         }
         dmu_status(s, DMU_STATUS_REQDONE, 0);
@@ -2718,14 +2755,86 @@ static void add_ram(Tc4xSoc *s, MemoryRegion *mr, const char *name,
  */
 static void add_flashes(Tc4xSoc *s)
 {
+    static const hwaddr win_base[2] = { PFLASH_BASE_C, PFLASH_BASE_NC };
+    static const char *const win_name[2] = { "pflash.win", "pflash.win.nc" };
     const char *dir = s->flash_dir ? s->flash_dir : s->shm_dir;
     bool kept;
 
     kept = init_ram(&s->pflash, dir, "pflash", 80 * MiB);
     kept &= init_ram(&s->dflash, dir, "dflash", 32 * MiB);
     s->flash_kept = s->flash_dir && kept;
-    memory_region_add_subregion(get_system_memory(), 0x80000000u, &s->pflash);
-    memory_region_add_subregion(get_system_memory(), 0xAE000000u, &s->dflash);
+    address_space_init(&s->pflash_as, &s->pflash, "pflash.storage");
+    address_space_init(&s->dflash_as, &s->dflash, "dflash.storage");
+    for (int w = 0; w < 2; w++) {
+        uint64_t size = memory_region_size(&s->pflash);
+
+        memory_region_init(&s->pflash_win[w], NULL, win_name[w], size);
+        memory_region_init_alias(&s->pflash_linear[w], NULL, "pflash.linear",
+                                 &s->pflash, 0, size);
+        memory_region_add_subregion(&s->pflash_win[w], 0,
+                                    &s->pflash_linear[w]);
+        memory_region_add_subregion(get_system_memory(), win_base[w],
+                                    &s->pflash_win[w]);
+    }
+    memory_region_init_alias(&s->dflash_win, NULL, "dflash.win", &s->dflash, 0,
+                             memory_region_size(&s->dflash));
+    memory_region_add_subregion(get_system_memory(), DMU_DFLASH_BASE,
+                                &s->dflash_win);
+    s->flash_locate = flash_locate_linear;
+    s->flash_locate_opaque = s;
+}
+
+bool tc4x_flash_kept(Tc4xSoc *s)
+{
+    return s->flash_kept;
+}
+
+void tc4x_flash_read(Tc4xSoc *s, Tc4xFlash flash, uint64_t off, void *buf,
+                     uint64_t len)
+{
+    address_space_read(flash_as(s, flash), off, MEMTXATTRS_UNSPECIFIED, buf,
+                       len);
+}
+
+void tc4x_flash_write(Tc4xSoc *s, Tc4xFlash flash, uint64_t off,
+                      const void *buf, uint64_t len)
+{
+    address_space_write(flash_as(s, flash), off, MEMTXATTRS_UNSPECIFIED, buf,
+                        len);
+}
+
+void tc4x_flash_set_locate(Tc4xSoc *s, Tc4xFlashLocateFn fn, void *opaque)
+{
+    s->flash_locate = fn ? fn : flash_locate_linear;
+    s->flash_locate_opaque = fn ? opaque : s;
+}
+
+void tc4x_pflash_set_maps(Tc4xSoc *s, const Tc4xPflashMap *maps, unsigned n)
+{
+    assert(n <= TC4X_PFLASH_MAPS_MAX);
+    memory_region_transaction_begin();
+    for (int w = 0; w < 2; w++) {
+        for (unsigned i = 0; i < s->n_pflash_maps; i++) {
+            memory_region_del_subregion(&s->pflash_win[w],
+                                        s->pflash_maps[w][i]);
+            object_unparent(OBJECT(s->pflash_maps[w][i]));
+        }
+        for (unsigned i = 0; i < n; i++) {
+            MemoryRegion *mr = g_new0(MemoryRegion, 1);
+
+            assert(maps[i].win + maps[i].size <=
+                   memory_region_size(&s->pflash) &&
+                   maps[i].storage + maps[i].size <=
+                   memory_region_size(&s->pflash));
+            memory_region_init_alias(mr, OBJECT(s), "pflash.map", &s->pflash,
+                                     maps[i].storage, maps[i].size);
+            memory_region_add_subregion_overlap(&s->pflash_win[w], maps[i].win,
+                                                mr, 1);
+            s->pflash_maps[w][i] = mr;
+        }
+    }
+    s->n_pflash_maps = n;
+    memory_region_transaction_commit();
 }
 
 static void add_alias(MemoryRegion *alias, const char *name,
@@ -2939,7 +3048,6 @@ static void tc4x_init(MachineState *ms)
     }
     add_ram(s, &s->seg1_ram, "seg1", 0x10000000u, 16 * MiB);
     add_flashes(s);
-    add_alias(&s->pflash_alias, "pflash.nc", &s->pflash, 0xA0000000u);
     add_ram(s, &s->lmu, "lmu", 0x90000000u, 64 * MiB);
     add_alias(&s->lmu_alias, "lmu.nc", &s->lmu, 0xB0000000u);
 

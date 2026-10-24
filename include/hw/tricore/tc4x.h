@@ -118,6 +118,46 @@ typedef struct Tc4xI2cSlaveOps {
 void tc4x_i2c_attach(Tc4xSoc *soc, unsigned bus, uint8_t addr,
                      const Tc4xI2cSlaveOps *ops, void *opaque);
 
+/* The program and data flash, as storage */
+typedef enum Tc4xFlash {
+    TC4X_PFLASH,
+    TC4X_DFLASH,
+} Tc4xFlash;
+
+/* The flashes came from flash-dir files of an earlier run (board init on) */
+bool tc4x_flash_kept(Tc4xSoc *soc);
+
+/* Read or write flash storage directly, without the DMU */
+void tc4x_flash_read(Tc4xSoc *soc, Tc4xFlash flash, uint64_t off, void *buf,
+                     uint64_t len);
+void tc4x_flash_write(Tc4xSoc *soc, Tc4xFlash flash, uint64_t off,
+                      const void *buf, uint64_t len);
+
+/*
+ * Where DMU commands find their addresses: @fn places [@addr, @addr+@len)
+ * in one flash (@flash, @off) or returns false, and the command fails.
+ * Without one (or with NULL), the PFLASH storage is linear from both read
+ * windows and the DFLASH from 0xAE000000.
+ */
+typedef bool (*Tc4xFlashLocateFn)(void *opaque, uint32_t addr, uint64_t len,
+                                  Tc4xFlash *flash, uint64_t *off);
+void tc4x_flash_set_locate(Tc4xSoc *soc, Tc4xFlashLocateFn fn, void *opaque);
+
+/*
+ * The PFLASH read windows (cached at 0x80000000, non-cached at 0xA0000000)
+ * show the storage linearly; each map shows @size bytes of storage from
+ * @storage at window offset @win instead.  A call replaces the maps of
+ * the previous one; n = 0 makes the windows linear again.
+ */
+#define TC4X_PFLASH_MAPS_MAX 16
+typedef struct Tc4xPflashMap {
+    uint64_t win;
+    uint64_t size;
+    uint64_t storage;
+} Tc4xPflashMap;
+void tc4x_pflash_set_maps(Tc4xSoc *soc, const Tc4xPflashMap *maps,
+                          unsigned n);
+
 /* Guest time: what the STM and the eGTM count, in ns (any thread) */
 int64_t tc4x_guest_ns(Tc4xSoc *soc);
 
