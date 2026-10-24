@@ -453,6 +453,7 @@ struct Tc4xSoc {
     char *board_name;
     Tc4xBoard *board;
     char *shm_dir;
+    bool imprecise_io;      /* SFR accesses skip the TCG I/O rewind */
 };
 
 Tc4xGpio *tc4x_soc_gpio(Tc4xSoc *s)
@@ -2907,10 +2908,12 @@ static void tc4x_init(MachineState *ms)
     memory_region_init_io(&s->sfr_e, NULL, &sfr_e_ops, s, "sfr.e",
                           0x10000000u);
     memory_region_enable_lockless_io(&s->sfr_e);
+    memory_region_set_imprecise_io(&s->sfr_e, s->imprecise_io);
     memory_region_add_subregion(sysmem, 0xE0000000u, &s->sfr_e);
     memory_region_init_io(&s->sfr_f, NULL, &sfr_f_ops, s, "sfr.f",
                           0x10000000u);
     memory_region_enable_lockless_io(&s->sfr_f);
+    memory_region_set_imprecise_io(&s->sfr_f, s->imprecise_io);
     memory_region_add_subregion(sysmem, 0xF0000000u, &s->sfr_f);
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         g_autofree char *name = g_strdup_printf("cpu%d.stm_page", c);
@@ -2921,6 +2924,7 @@ static void tc4x_init(MachineState *ms)
         memory_region_init_io(&pg->mr, NULL, &cpu_stm_page_ops, pg, name,
                               CPU_STM_PAGE_SIZE);
         memory_region_enable_lockless_io(&pg->mr);
+        memory_region_set_imprecise_io(&pg->mr, s->imprecise_io);
         memory_region_add_subregion_overlap(&s->sfr_f, pg->base - 0xF0000000u,
                                             &pg->mr, 1);
     }
@@ -2929,6 +2933,7 @@ static void tc4x_init(MachineState *ms)
     memory_region_init_io(&s->tbu_page.mr, NULL, &tbu_page_ops, &s->tbu_page,
                           "egtm.tbu_page", CPU_STM_PAGE_SIZE);
     memory_region_enable_lockless_io(&s->tbu_page.mr);
+    memory_region_set_imprecise_io(&s->tbu_page.mr, s->imprecise_io);
     memory_region_add_subregion_overlap(&s->sfr_f, EGTM_TBU_PAGE - 0xF0000000u,
                                         &s->tbu_page.mr, 1);
 
@@ -3049,6 +3054,16 @@ static void tc4x_set_shm_dir(Object *obj, const char *value, Error **errp)
     s->shm_dir = g_strdup(value);
 }
 
+static bool tc4x_get_imprecise_io(Object *obj, Error **errp)
+{
+    return TC4X_MACHINE(obj)->imprecise_io;
+}
+
+static void tc4x_set_imprecise_io(Object *obj, bool value, Error **errp)
+{
+    TC4X_MACHINE(obj)->imprecise_io = value;
+}
+
 static void tc4x_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -3067,6 +3082,12 @@ static void tc4x_class_init(ObjectClass *oc, const void *data)
                                   tc4x_set_sfr_script);
     object_class_property_set_description(oc, "sfr-script",
         "File of sim-bridge commands (force/poke/watch) run at machine init");
+
+    object_class_property_add_bool(oc, "imprecise-io", tc4x_get_imprecise_io,
+                                   tc4x_set_imprecise_io);
+    object_class_property_set_description(oc, "imprecise-io",
+        "SFR accesses take effect at the next TB instead of the next "
+        "instruction: faster, not instruction-precise (default off)");
 
     mc->desc = "Infineon AURIX TC4Dx (6x TriCore 1.8)";
     mc->init = tc4x_init;

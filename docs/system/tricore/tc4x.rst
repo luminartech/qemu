@@ -64,6 +64,12 @@ Machine properties:
   Back every RAM with a shared file ``DIR/NAME`` that external processes
   can map.
 
+``imprecise-io=on``
+  SFR accesses take effect at the next TB instead of the next instruction
+  (no TCG I/O rewind).  Faster for firmware that polls registers in tight
+  loops, but no longer instruction-precise; off by default, and icount
+  keeps the precise behaviour.
+
 CPU property, with ``-global tc4x-tricore-cpu.csa-cache=on``:
 
 ``csa-cache=on``
