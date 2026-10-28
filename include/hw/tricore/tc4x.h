@@ -180,6 +180,7 @@ typedef struct Tc4xDmuCommand {
     Tc4xDmuOp op;
     uint32_t addr;          /* command address */
     uint32_t code;
+    bool csrm;              /* from the CSRM command interface, else host */
     bool located;           /* @flash and @off hold @addr (program..verify) */
     Tc4xFlash flash;
     uint64_t off;

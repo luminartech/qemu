@@ -120,7 +120,11 @@
 #define DMU_HCI_STATUS      0xF8040004u
 #define DMU_HCI_ERR         0xF8040010u
 #define DMU_HCI_CLRERR      0xF8040014u
-#define DMU_CMD_BASE        0xF8080000u
+#define DMU_CSCI_STATUS     0xF8040084u
+#define DMU_CSCI_ERR        0xF8040090u
+#define DMU_CSCI_CLRERR     0xF8040094u
+#define DMU_CMD_BASE        0xF8080000u     /* host command interface */
+#define DMU_CSCI_CMD_BASE   0xF80C0000u     /* CSRM command interface */
 #define DMU_CMD_SIZE        0x10000u
 #define DMU_CMD_5554        0x5554u
 #define DMU_CMD_55F0        0x55F0u
@@ -344,6 +348,19 @@ typedef struct Tc4xSfrReadHook {
     void *opaque;
 } Tc4xSfrReadHook;
 
+/* A DMU command interface: the host's (HCI) or the CSRM's (CSCI) */
+typedef struct Tc4xDmuIf {
+    uint32_t status;    /* its STATUS and ERR registers */
+    uint32_t err;
+    bool csrm;
+    uint8_t page_buf[DMU_PAGE_BUF_SIZE];
+    unsigned page_len;
+    uint32_t cmd_addr;
+    uint32_t cmd_count;
+    bool cmd_armed;     /* AAA8 <- 0xA0 / 0x80 seen, waiting for the opcode */
+    uint32_t cmd_class;
+} Tc4xDmuIf;
+
 typedef struct Tc4xQspiSlave {
     const Tc4xQspiSlaveOps *ops;
     void *opaque;
@@ -465,12 +482,8 @@ struct Tc4xSoc {
     Tc4xAdc *adc;
     Tc4xI2c *i2c;
 
-    uint8_t page_buf[DMU_PAGE_BUF_SIZE];
-    unsigned page_len;
-    uint32_t cmd_addr;
-    uint32_t cmd_count;
-    bool cmd_armed;     /* AAA8 <- 0xA0 / 0x80 seen, waiting for the opcode */
-    uint32_t cmd_class;
+    Tc4xDmuIf dmu_if[2];        /* host, CSRM */
+    Tc4xDmuIf *dmu_cur;         /* the interface running a command */
 
     uint32_t boot_pc;
     uint32_t boot_pc_board;     /* this reset's start address from the board */
@@ -961,14 +974,14 @@ static bool asclin_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
     return true;
 }
 
-static void dmu_status(Tc4xSoc *s, uint32_t set, uint32_t clr)
+static void dmu_status(Tc4xSoc *s, Tc4xDmuIf *d, uint32_t set, uint32_t clr)
 {
-    reg_set(s, DMU_HCI_STATUS, (reg_get(s, DMU_HCI_STATUS) & ~clr) | set);
+    reg_set(s, d->status, (reg_get(s, d->status) & ~clr) | set);
 }
 
-static void dmu_error(Tc4xSoc *s, uint32_t err)
+static void dmu_error(Tc4xSoc *s, Tc4xDmuIf *d, uint32_t err)
 {
-    reg_set(s, DMU_HCI_ERR, reg_get(s, DMU_HCI_ERR) | err);
+    reg_set(s, d->err, reg_get(s, d->err) | err);
 }
 
 static AddressSpace *flash_as(Tc4xSoc *s, Tc4xFlash flash)
@@ -1041,11 +1054,12 @@ static uint32_t dmu_sector_size(uint32_t addr)
 }
 
 /* True when the board's hook executed or refused the command itself */
-static bool dmu_hooked(Tc4xSoc *s, Tc4xDmuOp op, uint32_t addr, uint32_t code,
-                       uint64_t len, const uint8_t *data)
+static bool dmu_hooked(Tc4xSoc *s, Tc4xDmuIf *d, Tc4xDmuOp op, uint32_t addr,
+                       uint32_t code, uint64_t len, const uint8_t *data)
 {
     Tc4xDmuCommand cmd = {
         .op = op, .addr = addr, .code = code, .len = len, .data = data,
+        .csrm = d->csrm,
     };
 
     if (!s->dmu_hook) {
@@ -1068,130 +1082,135 @@ static uint64_t dmu_verify_len(uint32_t addr, uint32_t opcode, uint32_t count)
            (uint64_t)count * dmu_sector_size(addr);
 }
 
-static void dmu_execute(Tc4xSoc *s, uint32_t class, uint32_t opcode)
+static void dmu_execute(Tc4xSoc *s, Tc4xDmuIf *d, uint32_t class,
+                        uint32_t opcode)
 {
-    uint32_t addr = s->cmd_addr;
+    uint32_t addr = d->cmd_addr;
     bool program = class == 0xA0 && (opcode == 0xAA || opcode == 0xA6);
     bool erase = class == 0x80 && opcode == 0x50;
     bool verify = class == 0x80 &&
                   (opcode == 0x56 || opcode == 0x58 || opcode == 0x5F);
 
-    if (program && dmu_hooked(s, TC4X_DMU_PROGRAM, addr, 0, s->page_len,
-                              s->page_buf)) {
-        s->page_len = 0;
-        dmu_status(s, DMU_STATUS_REQDONE,
+    if (program && dmu_hooked(s, d, TC4X_DMU_PROGRAM, addr, 0, d->page_len,
+                              d->page_buf)) {
+        d->page_len = 0;
+        dmu_status(s, d, DMU_STATUS_REQDONE,
                    DMU_STATUS_DFPAGE | DMU_STATUS_PFPAGE);
         return;
     }
-    if ((erase && dmu_hooked(s, TC4X_DMU_ERASE, addr, 0,
-                             (uint64_t)s->cmd_count * dmu_sector_size(addr),
+    if ((erase && dmu_hooked(s, d, TC4X_DMU_ERASE, addr, 0,
+                             (uint64_t)d->cmd_count * dmu_sector_size(addr),
                              NULL)) ||
-        (verify && dmu_hooked(s, TC4X_DMU_VERIFY, addr, 0,
-                              dmu_verify_len(addr, opcode, s->cmd_count),
+        (verify && dmu_hooked(s, d, TC4X_DMU_VERIFY, addr, 0,
+                              dmu_verify_len(addr, opcode, d->cmd_count),
                               NULL)) ||
         (!program && !erase && !verify &&
-         dmu_hooked(s, TC4X_DMU_OTHER, addr, class << 8 | opcode, 0, NULL))) {
-        dmu_status(s, DMU_STATUS_REQDONE, 0);
+         dmu_hooked(s, d, TC4X_DMU_OTHER, addr, class << 8 | opcode, 0,
+                    NULL))) {
+        dmu_status(s, d, DMU_STATUS_REQDONE, 0);
         return;
     }
 
     if (class == 0xA0 && (opcode == 0xAA || opcode == 0xA6)) {
         /* Write page / write burst: program the loaded page buffer */
         uint64_t off;
-        AddressSpace *as = dmu_locate(s, addr, s->page_len, &off);
+        AddressSpace *as = dmu_locate(s, addr, d->page_len, &off);
 
         if (!as) {
-            dmu_error(s, DMU_ERR_SQER);
+            dmu_error(s, d, DMU_ERR_SQER);
         } else {
-            if (!dmu_range_is(as, off, s->page_len, 0)) {
-                dmu_error(s, DMU_ERR_PVER);
+            if (!dmu_range_is(as, off, d->page_len, 0)) {
+                dmu_error(s, d, DMU_ERR_PVER);
             }
-            address_space_write(as, off, MEMTXATTRS_UNSPECIFIED, s->page_buf,
-                                s->page_len);
+            address_space_write(as, off, MEMTXATTRS_UNSPECIFIED, d->page_buf,
+                                d->page_len);
         }
-        s->page_len = 0;
-        dmu_status(s, DMU_STATUS_REQDONE,
+        d->page_len = 0;
+        dmu_status(s, d, DMU_STATUS_REQDONE,
                    DMU_STATUS_DFPAGE | DMU_STATUS_PFPAGE);
     } else if (class == 0x80 && opcode == 0x50) {
         /* Erase logical sector range: erased flash reads as zero */
-        uint64_t len = (uint64_t)s->cmd_count * dmu_sector_size(addr);
+        uint64_t len = (uint64_t)d->cmd_count * dmu_sector_size(addr);
         uint64_t off;
         AddressSpace *as = dmu_locate(s, addr, len, &off);
 
         if (as) {
             address_space_set(as, off, 0, len, MEMTXATTRS_UNSPECIFIED);
         } else {
-            dmu_error(s, DMU_ERR_SQER);
+            dmu_error(s, d, DMU_ERR_SQER);
         }
-        dmu_status(s, DMU_STATUS_REQDONE, 0);
+        dmu_status(s, d, DMU_STATUS_REQDONE, 0);
     } else if (class == 0x80 &&
                (opcode == 0x56 || opcode == 0x58 || opcode == 0x5F)) {
         /*
          * Verify erased page (0x56) / wordline (0x58) / logical sector
          * range (0x5F); the page form takes count 0
          */
-        uint64_t len = dmu_verify_len(addr, opcode, s->cmd_count);
+        uint64_t len = dmu_verify_len(addr, opcode, d->cmd_count);
         uint64_t off;
         AddressSpace *as = dmu_locate(s, addr, len, &off);
 
         if (!as) {
-            dmu_error(s, DMU_ERR_SQER);
+            dmu_error(s, d, DMU_ERR_SQER);
         } else if (!dmu_range_is(as, off, len, 0)) {
-            dmu_error(s, DMU_ERR_EVER);
+            dmu_error(s, d, DMU_ERR_EVER);
         }
-        dmu_status(s, DMU_STATUS_REQDONE, 0);
+        dmu_status(s, d, DMU_STATUS_REQDONE, 0);
     } else {
         qemu_log_mask(LOG_UNIMP, "tc4x-dmu: command 0x%02x/0x%02x at 0x%08x "
                       "completes without effect\n", class, opcode, addr);
-        dmu_status(s, DMU_STATUS_REQDONE, 0);
+        dmu_status(s, d, DMU_STATUS_REQDONE, 0);
     }
 }
 
-static void dmu_cmd_write(Tc4xSoc *s, uint32_t off, uint32_t val)
+static void dmu_cmd_write(Tc4xSoc *s, Tc4xDmuIf *d, uint32_t off,
+                          uint32_t val)
 {
     switch (off) {
     case DMU_CMD_5554:
-        if (dmu_hooked(s, val == 0xF0 ? TC4X_DMU_RESET_TO_READ : TC4X_DMU_OTHER,
+        if (dmu_hooked(s, d,
+                       val == 0xF0 ? TC4X_DMU_RESET_TO_READ : TC4X_DMU_OTHER,
                        0, val, 0, NULL)) {
             break;
         }
         if (val == 0xF0) {              /* reset to read */
-            s->page_len = 0;
-            s->cmd_armed = false;
-            dmu_status(s, 0, DMU_STATUS_DFPAGE | DMU_STATUS_PFPAGE);
+            d->page_len = 0;
+            d->cmd_armed = false;
+            dmu_status(s, d, 0, DMU_STATUS_DFPAGE | DMU_STATUS_PFPAGE);
         } else if (val == 0xFA) {       /* clear status (F5: resume protection) */
-            dmu_status(s, 0, DMU_STATUS_REQDONE);
-            reg_set(s, DMU_HCI_ERR, 0);
+            dmu_status(s, d, 0, DMU_STATUS_REQDONE);
+            reg_set(s, d->err, 0);
         } else if (val == 0x5D || val == 0x50) {  /* enter page mode */
-            s->page_len = 0;
-            dmu_status(s, val == 0x5D ? DMU_STATUS_DFPAGE : DMU_STATUS_PFPAGE,
+            d->page_len = 0;
+            dmu_status(s, d,
+                       val == 0x5D ? DMU_STATUS_DFPAGE : DMU_STATUS_PFPAGE,
                        DMU_STATUS_REQDONE);
         }
         break;
     case DMU_CMD_55F0:
     case DMU_CMD_55F4:                  /* load page, 64-bit as two words */
-        if (s->page_len + 4 <= DMU_PAGE_BUF_SIZE) {
-            stl_le_p(&s->page_buf[s->page_len], val);
-            s->page_len += 4;
+        if (d->page_len + 4 <= DMU_PAGE_BUF_SIZE) {
+            stl_le_p(&d->page_buf[d->page_len], val);
+            d->page_len += 4;
         } else {
-            dmu_error(s, DMU_ERR_SQER);
+            dmu_error(s, d, DMU_ERR_SQER);
         }
         break;
     case DMU_CMD_AA50:
-        s->cmd_addr = val;
-        s->cmd_armed = false;
+        d->cmd_addr = val;
+        d->cmd_armed = false;
         break;
     case DMU_CMD_AA58:
-        s->cmd_count = val;
+        d->cmd_count = val;
         break;
     case DMU_CMD_AAA8:
-        if (!s->cmd_armed) {
-            s->cmd_class = val;
-            s->cmd_armed = true;
+        if (!d->cmd_armed) {
+            d->cmd_class = val;
+            d->cmd_armed = true;
         } else {
-            s->cmd_armed = false;
-            dmu_status(s, 0, DMU_STATUS_REQDONE);
-            dmu_execute(s, s->cmd_class, val);
+            d->cmd_armed = false;
+            dmu_status(s, d, 0, DMU_STATUS_REQDONE);
+            dmu_execute(s, d, d->cmd_class, val);
         }
         break;
     default:
@@ -1965,11 +1984,21 @@ static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
         return;
     }
     if (addr >= DMU_CMD_BASE && addr < DMU_CMD_BASE + DMU_CMD_SIZE) {
-        dmu_cmd_write(s, addr - DMU_CMD_BASE, val);
+        s->dmu_cur = &s->dmu_if[0];
+        dmu_cmd_write(s, s->dmu_cur, addr - DMU_CMD_BASE, val);
+        s->dmu_cur = NULL;
         return;
     }
-    if (addr == DMU_HCI_CLRERR) {
-        reg_set(s, DMU_HCI_ERR, reg_get(s, DMU_HCI_ERR) & ~val);
+    if (addr >= DMU_CSCI_CMD_BASE && addr < DMU_CSCI_CMD_BASE + DMU_CMD_SIZE) {
+        s->dmu_cur = &s->dmu_if[1];
+        dmu_cmd_write(s, s->dmu_cur, addr - DMU_CSCI_CMD_BASE, val);
+        s->dmu_cur = NULL;
+        return;
+    }
+    if (addr == DMU_HCI_CLRERR || addr == DMU_CSCI_CLRERR) {
+        uint32_t err = addr == DMU_HCI_CLRERR ? DMU_HCI_ERR : DMU_CSCI_ERR;
+
+        reg_set(s, err, reg_get(s, err) & ~val);
         return;
     }
 
@@ -2935,7 +2964,7 @@ void tc4x_dmu_set_hook(Tc4xSoc *s, Tc4xDmuHookFn fn, void *opaque)
 
 void tc4x_dmu_error(Tc4xSoc *s, uint32_t err)
 {
-    dmu_error(s, err);
+    dmu_error(s, s->dmu_cur ? s->dmu_cur : &s->dmu_if[0], err);
 }
 
 void tc4x_pflash_set_maps(Tc4xSoc *s, const Tc4xPflashMap *maps, unsigned n)
@@ -3149,6 +3178,10 @@ static void tc4x_init(MachineState *ms)
     s->kresets = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->tom_cn0 = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                        NULL, g_free);
+    s->dmu_if[0] = (Tc4xDmuIf) { .status = DMU_HCI_STATUS, .err = DMU_HCI_ERR };
+    s->dmu_if[1] = (Tc4xDmuIf) {
+        .status = DMU_CSCI_STATUS, .err = DMU_CSCI_ERR, .csrm = true,
+    };
     s->write_hooks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                            NULL, g_free);
     s->read_hooks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
