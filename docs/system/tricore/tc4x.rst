@@ -3,7 +3,7 @@
 Infineon AURIX TC4Dx (``tc4x``)
 ===============================
 
-The ``tc4x`` machine models an Infineon AURIX TC4Dx: six TriCore 1.8
+The ``tc4x`` machine models an Infineon AURIX TC4Dx: seven TriCore 1.8
 cores (CPU type ``tc4x``) running in parallel under MTTCG, their local
 scratchpad RAMs, the LMU, program and data flash, and the on-chip
 peripherals listed below.  It loads TC4Dx images from Intel HEX or ELF
@@ -42,9 +42,10 @@ through the `Sim bridge`_, for example ``button press``.
 Supported devices
 -----------------
 
-* CPUs: boot of core 0 at the image entry point, the other cores released
-  through ``BOOTCON.BHALT`` / ``HRA_PC``; per-core STM with compares per
-  virtual machine
+* CPUs: boot of core 0 at the image entry point, cores 1-5 released
+  through ``BOOTCON.BHALT`` / ``HRA_PC``; CPUcs (core 6, its scratchpads in
+  segment 1) stays halted unless a board starts it; per-core STM with
+  compares per virtual machine
 * Interrupt router: SRC registers, per-core arbitration, interrupt delivery
   and acknowledge
 * DMA0 and DMA1: linked lists, software and QSPI hardware requests
@@ -261,7 +262,7 @@ Limitations
 
 * Peripherals not listed under `Supported devices`_ are plain registers:
   writes are stored, nothing happens.  CAN, the eGTM beyond TOM and the
-  TBU, the SMU, the MTU and the security core (CSRM) are not modelled.
+  TBU, the SMU, the MTU and the peripherals around CPUcs are not modelled.
 * Timing: instructions take no modelled cycles; guest time follows QEMU
   virtual time (see `Guest time`_).
 * Double-precision FPU corner cases differ from the TC1.8 architecture

@@ -33,6 +33,15 @@ typedef bool (*Tc4xSfrWriteFn)(void *opaque, uint32_t addr, uint32_t val);
 void tc4x_sfr_add_write_hook(Tc4xSoc *soc, uint32_t addr, Tc4xSfrWriteFn fn,
                              void *opaque);
 
+/*
+ * Guest reads of @addr call @fn under the BQL; when it returns true, *@val
+ * is the value read, else the read continues as if there were no hook.
+ * Hooks are added during machine init only.
+ */
+typedef bool (*Tc4xSfrReadFn)(void *opaque, uint32_t addr, uint32_t *val);
+void tc4x_sfr_add_read_hook(Tc4xSoc *soc, uint32_t addr, Tc4xSfrReadFn fn,
+                            void *opaque);
+
 /* Hardware-set SRR of the service request node at @src (any thread) */
 void tc4x_irq_raise(Tc4xSoc *soc, uint32_t src);
 
@@ -197,6 +206,15 @@ void tc4x_dmu_error(Tc4xSoc *soc, uint32_t err);
  */
 void tc4x_set_boot_pc(Tc4xSoc *soc, uint32_t pc);
 void tc4x_hold_boot(Tc4xSoc *soc);
+
+/*
+ * Start @core, still halted since the reset, at @pc: CPUcs (core 6), or
+ * core 0 held by tc4x_hold_boot
+ */
+void tc4x_start_core(Tc4xSoc *soc, int core, uint32_t pc);
+
+/* Start core 0, held by tc4x_hold_boot, at this reset's start address */
+void tc4x_release_boot(Tc4xSoc *soc);
 
 /* Guest time: what the STM and the eGTM count, in ns (any thread) */
 int64_t tc4x_guest_ns(Tc4xSoc *soc);

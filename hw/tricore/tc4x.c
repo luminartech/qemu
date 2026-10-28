@@ -46,7 +46,7 @@
 #include "hw/tricore/tc4x_pacer.h"
 #include "tc4x_soc.h"
 
-#define TC4X_NUM_CORES      6
+#define TC4X_NUM_CORES      7           /* CPU0..5 and CPUcs (core 6) */
 #define TC4X_CORE_RAM_SIZE  (2 * MiB)       /* DSPR + PSPR (at +1 MiB) */
 #define TC4X_PSPR_OFFSET    (1 * MiB)
 #define TC4X_LOCAL_DSPR     0xD0000000u
@@ -72,6 +72,14 @@
 #define CPU_HRHV_CORE_ID    0x3FE1Cu
 
 #define SRC_BASE            0xF4432000u
+/* General purpose service requests: INT_GPSRGx_SWCy, SRC_GPSRx_SRy */
+#define INT_GPSRG_SWC0      0xF4430720u
+#define INT_GPSRG_STRIDE    0x40u
+#define INT_GPSRG_GROUPS    8
+#define INT_GPSRG_SWC_COUNT 8
+#define INT_GPSRG_SWC_SETR  BIT(29)
+#define SRC_GPSR0_SR0       0xF4433460u
+#define SRC_GPSR_STRIDE     0x20u
 #define SRC_SIZE            0x2000u
 #define SRC_STMCPU_BASE     (SRC_BASE + 0x20u)
 #define SRC_STMCPU_STRIDE   0x40u
@@ -321,6 +329,8 @@ typedef struct Tc4xSfrPage {
     uint32_t plain_persist[SFR_PAGE_WORDS]; /* bits such a write changes */
     /* accesses take the BQL path */
     unsigned long bql_only[BITS_TO_LONGS(SFR_PAGE_WORDS)];
+    /* reads call a board hook, under the BQL */
+    unsigned long read_hooked[BITS_TO_LONGS(SFR_PAGE_WORDS)];
     Tc4xSfrForces *forces;
 } Tc4xSfrPage;
 
@@ -328,6 +338,11 @@ typedef struct Tc4xSfrWriteHook {
     Tc4xSfrWriteFn fn;
     void *opaque;
 } Tc4xSfrWriteHook;
+
+typedef struct Tc4xSfrReadHook {
+    Tc4xSfrReadFn fn;
+    void *opaque;
+} Tc4xSfrReadHook;
 
 typedef struct Tc4xQspiSlave {
     const Tc4xQspiSlaveOps *ops;
@@ -369,7 +384,6 @@ struct Tc4xSoc {
     MemoryRegion cpu_local_dspr[TC4X_NUM_CORES];
     MemoryRegion cpu_local_pspr[TC4X_NUM_CORES];
     MemoryRegion core_ram[TC4X_NUM_CORES];
-    MemoryRegion seg1_ram;
     MemoryRegion pflash, dflash;
     AddressSpace pflash_as, dflash_as;
     MemoryRegion pflash_win[2], pflash_linear[2], dflash_win;
@@ -389,6 +403,7 @@ struct Tc4xSoc {
     GHashTable *watches;
     DeviceState *geth;
     GHashTable *write_hooks;    /* addr -> Tc4xSfrWriteHook */
+    GHashTable *read_hooks;     /* addr -> Tc4xSfrReadHook */
     /*
      * Interrupt router.  Cores acknowledge interrupts without the BQL, so
      * pending, cpu_prio and the SRC registers' SRR bits are under ir_lock;
@@ -1746,9 +1761,13 @@ static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr)
     uint32_t off;
     int core;
 
-    if (tc4x_gpio_read(s->gpio, addr, &v) || tc4x_i2c_read(s->i2c, addr, &v) ||
+    Tc4xSfrReadHook *h = g_hash_table_lookup(s->read_hooks,
+                                             GUINT_TO_POINTER(addr));
+
+    if ((h && h->fn(h->opaque, addr, &v)) ||
+        tc4x_gpio_read(s->gpio, addr, &v) || tc4x_i2c_read(s->i2c, addr, &v) ||
         tc4x_adc_read(s->adc, addr, &v)) {
-        /* served by a pin or bus model */
+        /* served by a board hook, a pin or bus model */
     } else if (addr == EGTM_TBU_CH0) {
         v = stm_now(s) & EGTM_TBU_MASK;
     } else if (sfr_is_cpu(addr, &core, &off)) {
@@ -1916,6 +1935,17 @@ static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
         src_write(s, addr, val);
         return;
     }
+    if (addr >= INT_GPSRG_SWC0 &&
+        addr < INT_GPSRG_SWC0 + INT_GPSRG_GROUPS * INT_GPSRG_STRIDE &&
+        (addr - INT_GPSRG_SWC0) % INT_GPSRG_STRIDE <
+        INT_GPSRG_SWC_COUNT * 4 && (val & INT_GPSRG_SWC_SETR)) {
+        /* SETR: software trigger of SRC_GPSRx_SRy */
+        uint32_t x = (addr - INT_GPSRG_SWC0) / INT_GPSRG_STRIDE;
+        uint32_t y = (addr - INT_GPSRG_SWC0) % INT_GPSRG_STRIDE / 4;
+
+        src_set_srr(s, SRC_GPSR0_SR0 + x * SRC_GPSR_STRIDE + 4 * y, true);
+        val &= ~INT_GPSRG_SWC_SETR;
+    }
     if (asclin_write(s, addr, val)) {
         return;
     }
@@ -2004,6 +2034,7 @@ static bool sfr_read_lockless(Tc4xSoc *s, uint32_t addr, uint32_t *val)
     int core;
 
     if (sfr_is_cpu(addr, &core, &off) || tom_is_cn0(addr) ||
+        (pg && test_bit(w, pg->read_hooked)) ||
         (addr >= ASCLIN_BASE && addr < ASCLIN_END) ||
         (addr >= TMADC_BASE && addr < TMADC_BASE + TMADC_COUNT * TMADC_STRIDE &&
          (addr - TMADC_BASE) % TMADC_STRIDE == TMADC_MODSTAT)) {
@@ -2141,6 +2172,19 @@ void tc4x_sfr_add_write_hook(Tc4xSoc *s, uint32_t addr, Tc4xSfrWriteFn fn,
     h->opaque = opaque;
     g_hash_table_insert(s->write_hooks, GUINT_TO_POINTER(addr), h);
     sfr_set_bql_only(s, addr);
+}
+
+void tc4x_sfr_add_read_hook(Tc4xSoc *s, uint32_t addr, Tc4xSfrReadFn fn,
+                            void *opaque)
+{
+    Tc4xSfrReadHook *h = g_new(Tc4xSfrReadHook, 1);
+
+    /* vCPU threads look hooks up without a lock */
+    assert(!phase_check(PHASE_MACHINE_READY));
+    h->fn = fn;
+    h->opaque = opaque;
+    g_hash_table_insert(s->read_hooks, GUINT_TO_POINTER(addr), h);
+    set_bit_atomic(sfr_word(addr), sfr_page(s, addr, true)->read_hooked);
 }
 
 /*
@@ -2873,6 +2917,16 @@ void tc4x_hold_boot(Tc4xSoc *s)
     s->boot_hold = true;
 }
 
+void tc4x_start_core(Tc4xSoc *s, int core, uint32_t pc)
+{
+    tricore_cpu_release_boot_halt(s->cpu[core], pc);
+}
+
+void tc4x_release_boot(Tc4xSoc *s)
+{
+    tricore_cpu_release_boot_halt(s->cpu[0], s->cpu[0]->env.PC);
+}
+
 void tc4x_dmu_set_hook(Tc4xSoc *s, Tc4xDmuHookFn fn, void *opaque)
 {
     s->dmu_hook = fn;
@@ -3097,6 +3151,8 @@ static void tc4x_init(MachineState *ms)
                                        NULL, g_free);
     s->write_hooks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                            NULL, g_free);
+    s->read_hooks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                          NULL, g_free);
     s->pending = g_hash_table_new(g_direct_hash, g_direct_equal);
     qemu_rec_mutex_init(&s->ir_lock);
     qemu_rec_mutex_init(&s->qspi_lock);
@@ -3126,11 +3182,11 @@ static void tc4x_init(MachineState *ms)
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         g_autofree char *name = g_strdup_printf("core%d.spr", c);
+        /* CPUcs, core 6, lands in segment 1 */
         hwaddr base = 0x70000000u - c * 0x10000000u;
 
         add_ram(s, &s->core_ram[c], name, base, TC4X_CORE_RAM_SIZE);
     }
-    add_ram(s, &s->seg1_ram, "seg1", 0x10000000u, 16 * MiB);
     add_flashes(s);
     add_ram(s, &s->lmu, "lmu", 0x90000000u, 64 * MiB);
     add_alias(&s->lmu_alias, "lmu.nc", &s->lmu, 0xB0000000u);
