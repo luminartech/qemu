@@ -55,7 +55,11 @@ Supported devices
 * GETH0 (``hw/net/tc4x_geth.c``), based on the Synopsys DWC Ethernet QoS
   core, with its two MAC ports.  No PHY is attached by default, so MDIO
   reads return all ones; board code attaches PHYs through
-  ``tc4x_geth_attach_phy()``.
+  ``tc4x_geth_attach_phy()``.  The bridge forwards frames from a receive
+  queue of one port to a transmit queue of the other when the TxQ/RxC
+  mapping makes that queue a forwarding path (``BRIDGE_TXQ_MAP_PORT_n``,
+  ``BRIDGE_PORT_n_CONTROL``); its packet length limit, queue flushes and
+  same-port loopback are not modelled.
 * ASCLIN0..27: transmit at once and raise their service requests.  One
   instance is the console on the first serial port: ASCLIN0 unless the
   board names another.

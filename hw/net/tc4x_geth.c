@@ -6,6 +6,15 @@
  * ones; board code attaches PHYs with tc4x_geth_attach_phy().
  * The PTP system time stamps frames in TX status and RX context descriptors.
  * The on-chip HSPHY reports its calibration and DLL-lock status as done.
+ * The bridge forwards between the ports: in two-port mode with TxQ/RxC
+ * mapping (FORWARD_CONTROL.Q_CH_MAPPING_EN), a frame that lands in RxC q of
+ * one port (its receive queue: untagged queue, VLAN priority queues, or
+ * the multicast/broadcast queue of MAC_RXQ_CTRL1) is sent by the other port
+ * instead of the host's DMA when one of that port's TxQs is enabled
+ * (TXQ_EN), a forwarding path (FWD_EN) and mapped to RxC q (TXQ_MAP_PORT_n),
+ * as IfxGeth_Bridge_setPortMode(), _enablePortTxQueuesAndRxChannels() and
+ * _mapTxQueue() program it.  The forwarding packet length limit, queue
+ * flushes and same-port loopback are not modelled.
  *
  * Sources, all public: the GETH and HSPHY registers of the iLLD SFR headers
  * and the iLLD Ethernet driver (IfxGeth) bundled with the TC4D7 projects of
@@ -100,6 +109,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Tc4xGethState, TC4X_GETH)
 
 #define MAC_TE                BIT(0)
 #define MAC_RE                BIT(0)
+#define RXQ_MCBCQEN           BIT(15)
+#define RXQ_OMCBCQ            BIT(20)
 #define PF_PR                 BIT(0)
 #define PF_PM                 BIT(4)
 #define PF_DBF                BIT(5)
@@ -120,9 +131,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(Tc4xGethState, TC4X_GETH)
 #define MAC_INT_TSIS          BIT(12)
 #define NSEC_UPD_ADDSUB       BIT(31)
 
+#define BRIDGE_FORWARD_CONTROL 0x1E000u
 #define BRIDGE_PORT_CONTROL(p) (0x1E00Cu + (p) * 0xCu)
 #define BRIDGE_TXQ_MAP(p)      (0x1E010u + (p) * 0xCu)
+#define BRIDGE_FWD_EN_SHIFT    0
 #define BRIDGE_TXQ_EN_SHIFT    24
+#define FWD_Q_CH_MAPPING_EN    BIT(31)
 
 #define DMA_MODE              0x1F000u
 #define DMA_INTERRUPT_STATUS  0x1F008u
@@ -473,11 +487,19 @@ static uint32_t desc_next(Tc4xGethState *s, int ch, uint32_t cur, bool tx)
     return idx >= len ? base : base + idx * stride;
 }
 
+/* TxQs of port @p that are enabled and fed by its Tx DMA channels */
+static uint32_t txq_dma_mask(Tc4xGethState *s, int p)
+{
+    uint32_t ctrl = greg(s, BRIDGE_PORT_CONTROL(p));
+
+    return extract32(ctrl, BRIDGE_TXQ_EN_SHIFT, 8) &
+           ~extract32(ctrl, BRIDGE_FWD_EN_SHIFT, 8);
+}
+
 static int tx_port_of_channel(Tc4xGethState *s, int ch)
 {
     for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
-        uint32_t en = extract32(greg(s, BRIDGE_PORT_CONTROL(p)),
-                                BRIDGE_TXQ_EN_SHIFT, 8);
+        uint32_t en = txq_dma_mask(s, p);
         uint32_t map = greg(s, BRIDGE_TXQ_MAP(p));
 
         for (int q = 0; q < 8; q++) {
@@ -632,12 +654,18 @@ static bool rx_mac_accept(Tc4xGethState *s, int p, const uint8_t *buf)
     return false;
 }
 
-static int rx_channel(Tc4xGethState *s, int p, const uint8_t *buf,
-                      unsigned len)
+/* Receive queue (RxC) of a frame on port @p */
+static int rx_queue(Tc4xGethState *s, int p, const uint8_t *buf,
+                    unsigned len)
 {
     uint32_t en = preg(s, p, MAC_RXQ_CTRL0);
-    int q = extract32(preg(s, p, MAC_RXQ_CTRL1), 0, 4);   /* UPQ */
+    uint32_t ctrl1 = preg(s, p, MAC_RXQ_CTRL1);
+    int q = extract32(ctrl1, 0, 4);                       /* UPQ */
+    bool mcbc = (ctrl1 & RXQ_MCBCQEN) && is_multicast_ether_addr(buf);
 
+    if (mcbc && (ctrl1 & RXQ_OMCBCQ)) {
+        return extract32(ctrl1, 8, 4);                    /* MCBCQ */
+    }
     if (len >= ETH_HLEN + VLAN_HLEN && lduw_be_p(buf + 12) == ETH_P_VLAN) {
         uint32_t pcp = buf[14] >> 5;
 
@@ -647,13 +675,41 @@ static int rx_channel(Tc4xGethState *s, int p, const uint8_t *buf,
                                       (i % 4) * 8, 8);
 
             if (extract32(en, i * 2, 2) && (psrq & BIT(pcp))) {
-                q = i;
-                break;
+                return i;
             }
         }
     }
+    return mcbc ? extract32(ctrl1, 8, 4) : q;
+}
+
+static int rx_channel(Tc4xGethState *s, int p, int q)
+{
     return extract32(preg(s, p, q < 4 ? MTL_RXQ_DMA_MAP0 : MTL_RXQ_DMA_MAP1),
                      (q % 4) * 8, 3);
+}
+
+/*
+ * Port the bridge forwards RxC @q of port @p to: a TxQ of the other port
+ * that is enabled, marked a forwarding path and mapped to that RxC, in
+ * two-port mode with TxQ/RxC mapping; -1 for the host's DMA
+ */
+static int rx_forward_port(Tc4xGethState *s, int p, int q)
+{
+    int e = !p;
+    uint32_t ctrl = greg(s, BRIDGE_PORT_CONTROL(e));
+    uint32_t fwd = extract32(ctrl, BRIDGE_TXQ_EN_SHIFT, 8) &
+                   extract32(ctrl, BRIDGE_FWD_EN_SHIFT, 8);
+    uint32_t map = greg(s, BRIDGE_TXQ_MAP(e));
+
+    if (!(greg(s, BRIDGE_FORWARD_CONTROL) & FWD_Q_CH_MAPPING_EN)) {
+        return -1;
+    }
+    for (int t = 0; t < 8; t++) {
+        if ((fwd & BIT(t)) && extract32(map, t * 4, 4) == q) {
+            return e;
+        }
+    }
+    return -1;
 }
 
 /* Returns false when the frame must wait for descriptors */
@@ -741,7 +797,7 @@ static ssize_t geth_receive(NetClientState *nc, const uint8_t *data,
     int p = port->index;
     uint8_t buf[MAX_FRAME];
     unsigned len = size;
-    int ch;
+    int q, fwd;
 
     if ((greg(s, R_CLC) & CLC_DISR) ||
         !(preg(s, p, MAC_RX_CONFIGURATION) & MAC_RE) ||
@@ -756,8 +812,11 @@ static ssize_t geth_receive(NetClientState *nc, const uint8_t *data,
     if (!rx_mac_accept(s, p, buf)) {
         return size;
     }
-    ch = rx_channel(s, p, buf, len);
-    if (!rx_deliver(s, p, ch, buf, len)) {
+    q = rx_queue(s, p, buf, len);
+    fwd = rx_forward_port(s, p, q);
+    if (fwd >= 0) {
+        port_send(s, fwd, buf, len);
+    } else if (!rx_deliver(s, p, rx_channel(s, p, q), buf, len)) {
         return 0;                       /* queued; flushed on tail write */
     }
     mmc_inc(s, p, MMC_RX_PACKETS_GB, 1);
