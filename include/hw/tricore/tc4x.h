@@ -225,6 +225,9 @@ void tc4x_start_core(Tc4xSoc *soc, int core, uint32_t pc);
 /* Start core 0, held by tc4x_hold_boot, at this reset's start address */
 void tc4x_release_boot(Tc4xSoc *soc);
 
+/* Raise the non-maskable interrupt (trap class 7, TIN 0) on @core */
+void tc4x_nmi(Tc4xSoc *soc, int core);
+
 /* Guest time: what the STM and the eGTM count, in ns (any thread) */
 int64_t tc4x_guest_ns(Tc4xSoc *soc);
 

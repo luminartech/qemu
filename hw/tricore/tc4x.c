@@ -2956,6 +2956,11 @@ void tc4x_release_boot(Tc4xSoc *s)
     tricore_cpu_release_boot_halt(s->cpu[0], s->cpu[0]->env.PC);
 }
 
+void tc4x_nmi(Tc4xSoc *s, int core)
+{
+    tricore_cpu_raise_nmi(s->cpu[core]);
+}
+
 int tc4x_access_core(Tc4xSoc *s)
 {
     for (int c = 0; current_cpu && c < TC4X_NUM_CORES; c++) {

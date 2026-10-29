@@ -25,6 +25,7 @@
 #include "cpu.h"
 #include "exec/translation-block.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/aio.h"
 #include "tcg/debug-assert.h"
@@ -105,7 +106,8 @@ static bool tricore_cpu_has_work(CPUState *cs)
         return false;
     }
     /* WAIT ends on any pending request, even one that cannot be taken yet */
-    return qatomic_read(&env->pending_irq_prio) != 0;
+    return qatomic_read(&env->pending_irq_prio) != 0 ||
+           cpu_test_interrupt(cs, CPU_INTERRUPT_NMI);
 }
 
 static void tricore_cpu_kick_bh(void *opaque)
@@ -139,6 +141,11 @@ void tricore_cpu_set_pending_irq(TriCoreCPU *cpu, uint32_t prio)
                                     tricore_cpu_kick_bh, cs);
         }
     }
+}
+
+void tricore_cpu_raise_nmi(TriCoreCPU *cpu)
+{
+    cpu_interrupt(CPU(cpu), CPU_INTERRUPT_NMI);
 }
 
 void tricore_cpu_release_boot_halt(TriCoreCPU *cpu, uint32_t pc)
@@ -267,6 +274,13 @@ static bool tricore_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     uint32_t prio = qatomic_read(&env->pending_irq_prio);
 
     env->ICR = deposit32(env->ICR, R_ICR_PIPN_SHIFT, R_ICR_PIPN_LENGTH, prio);
+    if ((interrupt_request & CPU_INTERRUPT_NMI) && !env->boot_halted) {
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_NMI);
+        qemu_log_mask(CPU_LOG_INT, "core%u: NMI at pc 0x%08x\n", env->CORE_ID,
+                      env->PC);
+        tricore_cpu_enter_trap(env, TRAPC_NMI, TIN7_NMI, env->PC);
+        return true;
+    }
     if ((interrupt_request & CPU_INTERRUPT_HARD) &&
         !env->boot_halted && tricore_cpu_irq_deliverable(env, prio)) {
         tricore_cpu_do_interrupt(env, prio);

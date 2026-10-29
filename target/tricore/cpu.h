@@ -99,9 +99,15 @@ struct ArchCPU {
     void *irq_ack_opaque;
 };
 
+#define CPU_INTERRUPT_NMI   CPU_INTERRUPT_TGT_EXT_3
+
 void tricore_cpu_set_pending_irq(TriCoreCPU *cpu, uint32_t prio);
 void tricore_cpu_release_boot_halt(TriCoreCPU *cpu, uint32_t pc);
 void tricore_cpu_do_interrupt(CPUTriCoreState *env, uint32_t pipn);
+void tricore_cpu_enter_trap(CPUTriCoreState *env, uint32_t class, int tin,
+                            uint32_t ret);
+/* Raise the non-maskable interrupt: trap class 7, TIN 0 (with the BQL) */
+void tricore_cpu_raise_nmi(TriCoreCPU *cpu);
 
 struct TriCoreCPUClass {
     CPUClass parent_class;

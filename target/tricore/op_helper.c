@@ -29,21 +29,13 @@
 
 /* Exception helpers */
 
-static G_NORETURN
-void raise_exception_sync_internal(CPUTriCoreState *env, uint32_t class, int tin,
-                                   uintptr_t pc, uint32_t fcd_pc)
+/*
+ * Trap entry (TC1.8 architecture manual volume 1, traps): save the upper
+ * context, return to @ret, vector to class @class of the trap table
+ */
+void tricore_cpu_enter_trap(CPUTriCoreState *env, uint32_t class, int tin,
+                            uint32_t ret)
 {
-    CPUState *cs = env_cpu(env);
-    uint64_t last_pc;
-
-    /* in case we come from a helper-call we need to restore the PC */
-    cpu_restore_state(cs, pc);
-    last_pc = env->PC;
-
-    qemu_log_mask(CPU_LOG_INT, "core%u: trap class %u tin %d at pc 0x%08x"
-                  " fcx 0x%08x lcx 0x%08x\n", env->CORE_ID, class, tin,
-                  env->PC, env->FCX, env->LCX);
-
     /* Tin is loaded into d[15] */
     env->gpr_d[15] = tin;
 
@@ -54,17 +46,7 @@ void raise_exception_sync_internal(CPUTriCoreState *env, uint32_t class, int tin
     }
 
     /* The return address in a[11] is updated */
-    if (class == TRAPC_CTX_MNG && tin == TIN3_FCD) {
-        env->SYSCON |= MASK_SYSCON_FCD_SF;
-        /* when we run out of CSAs after saving a context a FCD trap is taken
-           and the return address is the start of the trap handler which used
-           the last CSA */
-        env->gpr_a[11] = fcd_pc;
-    } else if (class == TRAPC_SYSCALL) {
-        env->gpr_a[11] = env->PC + 4;
-    } else {
-        env->gpr_a[11] = env->PC;
-    }
+    env->gpr_a[11] = ret;
     /* The stack pointer in A[10] is set to the Interrupt Stack Pointer (ISP)
        when the processor was not previously using the interrupt stack
        (in case of PSW.IS = 0). The stack pointer bit is set for using the
@@ -101,6 +83,38 @@ void raise_exception_sync_internal(CPUTriCoreState *env, uint32_t class, int tin
     pcxi_set_pcpn(env, icr_get_ccpn(env));
     /* Update PC using the trap vector table */
     env->PC = env->BTV | (class << 5);
+}
+
+static G_NORETURN
+void raise_exception_sync_internal(CPUTriCoreState *env, uint32_t class,
+                                   int tin, uintptr_t pc, uint32_t fcd_pc)
+{
+    CPUState *cs = env_cpu(env);
+    uint64_t last_pc;
+    uint32_t ret;
+
+    /* in case we come from a helper-call we need to restore the PC */
+    cpu_restore_state(cs, pc);
+    last_pc = env->PC;
+
+    qemu_log_mask(CPU_LOG_INT, "core%u: trap class %u tin %d at pc 0x%08x"
+                  " fcx 0x%08x lcx 0x%08x\n", env->CORE_ID, class, tin,
+                  env->PC, env->FCX, env->LCX);
+
+    if (class == TRAPC_CTX_MNG && tin == TIN3_FCD) {
+        env->SYSCON |= MASK_SYSCON_FCD_SF;
+        /*
+         * when we run out of CSAs after saving a context a FCD trap is taken
+         * and the return address is the start of the trap handler which used
+         * the last CSA
+         */
+        ret = fcd_pc;
+    } else if (class == TRAPC_SYSCALL) {
+        ret = env->PC + 4;
+    } else {
+        ret = env->PC;
+    }
+    tricore_cpu_enter_trap(env, class, tin, ret);
 
     qemu_plugin_vcpu_exception_cb(cs, last_pc);
     cpu_loop_exit(cs);

@@ -45,7 +45,8 @@ Supported devices
 * CPUs: boot of core 0 at the image entry point, cores 1-5 released
   through ``BOOTCON.BHALT`` / ``HRA_PC``; CPUcs (core 6, its scratchpads in
   segment 1) stays halted unless a board starts it; per-core STM with
-  compares per virtual machine
+  compares per virtual machine; the non-maskable interrupt (trap class 7)
+  when board code raises it
 * Interrupt router: SRC registers, per-core arbitration, interrupt delivery
   and acknowledge
 * DMA0 and DMA1: linked lists, software and QSPI hardware requests
@@ -179,8 +180,8 @@ hook adds the board code through the services of
 ``include/hw/tricore/tc4x.h``: QSPI slaves, Ethernet PHYs, GPIO listeners,
 SFR read and write hooks, which can tell the core making the access and
 see writes before the SoC acts on them (a software trigger of a general
-purpose service request included), analog inputs, interrupt pacers,
-sim-bridge commands, and
+purpose service request included), non-maskable interrupts, analog inputs,
+interrupt pacers, sim-bridge commands, and
 the flashes: their storage, where DMU commands find an address, how
 the PFLASH read windows map the storage, and a hook that sees every DMU
 command before it runs.  A ``reset`` hook runs at every machine reset
