@@ -84,6 +84,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(Tc4xGethState, TC4X_GETH)
 #define MMC_TX_OCTETS_GB      0x814u
 #define MMC_TX_PACKETS_GB     0x81Cu
 #define MMC_TX_PACKETS_G      0x88Cu
+#define MMC_TX_BROADCAST_G    0x824u
+#define MMC_TX_MULTICAST_G    0x82Cu
+#define MMC_TX_UNICAST_GB     0x864u
+#define MMC_TX_MULTICAST_GB   0x86Cu
+#define MMC_TX_BROADCAST_GB   0x874u
 #define MMC_TX_OCTETS_G       0x884u
 #define MMC_RX_PACKETS_GB     0x900u
 #define MMC_RX_OCTETS_GB      0x908u
@@ -523,6 +528,15 @@ static void port_send(Tc4xGethState *s, int p, const uint8_t *buf,
     mmc_inc(s, p, MMC_TX_PACKETS_G, 1);
     mmc_inc(s, p, MMC_TX_OCTETS_GB, len);
     mmc_inc(s, p, MMC_TX_OCTETS_G, len);
+    if (is_broadcast_ether_addr(buf)) {
+        mmc_inc(s, p, MMC_TX_BROADCAST_GB, 1);
+        mmc_inc(s, p, MMC_TX_BROADCAST_G, 1);
+    } else if (is_multicast_ether_addr(buf)) {
+        mmc_inc(s, p, MMC_TX_MULTICAST_GB, 1);
+        mmc_inc(s, p, MMC_TX_MULTICAST_G, 1);
+    } else {
+        mmc_inc(s, p, MMC_TX_UNICAST_GB, 1);
+    }
     qemu_send_packet(qemu_get_queue(port->nic), buf, len);
 }
 
