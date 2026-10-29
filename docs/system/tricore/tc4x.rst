@@ -177,7 +177,10 @@ pull-ups, and register write semantics or kernel reset registers to add to
 the SoC's own.  An ``init``
 hook adds the board code through the services of
 ``include/hw/tricore/tc4x.h``: QSPI slaves, Ethernet PHYs, GPIO listeners,
-SFR write hooks, analog inputs, interrupt pacers, sim-bridge commands, and
+SFR read and write hooks, which can tell the core making the access and
+see writes before the SoC acts on them (a software trigger of a general
+purpose service request included), analog inputs, interrupt pacers,
+sim-bridge commands, and
 the flashes: their storage, where DMU commands find an address, how
 the PFLASH read windows map the storage, and a hook that sees every DMU
 command before it runs.  A ``reset`` hook runs at every machine reset

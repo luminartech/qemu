@@ -1954,6 +1954,14 @@ static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
         src_write(s, addr, val);
         return;
     }
+    if (asclin_write(s, addr, val)) {
+        return;
+    }
+    if (dma_write(s, addr, val) || tc4x_gpio_write(s->gpio, addr, val) ||
+        tc4x_i2c_write(s->i2c, addr, val) ||
+        tc4x_adc_write(s->adc, addr, val) || sfr_write_hook(s, addr, val)) {
+        return;
+    }
     if (addr >= INT_GPSRG_SWC0 &&
         addr < INT_GPSRG_SWC0 + INT_GPSRG_GROUPS * INT_GPSRG_STRIDE &&
         (addr - INT_GPSRG_SWC0) % INT_GPSRG_STRIDE <
@@ -1964,14 +1972,6 @@ static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
 
         src_set_srr(s, SRC_GPSR0_SR0 + x * SRC_GPSR_STRIDE + 4 * y, true);
         val &= ~INT_GPSRG_SWC_SETR;
-    }
-    if (asclin_write(s, addr, val)) {
-        return;
-    }
-    if (dma_write(s, addr, val) || tc4x_gpio_write(s->gpio, addr, val) ||
-        tc4x_i2c_write(s->i2c, addr, val) ||
-        tc4x_adc_write(s->adc, addr, val) || sfr_write_hook(s, addr, val)) {
-        return;
     }
     if (tom_is_cn0(addr)) {
         tom_cn0_write(s, addr, val);
@@ -2954,6 +2954,16 @@ void tc4x_start_core(Tc4xSoc *s, int core, uint32_t pc)
 void tc4x_release_boot(Tc4xSoc *s)
 {
     tricore_cpu_release_boot_halt(s->cpu[0], s->cpu[0]->env.PC);
+}
+
+int tc4x_access_core(Tc4xSoc *s)
+{
+    for (int c = 0; current_cpu && c < TC4X_NUM_CORES; c++) {
+        if (current_cpu == CPU(s->cpu[c])) {
+            return c;
+        }
+    }
+    return -1;
 }
 
 void tc4x_dmu_set_hook(Tc4xSoc *s, Tc4xDmuHookFn fn, void *opaque)

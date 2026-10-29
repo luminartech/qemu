@@ -42,6 +42,14 @@ typedef bool (*Tc4xSfrReadFn)(void *opaque, uint32_t addr, uint32_t *val);
 void tc4x_sfr_add_read_hook(Tc4xSoc *soc, uint32_t addr, Tc4xSfrReadFn fn,
                             void *opaque);
 
+/*
+ * From a read or write hook: the core whose load or store is being
+ * served, or -1 when no core makes the access (the sim bridge, a timer).
+ * An access a core's store starts on its way, such as a DMA transfer it
+ * triggers, counts as that core's.
+ */
+int tc4x_access_core(Tc4xSoc *soc);
+
 /* Hardware-set SRR of the service request node at @src (any thread) */
 void tc4x_irq_raise(Tc4xSoc *soc, uint32_t src);
 
