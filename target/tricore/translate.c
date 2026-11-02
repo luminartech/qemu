@@ -358,6 +358,11 @@ static void gen_mfcr(DisasContext *ctx, TCGv_i32 ret, int32_t offset)
     /* since we're caching PSW make this a special case */
     if (offset == 0xfe04) {
         gen_helper_psw_read(ret, tcg_env);
+    } else if (has_feature(ctx, TRICORE_FEATURE_18) &&
+               offset >= CSFR_MPU_FIRST && offset < CSFR_MPU_END) {
+        tcg_gen_ld_tl(ret, tcg_env,
+                      offsetof(CPUTriCoreState, csfr_generic) +
+                      (offset & 0xfffc));
     } else {
         switch (offset) {
 #include "csfr.h.inc"
@@ -395,6 +400,17 @@ static void gen_mtcr(DisasContext *ctx, TCGv_i32 r1, int32_t offset)
         if (offset == 0xfe04) {
             gen_helper_psw_write(tcg_env, r1);
             ctx->base.is_jmp = DISAS_EXIT_UPDATE;
+        } else if (has_feature(ctx, TRICORE_FEATURE_18) &&
+                   offset >= CSFR_MPU_FIRST && offset < CSFR_MPU_END) {
+            TCGv_i32 v = tcg_temp_new_i32();
+
+            /* range bounds: 8-byte (data) and 32-byte (code) granules */
+            tcg_gen_andi_i32(v, r1, offset < CSFR_CPR_L(0) ? ~7u :
+                             offset < CSFR_CPXE(0) ? ~31u : ~0u);
+            tcg_gen_st_tl(v, tcg_env, offsetof(CPUTriCoreState, csfr_generic) +
+                          (offset & 0xfffc));
+            gen_helper_mpu_changed(tcg_env);
+            ctx->base.is_jmp = DISAS_EXIT_UPDATE;
         } else {
             switch (offset) {
 #include "csfr.h.inc"
@@ -408,6 +424,11 @@ static void gen_mtcr(DisasContext *ctx, TCGv_i32 r1, int32_t offset)
             }
             /* ICR/BIV changes may make a pending interrupt deliverable */
             if (offset == 0xfe2c || offset == 0xfe20) {
+                ctx->base.is_jmp = DISAS_EXIT_UPDATE;
+            }
+            /* CORECON.PROTEN switches the memory protection */
+            if (offset == 0xfe14) {
+                gen_helper_mpu_changed(tcg_env);
                 ctx->base.is_jmp = DISAS_EXIT_UPDATE;
             }
         }

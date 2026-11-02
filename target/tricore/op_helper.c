@@ -61,7 +61,7 @@ void tricore_cpu_enter_trap(CPUTriCoreState *env, uint32_t class, int tin,
     env->PSW = (env->PSW & ~MASK_PSW_IO) | (2 << 10);
 
     /*The current Protection Register Set is set to 0: PSW.PRS = 00 B .*/
-    env->PSW &= ~MASK_PSW_PRS;
+    env->PSW &= ~(MASK_PSW_PRS | MASK_PSW_PRS2);
 
     /* The Call Depth Counter (CDC) is cleared, and the call depth limit is
        set for 64: PSW.CDC = 0000000 B .*/
@@ -141,7 +141,7 @@ void tricore_cpu_do_interrupt(CPUTriCoreState *env, uint32_t pipn)
     }
     env->PSW |= MASK_PSW_IS;
     env->PSW = (env->PSW & ~MASK_PSW_IO) | (2 << 10);
-    env->PSW &= ~MASK_PSW_PRS;
+    env->PSW &= ~(MASK_PSW_PRS | MASK_PSW_PRS2);
     env->PSW &= ~MASK_PSW_CDC;
     env->PSW |= MASK_PSW_CDE;
     env->PSW &= ~MASK_PSW_GW;
@@ -204,6 +204,12 @@ void tricore_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
     raise_exception_sync_internal(env, TRAPC_SYSBUS,
                                   access_type == MMU_INST_FETCH ? TIN4_PSE :
                                   TIN4_DSE, retaddr, 0);
+}
+
+void tricore_raise_trap(CPUTriCoreState *env, uint32_t class, int tin,
+                        uintptr_t retaddr)
+{
+    raise_exception_sync_internal(env, class, tin, retaddr, 0);
 }
 
 void helper_raise_exception_sync(CPUTriCoreState *env, uint32_t class,
@@ -2569,13 +2575,23 @@ static bool cdc_zero(uint32_t *psw)
  * CSA is accessed through one translation.
  */
 static uint8_t *csa_probe(CPUTriCoreState *env, uint32_t ea,
-                          MMUAccessType access)
+                          MMUAccessType access, int mmu_idx)
 {
     if (ea & (CSA_WORDS * 4 - 1)) {
         return NULL;
     }
-    return probe_access(env, ea, CSA_WORDS * 4, access,
-                        cpu_mmu_index(env_cpu(env), false), 0);
+    return probe_access(env, ea, CSA_WORDS * 4, access, mmu_idx, 0);
+}
+
+/*
+ * The memory protection does not check the context saves and restores of
+ * calls, returns, traps and interrupts, which hand a CSA on through the
+ * link word; it checks LDLCX, LDUCX, STLCX and STUCX (TC1.8 architecture
+ * manual volume 1, memory protection system).
+ */
+static int csa_mmu_idx(CPUTriCoreState *env, const uint32_t *link)
+{
+    return link ? TRICORE_MMU_IDX_CSA : cpu_mmu_index(env_cpu(env), false);
 }
 
 /*
@@ -2586,11 +2602,12 @@ static uint8_t *csa_probe(CPUTriCoreState *env, uint32_t ea,
  * remapped, and stores through a remembered page skip dirty tracking and
  * watchpoints set later: faster, but only for guests that keep to it.
  */
-static uint8_t *csa_host(CPUTriCoreState *env, target_ulong ea)
+static uint8_t *csa_host(CPUTriCoreState *env, target_ulong ea, int mmu_idx)
 {
     target_ulong page = ea & TARGET_PAGE_MASK;
     unsigned slot = (page >> TARGET_PAGE_BITS) & 1;
-    bool cache = env_archcpu(env)->csa_cache;
+    bool cache = env_archcpu(env)->csa_cache &&
+                 mmu_idx == TRICORE_MMU_IDX_CSA;
     void *host;
     int flags;
 
@@ -2601,8 +2618,7 @@ static uint8_t *csa_host(CPUTriCoreState *env, target_ulong ea)
         return env->csa_host_page[slot] + (ea - page);
     }
     flags = probe_access_flags(env, ea, CSA_WORDS * 4, MMU_DATA_STORE,
-                               cpu_mmu_index(env_cpu(env), false), true,
-                               &host, 0);
+                               mmu_idx, true, &host, 0);
     if (flags || !host) {
         return NULL;
     }
@@ -2621,20 +2637,22 @@ static uint8_t *csa_host(CPUTriCoreState *env, target_ulong ea)
 static void csa_store(CPUTriCoreState *env, uint32_t ea,
                       const uint32_t words[CSA_WORDS], uint32_t *link)
 {
-    uint8_t *host = csa_host(env, ea);
+    int mmu_idx = csa_mmu_idx(env, link);
+    uint8_t *host = csa_host(env, ea, mmu_idx);
     int i;
 
     if (!host) {
-        host = csa_probe(env, ea, MMU_DATA_STORE);
+        host = csa_probe(env, ea, MMU_DATA_STORE, mmu_idx);
     }
     if (link) {
-        *link = host ? ldl_le_p(host) : cpu_ldl_le_data(env, ea);
+        *link = host ? ldl_le_p(host) :
+                cpu_ldl_le_mmuidx_ra(env, ea, mmu_idx, 0);
     }
     for (i = 0; i < CSA_WORDS; i++) {
         if (host) {
             stl_le_p(host + i * 4, words[i]);
         } else {
-            cpu_stl_le_data(env, ea + i * 4, words[i]);
+            cpu_stl_le_mmuidx_ra(env, ea + i * 4, words[i], mmu_idx, 0);
         }
     }
 }
@@ -2646,22 +2664,24 @@ static void csa_store(CPUTriCoreState *env, uint32_t ea,
 static void csa_load(CPUTriCoreState *env, uint32_t ea,
                      uint32_t words[CSA_WORDS], const uint32_t *link)
 {
-    uint8_t *host = csa_host(env, ea);
+    int mmu_idx = csa_mmu_idx(env, link);
+    uint8_t *host = csa_host(env, ea, mmu_idx);
     int i;
 
     if (!host) {
-        host = csa_probe(env, ea, link ? MMU_DATA_STORE : MMU_DATA_LOAD);
+        host = csa_probe(env, ea, link ? MMU_DATA_STORE : MMU_DATA_LOAD,
+                         mmu_idx);
     }
 
     for (i = 0; i < CSA_WORDS; i++) {
         words[i] = host ? ldl_le_p(host + i * 4)
-                        : cpu_ldl_le_data(env, ea + i * 4);
+                        : cpu_ldl_le_mmuidx_ra(env, ea + i * 4, mmu_idx, 0);
     }
     if (link) {
         if (host) {
             stl_le_p(host, *link);
         } else {
-            cpu_stl_le_data(env, ea, *link);
+            cpu_stl_le_mmuidx_ra(env, ea, *link, mmu_idx, 0);
         }
     }
 }

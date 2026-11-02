@@ -110,6 +110,9 @@ void tricore_cpu_enter_trap(CPUTriCoreState *env, uint32_t class, int tin,
                             uint32_t ret);
 /* Raise the non-maskable interrupt: trap class 7, TIN 0 (with the BQL) */
 void tricore_cpu_raise_nmi(TriCoreCPU *cpu);
+/* Take a synchronous trap at the instruction of @retaddr */
+G_NORETURN void tricore_raise_trap(CPUTriCoreState *env, uint32_t class,
+                                   int tin, uintptr_t retaddr);
 /* A memory transaction answered with an error: a class 4 bus error trap */
 void tricore_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
                                        vaddr addr, unsigned size,
@@ -148,6 +151,7 @@ FIELD(ICR, CCPN, 0, 8)
 #define MASK_USB_AV  0x10000000
 #define MASK_USB_SAV 0x08000000
 #define MASK_PSW_PRS 0x00003000
+#define MASK_PSW_PRS2 0x00008000    /* TC1.8: PSW.PRS[2] */
 #define MASK_PSW_IO  0x00000c00
 #define MASK_PSW_IS  0x00000200
 #define MASK_PSW_GW  0x00000100
@@ -355,9 +359,43 @@ FIELD_SETTER(icr_set_ccpn, ICR, CCPN)
 
 #define MMU_USER_IDX 2
 
-FIELD(TB_FLAGS, PRIV, 0, 2)
+/*
+ * MMU indexes: the protection register set the range-based memory
+ * protection checks an access against (PSW.PRS, TC1.8: 0..7), and the
+ * context save areas of calls, returns, traps and interrupts, which it
+ * does not check
+ */
+#define TRICORE_PRS_COUNT   8
+#define TRICORE_MMU_IDX_CSA TRICORE_PRS_COUNT
 
+FIELD(TB_FLAGS, PRIV, 0, 2)
+FIELD(TB_FLAGS, PRS, 2, 3)
+
+/* PSW.PRS: bits 13:12, TC1.8 adds bit 2 of the set number at bit 15 */
+static inline unsigned tricore_psw_prs(CPUTriCoreState *env)
+{
+    unsigned prs = extract32(env->PSW, 12, 2);
+
+    if (tricore_has_feature(env, TRICORE_FEATURE_18)) {
+        prs |= extract32(env->PSW, 15, 1) << 2;
+    }
+    return prs;
+}
+
+/* TC1.8 memory protection CSFRs: DPRn_L/U, CPRn_L/U, CPXE/DPRE/DPWE_x */
+#define CSFR_DPR_L(n)       (0xC000 + (n) * 8)
+#define CSFR_DPR_U(n)       (0xC004 + (n) * 8)
+#define CSFR_CPR_L(n)       (0xD000 + (n) * 8)
+#define CSFR_CPR_U(n)       (0xD004 + (n) * 8)
+/* sets 0-3 at E0x0 + x*4, sets 4-7 at E0x0 + 0x40 + (x - 4)*4 */
+#define CSFR_PRS_SET(x)     (((x) & 3) * 4 + ((x) >> 2) * 0x40)
+#define CSFR_CPXE(x)        (0xE000 + CSFR_PRS_SET(x))
+#define CSFR_DPRE(x)        (0xE010 + CSFR_PRS_SET(x))
+#define CSFR_DPWE(x)        (0xE020 + CSFR_PRS_SET(x))
 #define CSFR_DEADD          0x901C      /* data error address */
+#define CSFR_MPU_FIRST      CSFR_DPR_L(0)
+#define CSFR_MPU_END        (CSFR_DPWE(TRICORE_PRS_COUNT - 1) + 4)
+#define TRICORE_MPU_RANGES  32
 
 void cpu_state_reset(CPUTriCoreState *s);
 void tricore_tcg_init(void);

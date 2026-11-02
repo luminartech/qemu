@@ -47,7 +47,8 @@ Supported devices
   segment 1) stays halted unless a board starts it; per-core STM with
   compares per virtual machine; the non-maskable interrupt (trap class 7)
   when board code raises it; a device's error response to a fetch, load or
-  store as a bus error trap (class 4: PSE, DSE, DAE)
+  store as a bus error trap (class 4: PSE, DSE, DAE); the TC1.8 range-based
+  memory protection (``CORECON.PROTEN``, class 1: MPR, MPW, MPX)
 * Interrupt router: SRC registers, per-core arbitration, interrupt delivery
   and acknowledge
 * DMA0 and DMA1: linked lists, software and QSPI hardware requests

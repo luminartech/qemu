@@ -55,9 +55,12 @@ static TCGTBCPUState tricore_get_tb_cpu_state(CPUState *cs)
 {
     CPUTriCoreState *env = cpu_env(cs);
 
+    uint32_t flags = FIELD_DP32(0, TB_FLAGS, PRIV, extract32(env->PSW, 10, 2));
+
+    flags = FIELD_DP32(flags, TB_FLAGS, PRS, tricore_psw_prs(env));
     return (TCGTBCPUState){
         .pc = env->PC,
-        .flags = FIELD_DP32(0, TB_FLAGS, PRIV, extract32(env->PSW, 10, 2)),
+        .flags = flags,
     };
 }
 
@@ -164,7 +167,7 @@ void tricore_cpu_release_boot_halt(TriCoreCPU *cpu, uint32_t pc)
 
 static int tricore_cpu_mmu_index(CPUState *cs, bool ifetch)
 {
-    return 0;
+    return tricore_psw_prs(cpu_env(cs));
 }
 
 static void tricore_cpu_realizefn(DeviceState *dev, Error **errp)
