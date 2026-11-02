@@ -57,7 +57,7 @@ void tricore_cpu_enter_trap(CPUTriCoreState *env, uint32_t class, int tin,
     env->PSW |= MASK_PSW_IS;
     /* The I/O mode is set to Supervisor mode, which means all permissions
        are enabled: PSW.IO = 10 B .*/
-    env->PSW |= (2 << 10);
+    env->PSW = (env->PSW & ~MASK_PSW_IO) | (2 << 10);
 
     /*The current Protection Register Set is set to 0: PSW.PRS = 00 B .*/
     env->PSW &= ~MASK_PSW_PRS;
