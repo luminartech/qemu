@@ -100,6 +100,8 @@ struct ArchCPU {
 };
 
 #define CPU_INTERRUPT_NMI   CPU_INTERRUPT_TGT_EXT_3
+/* A data access asynchronous error (DAE) waits to be taken */
+#define CPU_INTERRUPT_DAE   CPU_INTERRUPT_TGT_EXT_2
 
 void tricore_cpu_set_pending_irq(TriCoreCPU *cpu, uint32_t prio);
 void tricore_cpu_release_boot_halt(TriCoreCPU *cpu, uint32_t pc);
@@ -108,6 +110,12 @@ void tricore_cpu_enter_trap(CPUTriCoreState *env, uint32_t class, int tin,
                             uint32_t ret);
 /* Raise the non-maskable interrupt: trap class 7, TIN 0 (with the BQL) */
 void tricore_cpu_raise_nmi(TriCoreCPU *cpu);
+/* A memory transaction answered with an error: a class 4 bus error trap */
+void tricore_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
+                                       vaddr addr, unsigned size,
+                                       MMUAccessType access_type, int mmu_idx,
+                                       MemTxAttrs attrs, MemTxResult response,
+                                       uintptr_t retaddr);
 
 struct TriCoreCPUClass {
     CPUClass parent_class;
@@ -348,6 +356,8 @@ FIELD_SETTER(icr_set_ccpn, ICR, CCPN)
 #define MMU_USER_IDX 2
 
 FIELD(TB_FLAGS, PRIV, 0, 2)
+
+#define CSFR_DEADD          0x901C      /* data error address */
 
 void cpu_state_reset(CPUTriCoreState *s);
 void tricore_tcg_init(void);

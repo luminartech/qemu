@@ -46,7 +46,8 @@ Supported devices
   through ``BOOTCON.BHALT`` / ``HRA_PC``; CPUcs (core 6, its scratchpads in
   segment 1) stays halted unless a board starts it; per-core STM with
   compares per virtual machine; the non-maskable interrupt (trap class 7)
-  when board code raises it
+  when board code raises it; a device's error response to a fetch, load or
+  store as a bus error trap (class 4: PSE, DSE, DAE)
 * Interrupt router: SRC registers, per-core arbitration, interrupt delivery
   and acknowledge
 * DMA0 and DMA1: linked lists, software and QSPI hardware requests

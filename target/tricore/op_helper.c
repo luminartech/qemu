@@ -19,6 +19,7 @@
 #include "cpu.h"
 #include "qemu/host-utils.h"
 #include "exec/helper-proto.h"
+#include "exec/cpu-interrupt.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/cpu-loop.h"
 #include "qemu/plugin.h"
@@ -166,6 +167,43 @@ void helper_wait(CPUTriCoreState *env)
     cs->halted = 1;
     cs->exception_index = EXCP_HLT;
     cpu_loop_exit(cs);
+}
+
+/*
+ * Bus errors (TC1.8 architecture manual volume 1, trap class 4): a failed
+ * instruction fetch is a program fetch synchronous error (PSE), a failed
+ * load a data access synchronous error (DSE), both taken at the
+ * instruction; a failed store is a data access asynchronous error (DAE),
+ * taken once the current block of instructions is done, its address in
+ * DEADD.  Only a device's error response is a bus error: an address the
+ * machine maps nothing to reads 0 and ignores writes, as the machine does
+ * not map the whole address space.
+ */
+void tricore_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
+                                       vaddr addr, unsigned size,
+                                       MMUAccessType access_type, int mmu_idx,
+                                       MemTxAttrs attrs, MemTxResult response,
+                                       uintptr_t retaddr)
+{
+    CPUTriCoreState *env = cpu_env(cs);
+
+    if (response != MEMTX_ERROR) {
+        return;
+    }
+    qemu_log_mask(CPU_LOG_INT, "core%u: bus error on %s at 0x%08" VADDR_PRIx
+                  "\n", env->CORE_ID, access_type == MMU_INST_FETCH ? "fetch" :
+                  access_type == MMU_DATA_LOAD ? "load" : "store", addr);
+    if (access_type == MMU_DATA_STORE) {
+        env->csfr_generic[CSFR_DEADD / 4] = addr;
+        cpu_interrupt(cs, CPU_INTERRUPT_DAE);
+        return;
+    }
+    if (access_type == MMU_DATA_LOAD) {
+        env->csfr_generic[CSFR_DEADD / 4] = addr;
+    }
+    raise_exception_sync_internal(env, TRAPC_SYSBUS,
+                                  access_type == MMU_INST_FETCH ? TIN4_PSE :
+                                  TIN4_DSE, retaddr, 0);
 }
 
 void helper_raise_exception_sync(CPUTriCoreState *env, uint32_t class,

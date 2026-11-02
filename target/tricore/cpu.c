@@ -281,6 +281,13 @@ static bool tricore_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         tricore_cpu_enter_trap(env, TRAPC_NMI, TIN7_NMI, env->PC);
         return true;
     }
+    if ((interrupt_request & CPU_INTERRUPT_DAE) && !env->boot_halted) {
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_DAE);
+        qemu_log_mask(CPU_LOG_INT, "core%u: DAE at pc 0x%08x\n", env->CORE_ID,
+                      env->PC);
+        tricore_cpu_enter_trap(env, TRAPC_SYSBUS, TIN4_DAE, env->PC);
+        return true;
+    }
     if ((interrupt_request & CPU_INTERRUPT_HARD) &&
         !env->boot_halted && tricore_cpu_irq_deliverable(env, prio)) {
         tricore_cpu_do_interrupt(env, prio);
@@ -307,6 +314,7 @@ static const TCGCPUOps tricore_tcg_ops = {
     .restore_state_to_opc = tricore_restore_state_to_opc,
     .mmu_index = tricore_cpu_mmu_index,
     .tlb_fill = tricore_cpu_tlb_fill,
+    .do_transaction_failed = tricore_cpu_do_transaction_failed,
     .pointer_wrap = cpu_pointer_wrap_uint32,
     .cpu_exec_interrupt = tricore_cpu_exec_interrupt,
     .cpu_exec_interrupt_ready = tricore_cpu_exec_interrupt_ready,
