@@ -178,6 +178,11 @@ cells (zeros), the flashes are kept and ``-kernel`` images seed only the
 RAMs; otherwise the images seed the flashes at the first reset.  A
 machine reset leaves the flash contents as they are.
 
+The DMU command interfaces of the host and of the CSRM program, erase
+and verify the flashes.  A command whose address is not aligned to its
+page, wordline or logical sector, or whose range has no flash, fails
+with a sequence error (SQER).
+
 Guest time
 ----------
 

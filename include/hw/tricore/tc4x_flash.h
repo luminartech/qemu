@@ -23,7 +23,8 @@
  * The DMU command interfaces of the host (HCI) and of the CSRM (CSCI)
  * program, erase and verify the flashes.  Their registers stay SFR store
  * words, so the SoC passes writes of the command windows and of CLRERR
- * to tc4x_flash_dmu_write().
+ * to tc4x_flash_dmu_write().  Commands at addresses that are not aligned
+ * to their page, wordline or sector fail with a sequence error.
  * Link "policy": the board's rules (where a command finds its flash,
  * which commands it runs or refuses itself, what a failed command does),
  * an object with the TYPE_TC4X_FLASH_POLICY interface.

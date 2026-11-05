@@ -50,6 +50,8 @@
 #define DMU_PF_PAGE         32u
 #define DMU_DF_WORDLINE     512u
 #define DMU_PF_WORDLINE     1024u
+#define DMU_DF_BURST        0x20u       /* IFXFLASH_DFLASH_BURST_LENGTH */
+#define DMU_PF_BURST        0x200u      /* IFXFLASH_PFLASH_BURST_LENGTH */
 
 static const char *const flash_names[TC4X_FLASH_COUNT] = {
     [TC4X_PFLASH] = "pflash",
@@ -259,6 +261,35 @@ static uint64_t dmu_verify_len(uint32_t addr, uint32_t opcode, uint32_t count)
            (uint64_t)count * dmu_sector_size(addr);
 }
 
+/*
+ * Program, erase and verify address whole pages, wordlines or logical
+ * sectors (page 8/32 bytes, burst 0x20/0x200 bytes, wordline 512/1024
+ * bytes, sector 2/16 KiB for DFLASH/PFLASH: iLLD IfxFlash_cfg.h); a write
+ * page programs one page, a write burst up to a burst
+ */
+static bool dmu_aligned(Tc4xDmuIf *d, uint32_t class, uint32_t opcode)
+{
+    uint32_t addr = d->cmd_addr;
+    bool df = dmu_sector_size(addr) == DMU_DF_SECTOR;
+    uint32_t page = df ? DMU_DF_PAGE : DMU_PF_PAGE;
+
+    if (class == 0xA0 && (opcode == 0xAA || opcode == 0xA6)) {
+        return d->page_len && addr % page == 0 && d->page_len % page == 0 &&
+               d->page_len <= (opcode == 0xAA ? page :
+                               df ? DMU_DF_BURST : DMU_PF_BURST);
+    }
+    if (class == 0x80 && opcode == 0x56) {
+        return addr % page == 0;
+    }
+    if (class == 0x80 && opcode == 0x58) {
+        return addr % (df ? DMU_DF_WORDLINE : DMU_PF_WORDLINE) == 0;
+    }
+    if (class == 0x80 && (opcode == 0x50 || opcode == 0x5F)) {
+        return d->cmd_count && addr % dmu_sector_size(addr) == 0;
+    }
+    return true;
+}
+
 static void dmu_execute(Tc4xFlashState *s, Tc4xDmuIf *d, uint32_t class,
                         uint32_t opcode)
 {
@@ -270,6 +301,19 @@ static void dmu_execute(Tc4xFlashState *s, Tc4xDmuIf *d, uint32_t class,
     Tc4xFlash flash;
     uint64_t off, len;
 
+    if (!dmu_aligned(d, class, opcode)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "tc4x-flash: DMU command 0x%02x/0x%02x "
+                      "at 0x%08x (%u bytes, count %u) is not aligned: "
+                      "sequence error\n", class, opcode, addr, d->page_len,
+                      d->cmd_count);
+        tc4x_flash_dmu_error(s, d->csrm, TC4X_DMU_ERR_SQER);
+        if (program) {
+            d->page_len = 0;
+        }
+        dmu_status(s, d, DMU_STATUS_REQDONE,
+                   program ? DMU_STATUS_DFPAGE | DMU_STATUS_PFPAGE : 0);
+        return;
+    }
     if (program && dmu_policy(s, d, TC4X_DMU_PROGRAM, addr, 0, d->page_len,
                               d->page_buf)) {
         d->page_len = 0;
