@@ -25,9 +25,12 @@
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
 #include "qemu/cutils.h"
+#include "qapi/error.h"
+#include "hw/core/resettable.h"
 #include "hw/tricore/tc4x.h"
 #include "hw/tricore/tc4x_board.h"
 #include "hw/tricore/tc4x_machine.h"
+#include "system/reset.h"
 #include "trace.h"
 
 #define KIT_LED_PORT        3u
@@ -44,7 +47,6 @@
 #define KIT_EEPROM_EUI48    0xFAu
 /* The upper half of the 24AA02E48 is write-protected */
 #define KIT_EEPROM_WP_START 0x80u
-#define KIT_PHY_PORT        0u
 #define KIT_PHY_ADDR        0u
 
 /* IEEE 802.3 Clause 22 registers and bits */
@@ -74,16 +76,30 @@
 #define TYPE_KIT_TC4D7_LITE TC4X_BOARD_TYPE_NAME(KIT_NAME)
 OBJECT_DECLARE_SIMPLE_TYPE(KitTc4d7Lite, KIT_TC4D7_LITE)
 
+/*
+ * The DP83825I: the link is up while the cable is plugged and the port has
+ * its network link
+ */
+#define TYPE_KIT_PHY        "dp83825i-phy"
+OBJECT_DECLARE_SIMPLE_TYPE(KitPhy, KIT_PHY)
+
+struct KitPhy {
+    DeviceState parent_obj;
+
+    uint16_t bmcr;
+    uint16_t anar;
+    bool cable;
+    bool port_up;
+};
+
 struct KitTc4d7Lite {
     Tc4xBoard parent_obj;
 
     Tc4xSoc *soc;
+    KitPhy *phy;
     uint8_t eeprom[KIT_EEPROM_SIZE];
     uint8_t eeprom_ptr;
     bool eeprom_addressed;
-    uint16_t bmcr;
-    uint16_t anar;
-    bool link;
 };
 
 /* The node address the EEPROM holds: QEMU's default NIC address */
@@ -142,32 +158,33 @@ static const Tc4xI2cSlaveOps kit_eeprom_ops = {
     .read = kit_eeprom_read,
 };
 
-static void kit_phy_reset(void *opaque)
+static void kit_phy_reset_hold(Object *obj, ResetType type)
 {
-    KitTc4d7Lite *k = opaque;
+    KitPhy *phy = KIT_PHY(obj);
 
-    k->bmcr = BMCR_DEFAULT;
-    k->anar = ANAR_DEFAULT;
+    phy->bmcr = BMCR_DEFAULT;
+    phy->anar = ANAR_DEFAULT;
 }
 
 /* Auto-negotiation completes at once with a 100BASE-TX full duplex partner */
-static uint16_t kit_phy_read22(void *opaque, unsigned reg)
+static uint16_t kit_phy_read22(Tc4xGethPhy *gphy, unsigned reg)
 {
-    KitTc4d7Lite *k = opaque;
-    bool an_done = k->link && (k->bmcr & BMCR_ANENABLE);
+    KitPhy *phy = KIT_PHY(gphy);
+    bool link = phy->cable && phy->port_up;
+    bool an_done = link && (phy->bmcr & BMCR_ANENABLE);
 
     switch (reg) {
     case MII_BMCR:
-        return k->bmcr;
+        return phy->bmcr;
     case MII_BMSR:
-        return BMSR_ABILITIES | (k->link ? BMSR_LSTATUS : 0) |
+        return BMSR_ABILITIES | (link ? BMSR_LSTATUS : 0) |
                (an_done ? BMSR_ANEGCOMPLETE : 0);
     case MII_PHYID1:
         return DP83825I_PHYID1;
     case MII_PHYID2:
         return DP83825I_PHYID2;
     case MII_ANAR:
-        return k->anar;
+        return phy->anar;
     case MII_ANLPAR:
         return an_done ? ANLPAR_PARTNER : 0;
     case MII_ANER:
@@ -177,41 +194,47 @@ static uint16_t kit_phy_read22(void *opaque, unsigned reg)
     }
 }
 
-static void kit_phy_write22(void *opaque, unsigned reg, uint16_t val)
+static void kit_phy_write22(Tc4xGethPhy *gphy, unsigned reg, uint16_t val)
 {
-    KitTc4d7Lite *k = opaque;
+    KitPhy *phy = KIT_PHY(gphy);
 
     switch (reg) {
     case MII_BMCR:
         if (val & BMCR_RESET) {
-            kit_phy_reset(k);
+            kit_phy_reset_hold(OBJECT(phy), RESET_TYPE_COLD);
         } else {
-            k->bmcr = val & ~BMCR_ANRESTART;
+            phy->bmcr = val & ~BMCR_ANRESTART;
         }
         break;
     case MII_ANAR:
-        k->anar = val;
+        phy->anar = val;
         break;
     }
 }
 
-static uint16_t kit_phy_read45(void *opaque, unsigned mmd, unsigned reg)
+static void kit_phy_port_link(Tc4xGethPhy *gphy, bool up)
 {
-    return 0;
+    KIT_PHY(gphy)->port_up = up;
 }
 
-static void kit_phy_write45(void *opaque, unsigned mmd, unsigned reg,
-                            uint16_t val)
+static void kit_phy_init(Object *obj)
 {
+    KIT_PHY(obj)->cable = true;
 }
 
-static const Tc4xGethPhyOps kit_phy_ops = {
-    .read22 = kit_phy_read22,
-    .write22 = kit_phy_write22,
-    .read45 = kit_phy_read45,
-    .write45 = kit_phy_write45,
-    .reset = kit_phy_reset,
-};
+static void kit_phy_class_init(ObjectClass *oc, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+    ResettableClass *rc = RESETTABLE_CLASS(oc);
+    Tc4xGethPhyClass *pc = TC4X_GETH_PHY_CLASS(oc);
+
+    dc->desc = "TI DP83825I Ethernet PHY of the TC4D7 lite kit";
+    dc->user_creatable = false;
+    rc->phases.hold = kit_phy_reset_hold;
+    pc->read22 = kit_phy_read22;
+    pc->write22 = kit_phy_write22;
+    pc->port_link = kit_phy_port_link;
+}
 
 /*
  * button press|release   push or let go of the user button
@@ -234,7 +257,7 @@ static bool kit_command(void *opaque, int argc, char **argv, GString *out)
             g_string_append(out, "err usage: link up|down\n");
             return true;
         }
-        k->link = !strcmp(argv[1], "up");
+        k->phy->cable = !strcmp(argv[1], "up");
     } else {
         return false;
     }
@@ -254,12 +277,23 @@ static void kit_init(Tc4xBoard *board, Tc4xSoc *soc)
     memcpy(&k->eeprom[KIT_EEPROM_EUI48], kit_eui48, sizeof(kit_eui48));
     tc4x_i2c_attach(soc, KIT_EEPROM_BUS, KIT_EEPROM_ADDR, &kit_eeprom_ops, k);
 
-    k->link = true;
-    kit_phy_reset(k);
-    tc4x_geth_attach(soc, KIT_PHY_PORT, KIT_PHY_ADDR, &kit_phy_ops, k);
-
     tc4x_sim_add_command(soc, "button", kit_command, k, false);
     tc4x_sim_add_command(soc, "link", kit_command, k, false);
+}
+
+/* The PHY on GETH0 port 0 */
+static void kit_wire(Tc4xBoard *board, Tc4xSoc *soc)
+{
+    KitTc4d7Lite *k = KIT_TC4D7_LITE(board);
+    DeviceState *phy = qdev_new(TYPE_KIT_PHY);
+    Object *geth = OBJECT(tc4x_soc_geth(soc));
+
+    object_property_add_child(OBJECT(board), "phy", OBJECT(phy));
+    qdev_realize_and_unref(phy, NULL, &error_fatal);
+    qemu_register_resettable(OBJECT(phy));
+    k->phy = KIT_PHY(phy);
+    object_property_set_link(geth, "phy0", OBJECT(phy), &error_fatal);
+    object_property_set_uint(geth, "phy0-addr", KIT_PHY_ADDR, &error_fatal);
 }
 
 static const Tc4xBoardInput kit_inputs[] = {
@@ -275,6 +309,7 @@ static void kit_class_init(ObjectClass *oc, const void *data)
     bc->console = 0;
     bc->inputs = kit_inputs;
     bc->n_inputs = ARRAY_SIZE(kit_inputs);
+    bc->wire = kit_wire;
     bc->init = kit_init;
 }
 
@@ -290,6 +325,16 @@ static void kit_machine_class_init(ObjectClass *oc, const void *data)
 
 static const TypeInfo kit_types[] = {
     {
+        .name = TYPE_KIT_PHY,
+        .parent = TYPE_DEVICE,
+        .instance_size = sizeof(KitPhy),
+        .instance_init = kit_phy_init,
+        .class_init = kit_phy_class_init,
+        .interfaces = (const InterfaceInfo[]) {
+            { TYPE_TC4X_GETH_PHY },
+            { }
+        },
+    }, {
         .name = TYPE_KIT_TC4D7_LITE,
         .parent = TYPE_TC4X_BOARD,
         .instance_size = sizeof(KitTc4d7Lite),

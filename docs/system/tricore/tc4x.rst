@@ -56,9 +56,11 @@ Supported devices
 * QSPI0..7: full-duplex FIFOs, end of job through phase transition 2 or the
   move counter; slaves are attached by board code
 * GETH0 (``hw/net/tc4x_geth.c``), based on the Synopsys DWC Ethernet QoS
-  core, with its two MAC ports.  No PHY is attached by default, so MDIO
-  reads return all ones; board code attaches PHYs through
-  ``tc4x_geth_attach_phy()``.  The bridge forwards frames from a receive
+  core, with its two MAC ports.  Board code links a PHY to a port through
+  the controller's ``phy0``/``phy1`` links (``TYPE_TC4X_GETH_PHY``, MDIO
+  address in ``phy0-addr``/``phy1-addr``); MDIO reads of a port without
+  one return all ones.  The PHY sees the link state of the port's network
+  connection (QMP ``set_link``).  The bridge forwards frames from a receive
   queue of one port to a transmit queue of the other when the TxQ/RxC
   mapping makes that queue a forwarding path (``BRIDGE_TXQ_MAP_PORT_n``,
   ``BRIDGE_PORT_n_CONTROL``); its packet length limit, queue flushes and
@@ -251,7 +253,8 @@ see ``hw/tricore/boards/README.rst``.
   * 2-Kbit EEPROM at I2C0 address 0x50 with an EUI-48 node address
     (52:54:00:12:34:56) at 0xFA
   * DP83825I Ethernet PHY at MDIO address 0 of GETH0 port 0 with the link
-    up at 100 Mbit/s full duplex; sim-bridge command ``link up|down``.
+    up at 100 Mbit/s full duplex while the cable is plugged (sim-bridge
+    command ``link up|down``) and port 0's network link is up.
     A ``-nic`` with ``model=tc4x-geth`` connects port 0, for example
     ``-nic socket,model=tc4x-geth,udp=127.0.0.1:5556,localaddr=127.0.0.1:5555``
     exchanges frames as UDP datagrams with a host process (the

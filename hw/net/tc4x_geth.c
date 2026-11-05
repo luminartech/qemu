@@ -2,8 +2,9 @@
  * TC4x GETH Ethernet controller
  *
  * TC4x GETH0 is based on the Synopsys DWC Ethernet QoS core and has two MAC
- * ports.  No PHY is attached by default, so MDIO reads of a port return all
- * ones; board code attaches PHYs with tc4x_geth_attach_phy().
+ * ports.  Board code links a PHY (TYPE_TC4X_GETH_PHY) to each port that has
+ * one; MDIO reads of a port without one return all ones.  The PHY learns
+ * the link state of the port's network connection.
  * The PTP system time stamps frames in TX status and RX context descriptors.
  * The on-chip HSPHY reports its calibration and DLL-lock status as done.
  * The bridge forwards between the ports: in two-port mode with TxQ/RxC
@@ -49,6 +50,64 @@
 #include "qom/object.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(Tc4xGethState, TC4X_GETH)
+
+#define TC4X_GETH_PHY_ADDR_MAX 31u
+
+/* A PHY attached by tc4x_geth_attach_phy(): calls its operations */
+#define TYPE_TC4X_GETH_PHY_LEGACY "tc4x-geth-phy-legacy"
+OBJECT_DECLARE_SIMPLE_TYPE(Tc4xGethPhyLegacy, TC4X_GETH_PHY_LEGACY)
+
+struct Tc4xGethPhyLegacy {
+    Object parent_obj;
+
+    const Tc4xGethPhyOps *ops;
+    void *opaque;
+};
+
+static uint16_t geth_phy_legacy_read22(Tc4xGethPhy *phy, unsigned reg)
+{
+    Tc4xGethPhyLegacy *l = TC4X_GETH_PHY_LEGACY(phy);
+
+    return l->ops->read22(l->opaque, reg);
+}
+
+static void geth_phy_legacy_write22(Tc4xGethPhy *phy, unsigned reg,
+                                    uint16_t val)
+{
+    Tc4xGethPhyLegacy *l = TC4X_GETH_PHY_LEGACY(phy);
+
+    l->ops->write22(l->opaque, reg, val);
+}
+
+static uint16_t geth_phy_legacy_read45(Tc4xGethPhy *phy, unsigned mmd,
+                                       unsigned reg)
+{
+    Tc4xGethPhyLegacy *l = TC4X_GETH_PHY_LEGACY(phy);
+
+    return l->ops->read45(l->opaque, mmd, reg);
+}
+
+static void geth_phy_legacy_write45(Tc4xGethPhy *phy, unsigned mmd,
+                                    unsigned reg, uint16_t val)
+{
+    Tc4xGethPhyLegacy *l = TC4X_GETH_PHY_LEGACY(phy);
+
+    l->ops->write45(l->opaque, mmd, reg, val);
+}
+
+/*
+ * A legacy PHY resets with the controller; a PHY device resets with its
+ * own reset
+ */
+static void geth_phy_legacy_reset(Tc4xGethPhy *phy)
+{
+    Tc4xGethPhyLegacy *l = (Tc4xGethPhyLegacy *)
+        object_dynamic_cast(OBJECT(phy), TYPE_TC4X_GETH_PHY_LEGACY);
+
+    if (l && l->ops->reset) {
+        l->ops->reset(l->opaque);
+    }
+}
 
 #define R_CLC                 0x0000u
 #define R_RST_CTRLA           0x000Cu
@@ -238,9 +297,8 @@ typedef struct Tc4xGethPort {
     int index;
     NICConf conf;
     NICState *nic;
+    Tc4xGethPhy *phy;           /* NULL: nothing answers on MDIO */
     uint8_t phy_addr;
-    const Tc4xGethPhyOps *phy;  /* NULL: nothing answers on MDIO */
-    void *phy_opaque;
     int64_t ptp_offset_ns;
     Tc4xGethTxTs txts[TXTS_FIFO_DEPTH];
     unsigned txts_count;
@@ -427,14 +485,24 @@ static void mdio_command(Tc4xGethState *s, int p, uint32_t ctrl)
     uint16_t data = 0xFFFF;
 
     if (port->phy && pa == port->phy_addr) {
+        Tc4xGethPhyClass *pc = TC4X_GETH_PHY_GET_CLASS(port->phy);
+
         if (cl22 && write) {
-            port->phy->write22(port->phy_opaque, ra & 0x1F, ctrl & 0xFFFF);
+            if (pc->write22) {
+                pc->write22(port->phy, ra & 0x1F, ctrl & 0xFFFF);
+            }
         } else if (cl22) {
-            data = port->phy->read22(port->phy_opaque, ra & 0x1F);
+            if (pc->read22) {
+                data = pc->read22(port->phy, ra & 0x1F);
+            }
         } else if (write) {
-            port->phy->write45(port->phy_opaque, da, ra, ctrl & 0xFFFF);
+            if (pc->write45) {
+                pc->write45(port->phy, da, ra, ctrl & 0xFFFF);
+            }
         } else {
-            data = port->phy->read45(port->phy_opaque, da, ra);
+            if (pc->read45) {
+                data = pc->read45(port->phy, da, ra);
+            }
             if (cmd == MDIO_CMD_POSTINC_READ) {
                 sreg(s, PORT_BASE(p) + MDIO_ADDRESS,
                      deposit32(addr, 0, 16, ra + 1));
@@ -865,6 +933,30 @@ static void rx_kick(Tc4xGethState *s)
     }
 }
 
+/* The port has a network connection with its link up */
+static bool port_link_up(Tc4xGethPort *port)
+{
+    return port->nic && !qemu_get_queue(port->nic)->link_down;
+}
+
+static void port_link_changed(Tc4xGethPort *port)
+{
+    Tc4xGethPhyClass *pc;
+
+    if (!port->phy) {
+        return;
+    }
+    pc = TC4X_GETH_PHY_GET_CLASS(port->phy);
+    if (pc->port_link) {
+        pc->port_link(port->phy, port_link_up(port));
+    }
+}
+
+static void geth_link_status_changed(NetClientState *nc)
+{
+    port_link_changed(qemu_get_nic_opaque(nc));
+}
+
 static void geth_core_reset(Tc4xGethState *s)
 {
     memset(&s->regs[CORE_BASE / 4], 0, TC4X_GETH_SIZE - CORE_BASE);
@@ -898,9 +990,7 @@ static void geth_reset_hold(Object *obj, ResetType type)
     for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
         Tc4xGethPort *port = &s->port[p];
 
-        if (port->phy && port->phy->reset) {
-            port->phy->reset(port->phy_opaque);
-        }
+        geth_phy_legacy_reset(port->phy);
         port->ptp_offset_ns = 0;
     }
     geth_core_reset(s);
@@ -1265,6 +1355,7 @@ static NetClientInfo geth_net_info = {
     .size = sizeof(NICState),
     .can_receive = geth_can_receive,
     .receive = geth_receive,
+    .link_status_changed = geth_link_status_changed,
 };
 
 static void geth_realize(DeviceState *dev, Error **errp)
@@ -1272,6 +1363,13 @@ static void geth_realize(DeviceState *dev, Error **errp)
     Tc4xGethState *s = TC4X_GETH(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
+    for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
+        if (s->port[p].phy_addr > TC4X_GETH_PHY_ADDR_MAX) {
+            error_setg(errp, "phy%d-addr %u is not an MDIO address (0..%u)",
+                       p, s->port[p].phy_addr, TC4X_GETH_PHY_ADDR_MAX);
+            return;
+        }
+    }
     memory_region_init_io(&s->geth_mr, OBJECT(s), &geth_ops, s, "geth0",
                           TC4X_GETH_SIZE);
     memory_region_enable_lockless_io(&s->geth_mr);
@@ -1301,12 +1399,21 @@ static void geth_realize(DeviceState *dev, Error **errp)
         qemu_format_nic_info_str(qemu_get_queue(port->nic),
                                  port->conf.macaddr.a);
     }
+    for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
+        port_link_changed(&s->port[p]);
+    }
 }
 
 static const Property geth_properties[] = {
     DEFINE_NIC_PROPERTIES(Tc4xGethState, port[0].conf),
     DEFINE_PROP_MACADDR("mac1", Tc4xGethState, port[1].conf.macaddr),
     DEFINE_PROP_NETDEV("netdev1", Tc4xGethState, port[1].conf.peers),
+    DEFINE_PROP_LINK("phy0", Tc4xGethState, port[0].phy, TYPE_TC4X_GETH_PHY,
+                     Tc4xGethPhy *),
+    DEFINE_PROP_LINK("phy1", Tc4xGethState, port[1].phy, TYPE_TC4X_GETH_PHY,
+                     Tc4xGethPhy *),
+    DEFINE_PROP_UINT8("phy0-addr", Tc4xGethState, port[0].phy_addr, 0),
+    DEFINE_PROP_UINT8("phy1-addr", Tc4xGethState, port[1].phy_addr, 0),
 };
 
 static void geth_class_init(ObjectClass *klass, const void *data)
@@ -1321,12 +1428,35 @@ static void geth_class_init(ObjectClass *klass, const void *data)
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
 }
 
+static void geth_phy_legacy_class_init(ObjectClass *oc, const void *data)
+{
+    Tc4xGethPhyClass *pc = TC4X_GETH_PHY_CLASS(oc);
+
+    pc->read22 = geth_phy_legacy_read22;
+    pc->write22 = geth_phy_legacy_write22;
+    pc->read45 = geth_phy_legacy_read45;
+    pc->write45 = geth_phy_legacy_write45;
+}
+
 static const TypeInfo geth_types[] = {
     {
         .name = TYPE_TC4X_GETH,
         .parent = TYPE_SYS_BUS_DEVICE,
         .instance_size = sizeof(Tc4xGethState),
         .class_init = geth_class_init,
+    }, {
+        .name = TYPE_TC4X_GETH_PHY,
+        .parent = TYPE_INTERFACE,
+        .class_size = sizeof(Tc4xGethPhyClass),
+    }, {
+        .name = TYPE_TC4X_GETH_PHY_LEGACY,
+        .parent = TYPE_OBJECT,
+        .instance_size = sizeof(Tc4xGethPhyLegacy),
+        .class_init = geth_phy_legacy_class_init,
+        .interfaces = (const InterfaceInfo[]) {
+            { TYPE_TC4X_GETH_PHY },
+            { }
+        },
     },
 };
 
@@ -1336,13 +1466,16 @@ void tc4x_geth_attach_phy(DeviceState *dev, unsigned port, uint8_t addr,
                           const Tc4xGethPhyOps *ops, void *opaque)
 {
     Tc4xGethState *s = TC4X_GETH(dev);
-    Tc4xGethPort *p;
+    Tc4xGethPhyLegacy *l;
 
-    assert(port < TC4X_GETH_NUM_PORTS);
-    p = &s->port[port];
-    p->phy_addr = addr;
-    p->phy = ops;
-    p->phy_opaque = opaque;
+    assert(port < TC4X_GETH_NUM_PORTS && addr <= TC4X_GETH_PHY_ADDR_MAX);
+    l = TC4X_GETH_PHY_LEGACY(object_new(TYPE_TC4X_GETH_PHY_LEGACY));
+    l->ops = ops;
+    l->opaque = opaque;
+    object_property_add_child(OBJECT(dev), "legacy-phy[*]", OBJECT(l));
+    object_unref(OBJECT(l));
+    s->port[port].phy_addr = addr;
+    s->port[port].phy = TC4X_GETH_PHY(l);
 }
 
 void tc4x_geth_configure_nics(DeviceState *dev)
