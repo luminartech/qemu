@@ -299,6 +299,12 @@ void tc4x_reg_set(Tc4xSoc *s, uint32_t addr, uint32_t val)
     }
 }
 
+void tc4x_reg_or(Tc4xSoc *s, uint32_t addr, uint32_t bits)
+{
+    assert(!tc4x_ir_is_src(addr));
+    tc4x_sfr_store_or(s->sfr, addr, bits);
+}
+
 uint32_t tc4x_reg_cmpxchg(Tc4xSoc *s, uint32_t addr, uint32_t old,
                           uint32_t val)
 {

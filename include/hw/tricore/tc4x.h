@@ -29,6 +29,13 @@ uint32_t tc4x_reg_get(Tc4xSoc *soc, uint32_t addr);
 /* Store @val at @addr, no side effects (any thread) */
 void tc4x_reg_set(Tc4xSoc *soc, uint32_t addr, uint32_t val);
 
+/*
+ * Set @bits of the SFR at @addr atomically, no side effects (any thread):
+ * a guest write that clears other bits at the same time is not undone.
+ * Not for service request nodes (tc4x_irq_raise() sets SRR).
+ */
+void tc4x_reg_or(Tc4xSoc *soc, uint32_t addr, uint32_t bits);
+
 /* Hooks of the SFR store at @addr (see tc4x_sfr_store.h) */
 void tc4x_sfr_add_write_hook(Tc4xSoc *soc, uint32_t addr, Tc4xSfrWriteFn fn,
                              void *opaque);
