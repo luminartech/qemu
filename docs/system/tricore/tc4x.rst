@@ -166,6 +166,8 @@ The bridge serves:
 ``set PATH PROP VALUE``                    set a QOM property from its text
                                            form
 ``vmstop``, ``vmcont``                     pause and resume the guest
+``ack ID``                                 the core waiting since the event
+                                           ``... sync ID`` goes on
 =========================================  ====================================
 
 The devices serve:
@@ -174,7 +176,7 @@ The devices serve:
 ``poke ADDR VAL``              set an SFR's stored value, no side effects
 ``force ADDR VAL [MASK]``      SFR reads return VAL on MASK until ``unforce``
 ``irq SRC``                    hardware-set SRR of a service request node
-``watch ADDR``                 report guest writes as ``ev w ADDR VAL SIZE CPU``
+``watch ADDR [sync]``          report guest writes as ``ev w ADDR VAL SIZE CPU``
 ``unwatch ADDR``               stop reporting them
 ``cores``                      per-core PC, state, ICR and some registers
 ``hot [MIN]``                  SFRs read at least MIN times since last asked
@@ -189,12 +191,24 @@ The devices serve:
 for a register a device serves, the reply is ``err ADDR owned by PATH``.
 
 Event lines start with ``ev`` and may come at any time, before a reply
-included: ``ev w ...`` for watched writes.
+included: ``ev w ...`` for watched writes, sent once the write took
+effect (CPU -1: not a core).
+
+``watch ADDR sync`` makes the watch synchronous: a core that writes the
+register sends ``ev w ADDR VAL SIZE CPU sync ID`` and waits until the
+client sends ``ack ID``, so the guest sees the client's answer (``poke``,
+``irq``) before its next instruction.  A stop of the VM (``vmstop``, a
+reset, quit) or the client's disconnection lets the core go on without
+the ack; a write that no core makes (``w``, a timer) sends the event
+without ``sync``.  The SFR store and the interrupt router report writes;
+for a register another device owns, ``watch`` is an error.
 
 A device, a board or any other object adds commands by implementing the
 QOM interface ``tc4x-sim-commands`` (``include/hw/tricore/tc4x_sim_bridge.h``):
 the class lists its command words and runs them; the bridge finds the
-object in the QOM tree.  ``tc4x_sim_event()`` sends an event line.  The
+object in the QOM tree.  An object that owns registers implements the
+interface's ``watch`` method and reports watched writes with
+``tc4x_sim_watch_event()``; ``tc4x_sim_event()`` sends any event line.  The
 ``sfr-script`` machine property runs a file of commands at machine init;
 a command that fails stops QEMU with the line and its reply.
 

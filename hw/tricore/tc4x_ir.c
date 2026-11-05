@@ -44,8 +44,8 @@ typedef struct Tc4xIrAckListener {
  * BQL, and service requests come from any thread, so src (written),
  * pending, cpu_prio and acked are under lock; src is read atomically
  * without it.  Acknowledges of listened nodes reach their listeners in
- * the main loop (ack_bh).  listeners, cpu and the watch callback are set
- * up during machine init; watched is under the BQL.
+ * the main loop (ack_bh).  listeners and cpu are set up during machine
+ * init; watched and watched_sync are under the BQL.
  */
 struct Tc4xIr {
     SysBusDevice parent_obj;
@@ -65,8 +65,7 @@ struct Tc4xIr {
 
     qemu_irq *src_in;
     unsigned long watched[BITS_TO_LONGS(TC4X_IR_NUM_SRC)];
-    Tc4xIrWatchFn watch_fn;
-    void *watch_opaque;
+    unsigned long watched_sync[BITS_TO_LONGS(TC4X_IR_NUM_SRC)];
 };
 
 static unsigned src_index(uint32_t src)
@@ -243,20 +242,25 @@ static void ir_ack(void *opaque, uint32_t core, uint32_t prio)
     }
 }
 
-void tc4x_ir_set_watch_fn(Tc4xIr *ir, Tc4xIrWatchFn fn, void *opaque)
+/* SRC writes are under the BQL already */
+static bool tc4x_ir_sim_watch(Tc4xSimCommands *obj, uint32_t addr,
+                              Tc4xSimWatch mode, Error **errp)
 {
-    ir->watch_fn = fn;
-    ir->watch_opaque = opaque;
-}
+    Tc4xIr *ir = TC4X_IR(obj);
+    unsigned n = src_index(addr);
 
-void tc4x_ir_watch(Tc4xIr *ir, uint32_t src, bool on)
-{
-    assert(tc4x_ir_is_src(src));
-    if (on) {
-        set_bit(src_index(src), ir->watched);
+    assert(tc4x_ir_is_src(addr));
+    if (mode == TC4X_SIM_WATCH_OFF) {
+        clear_bit(n, ir->watched);
     } else {
-        clear_bit(src_index(src), ir->watched);
+        set_bit(n, ir->watched);
     }
+    if (mode == TC4X_SIM_WATCH_SYNC) {
+        set_bit(n, ir->watched_sync);
+    } else {
+        clear_bit(n, ir->watched_sync);
+    }
+    return true;
 }
 
 static MemTxResult ir_read(void *opaque, hwaddr off, uint64_t *data,
@@ -288,22 +292,24 @@ static MemTxResult ir_write(void *opaque, hwaddr off, uint64_t val64,
     BQL_LOCK_GUARD();
     val = deposit32(qatomic_read(&ir->src[n]), (off & 3) * 8, size * 8,
                     val64);
-    if (test_bit(n, ir->watched) && ir->watch_fn) {
-        ir->watch_fn(ir->watch_opaque, src_addr(n), val, size);
+    WITH_QEMU_LOCK_GUARD(&ir->lock) {
+        v = (ir->src[n] & ~SRC_WRITABLE) | (val & SRC_WRITABLE);
+        if (val & R_SRC_SRCR_IOVCLR_MASK) {
+            v &= ~R_SRC_SRCR_IOV_MASK;
+        }
+        qatomic_set(&ir->src[n], v);
+        if (val & R_SRC_SRCR_SETR_MASK) {
+            ir_set_srr(ir, n, true);
+        } else if (val & R_SRC_SRCR_CLRR_MASK) {
+            ir_set_srr(ir, n, false);
+        } else {
+            ir_update(ir);
+        }
     }
-
-    QEMU_LOCK_GUARD(&ir->lock);
-    v = (ir->src[n] & ~SRC_WRITABLE) | (val & SRC_WRITABLE);
-    if (val & R_SRC_SRCR_IOVCLR_MASK) {
-        v &= ~R_SRC_SRCR_IOV_MASK;
-    }
-    qatomic_set(&ir->src[n], v);
-    if (val & R_SRC_SRCR_SETR_MASK) {
-        ir_set_srr(ir, n, true);
-    } else if (val & R_SRC_SRCR_CLRR_MASK) {
-        ir_set_srr(ir, n, false);
-    } else {
-        ir_update(ir);
+    if (test_bit(n, ir->watched)) {
+        tc4x_sim_watch_event(src_addr(n), val, size,
+                             test_bit(n, ir->watched_sync) ?
+                             TC4X_SIM_WATCH_SYNC : TC4X_SIM_WATCH_ON);
     }
     return MEMTX_OK;
 }
@@ -417,6 +423,7 @@ static void tc4x_ir_class_init(ObjectClass *oc, const void *data)
     rc->phases.hold = tc4x_ir_reset_hold;
     sc->commands = tc4x_ir_sim_commands;
     sc->run = tc4x_ir_sim_run;
+    sc->watch = tc4x_ir_sim_watch;
     device_class_set_props(dc, tc4x_ir_properties);
 }
 

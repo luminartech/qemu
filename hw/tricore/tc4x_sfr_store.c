@@ -89,7 +89,7 @@ struct Tc4xSfrStore {
     GHashTable *kresets;        /* RST_CTRLB addr -> const Tc4xKernelReset */
     GHashTable *write_hooks;    /* addr -> Tc4xSfrWriteHook */
     GHashTable *read_hooks;     /* addr -> Tc4xSfrReadHook */
-    GHashTable *watches;        /* addrs */
+    GHashTable *watches;        /* addr -> Tc4xSimWatch */
     GPtrArray *passthrough;     /* MemoryRegions that forward to the store */
 
     const Tc4xSfrModelOps *models;
@@ -344,10 +344,15 @@ void tc4x_sfr_store_add_passthrough(Tc4xSfrStore *st, MemoryRegion *mr)
     g_ptr_array_add(st->passthrough, mr);
 }
 
-void tc4x_sfr_store_watch(Tc4xSfrStore *st, uint32_t addr, bool on)
+/* Guest writes of a watched register take the BQL and report themselves */
+static bool tc4x_sfr_store_sim_watch(Tc4xSimCommands *obj, uint32_t addr,
+                                     Tc4xSimWatch mode, Error **errp)
 {
-    if (on) {
-        g_hash_table_add(st->watches, GUINT_TO_POINTER(addr));
+    Tc4xSfrStore *st = TC4X_SFR_STORE(obj);
+
+    if (mode != TC4X_SIM_WATCH_OFF) {
+        g_hash_table_insert(st->watches, GUINT_TO_POINTER(addr),
+                            GUINT_TO_POINTER(mode));
         sfr_set_bql_only(st, addr);
     } else {
         Tc4xSfrPage *pg = sfr_page(st, addr, false);
@@ -358,6 +363,7 @@ void tc4x_sfr_store_watch(Tc4xSfrStore *st, uint32_t addr, bool on)
             clear_bit_atomic(sfr_word(addr), pg->bql_only);
         }
     }
+    return true;
 }
 
 typedef struct SfrHotQuery {
@@ -526,6 +532,7 @@ void tc4x_sfr_store_access_write(Tc4xSfrStore *st, uint32_t addr, uint64_t val,
     uint32_t word_addr = addr & ~3u;
     uint32_t shift = (addr & 3) * 8;
     uint32_t word = val;
+    Tc4xSimWatch watch;
     MemTxAttrs outer;
 
     if (size == 4 && !(addr & 3)) {
@@ -554,13 +561,15 @@ void tc4x_sfr_store_access_write(Tc4xSfrStore *st, uint32_t addr, uint64_t val,
             word |= others & m->w0c;
         }
     }
-    if (g_hash_table_contains(st->watches, GUINT_TO_POINTER(word_addr))) {
-        st->models->watched(st->models_opaque, word_addr, word, size);
-    }
+    watch = GPOINTER_TO_UINT(g_hash_table_lookup(st->watches,
+                                                 GUINT_TO_POINTER(word_addr)));
     outer = st->hook_attrs;
     st->hook_attrs = attrs;
     sfr_write_locked(st, word_addr, word);
     st->hook_attrs = outer;
+    if (watch != TC4X_SIM_WATCH_OFF) {
+        tc4x_sim_watch_event(word_addr, word, size, watch);
+    }
 }
 
 static MemTxResult sfr_read(Tc4xSfrStore *st, uint32_t addr, uint64_t *data,
@@ -675,16 +684,10 @@ static bool sfr_no_write(void *opaque, uint32_t addr, uint32_t *val)
     return false;
 }
 
-static void sfr_no_watched(void *opaque, uint32_t addr, uint32_t val,
-                           unsigned size)
-{
-}
-
 static const Tc4xSfrModelOps tc4x_sfr_plain_models = {
     .read_lockless = sfr_no_read_lockless,
     .read = sfr_no_read,
     .write = sfr_no_write,
-    .watched = sfr_no_watched,
 };
 
 static void tc4x_sfr_store_init(Object *obj)
@@ -764,6 +767,7 @@ static void tc4x_sfr_store_class_init(ObjectClass *oc, const void *data)
     rc->phases.hold = tc4x_sfr_store_reset_hold;
     sc->commands = tc4x_sfr_store_sim_commands;
     sc->run = tc4x_sfr_store_sim_run;
+    sc->watch = tc4x_sfr_store_sim_watch;
     device_class_set_props(dc, tc4x_sfr_store_properties);
 }
 

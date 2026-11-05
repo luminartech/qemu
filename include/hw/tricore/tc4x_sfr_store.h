@@ -98,8 +98,6 @@ Object *tc4x_sfr_store_owner(Tc4xSfrStore *st, uint32_t addr);
  */
 void tc4x_sfr_store_add_passthrough(Tc4xSfrStore *st, MemoryRegion *mr);
 
-/* Report guest writes of @addr to the models' watched() (on) or stop */
-void tc4x_sfr_store_watch(Tc4xSfrStore *st, uint32_t addr, bool on);
 
 /*
  * Append "hot ADDR READS VALUE" lines for the registers read at least @min
@@ -170,8 +168,6 @@ typedef struct Tc4xSfrModelOps {
      * stores *@val, which the model may change
      */
     bool (*write)(void *opaque, uint32_t addr, uint32_t *val);
-    /* a write of a watched register, before it takes effect */
-    void (*watched)(void *opaque, uint32_t addr, uint32_t val, unsigned size);
 } Tc4xSfrModelOps;
 
 void tc4x_sfr_store_set_models(Tc4xSfrStore *st, const Tc4xSfrModelOps *ops,

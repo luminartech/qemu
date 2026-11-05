@@ -41,6 +41,13 @@ DECLARE_CLASS_CHECKERS(Tc4xSimCommandsClass, TC4X_SIM_COMMANDS,
 
 typedef struct Tc4xSimCommands Tc4xSimCommands;
 
+/* How a client watches guest writes of a register */
+typedef enum Tc4xSimWatch {
+    TC4X_SIM_WATCH_OFF,
+    TC4X_SIM_WATCH_ON,      /* an event per write */
+    TC4X_SIM_WATCH_SYNC,    /* and the writing core waits for the client */
+} Tc4xSimWatch;
+
 struct Tc4xSimCommandsClass {
     InterfaceClass parent_class;
 
@@ -53,6 +60,13 @@ struct Tc4xSimCommandsClass {
      * appended, to leave the line to the next object that serves the word.
      */
     bool (*run)(Tc4xSimCommands *obj, int argc, char **argv, GString *out);
+    /*
+     * Optional, for an object that owns registers: report guest writes of
+     * the register at @addr with tc4x_sim_watch_event() as @mode says, or
+     * fail with @errp.  Main loop, BQL held.
+     */
+    bool (*watch)(Tc4xSimCommands *obj, uint32_t addr, Tc4xSimWatch mode,
+                  Error **errp);
 };
 
 /*
@@ -71,6 +85,21 @@ bool tc4x_sim_parse_double(const char *arg, double *val);
  * Called with the BQL held, from any thread.
  */
 void G_GNUC_PRINTF(1, 2) tc4x_sim_event(const char *fmt, ...);
+
+/*
+ * A guest write of @val (the 32-bit word written, @size bytes of it new)
+ * to the register at @addr, which a client watches with @mode: the event
+ * "ev w ADDR VAL SIZE CPU" (CPU -1: not a core).  With
+ * TC4X_SIM_WATCH_SYNC on a vCPU thread the event ends in "sync ID" and the
+ * core stops at the end of its translation block, which a precise access
+ * ends (always under -icount), and waits outside cpu_exec with the BQL
+ * dropped until the client sends "ack ID", the VM stops or the client goes
+ * away; the core therefore sees the client's answer to the write before
+ * its next instruction.  Called once the write took effect, with the BQL
+ * held.
+ */
+void tc4x_sim_watch_event(uint32_t addr, uint32_t val, unsigned size,
+                          Tc4xSimWatch mode);
 
 /*
  * Run one command line (empty lines and lines starting with '#' do

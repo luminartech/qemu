@@ -11,6 +11,7 @@
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
 #include "qemu/main-loop.h"
+#include "qemu/queue.h"
 #include "qapi/error.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -19,6 +20,7 @@
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/runstate.h"
+#include "hw/core/cpu.h"
 #include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_sim_bridge.h"
 #include "tc4x_soc.h"
@@ -31,12 +33,21 @@ typedef struct Tc4xSimLegacyCommand {
     Tc4xSoc *qspi_lock;     /* runs under the QSPI bus locks of this SoC */
 } Tc4xSimLegacyCommand;
 
+/* A core held by a synchronous watch event until "ack id" */
+typedef struct Tc4xSimWaiter {
+    uint64_t id;
+    CPUState *cpu;
+    bool released;
+    QLIST_ENTRY(Tc4xSimWaiter) next;
+} Tc4xSimWaiter;
+
 /* Everything under the BQL */
 struct Tc4xSimBridge {
     DeviceState parent_obj;
 
     CharFrontend chr;
     Tc4xSoc *soc;
+    bool connected;         /* a client is there */
 
     GString *line;          /* received, up to its newline */
     MemTxAttrs attrs;       /* the bus master of r and w */
@@ -44,6 +55,8 @@ struct Tc4xSimBridge {
     GHashTable *servers;
     bool servers_found;
     GArray *legacy;         /* Tc4xSimLegacyCommand */
+    uint64_t last_sync;     /* ID of the last synchronous event */
+    QLIST_HEAD(, Tc4xSimWaiter) waiters;
 };
 
 static Tc4xSimBridge *sim_bridge;
@@ -93,6 +106,60 @@ void tc4x_sim_event(const char *fmt, ...)
     line = g_strdup_printf("ev %s\n", text);
     qemu_chr_fe_write_all(&sim_bridge->chr, (const uint8_t *)line,
                           strlen(line));
+}
+
+/*
+ * Work of a core that wrote a synchronously watched register, run on its
+ * thread outside cpu_exec before its next translation block: wait for the
+ * ack with the BQL dropped
+ */
+static void sim_wait_ack(CPUState *cpu, run_on_cpu_data data)
+{
+    Tc4xSimWaiter *w = data.host_ptr;
+
+    /* a kick (vm stop, reset, quit) broadcasts halt_cond too */
+    while (!w->released && !qatomic_read(&cpu->stop)) {
+        qemu_cond_wait_bql(cpu->halt_cond);
+    }
+    if (!w->released) {
+        QLIST_REMOVE(w, next);
+    }
+    g_free(w);
+}
+
+void tc4x_sim_watch_event(uint32_t addr, uint32_t val, unsigned size,
+                          Tc4xSimWatch mode)
+{
+    Tc4xSimBridge *b = sim_bridge;
+    CPUState *cpu = current_cpu;
+    Tc4xSimWaiter *w;
+
+    assert(bql_locked());
+    if (mode != TC4X_SIM_WATCH_SYNC || !b || !b->connected || !cpu ||
+        !qemu_cpu_is_self(cpu) || qatomic_read(&cpu->stop)) {
+        tc4x_sim_event("w 0x%08x 0x%08x %u %d", addr, val, size,
+                       cpu ? cpu->cpu_index : -1);
+        return;
+    }
+    w = g_new0(Tc4xSimWaiter, 1);
+    w->id = ++b->last_sync;
+    w->cpu = cpu;
+    QLIST_INSERT_HEAD(&b->waiters, w, next);
+    tc4x_sim_event("w 0x%08x 0x%08x %u %d sync %" PRIu64, addr, val, size,
+                   cpu->cpu_index, w->id);
+    /*
+     * Queued work makes the core leave cpu_exec at the end of the
+     * translation block, which a precise access ends, and waits there:
+     * not inside the MMIO dispatch or the RCU read-side section
+     */
+    async_run_on_cpu(cpu, sim_wait_ack, RUN_ON_CPU_HOST_PTR(w));
+}
+
+static void sim_release(Tc4xSimWaiter *w)
+{
+    QLIST_REMOVE(w, next);
+    w->released = true;
+    qemu_cond_broadcast(w->cpu->halt_cond);
 }
 
 /* The reply line of an error, on one line */
@@ -276,6 +343,27 @@ static void sim_vmcont(Tc4xSimBridge *b, int argc, char **argv,
     g_string_append(out, "ok\n");
 }
 
+/* ack ID: the core waiting since the event "sync ID" goes on */
+static void sim_ack(Tc4xSimBridge *b, int argc, char **argv, GString *out)
+{
+    Tc4xSimWaiter *w;
+    uint64_t id;
+
+    if (argc != 2 || !tc4x_sim_parse_uint(argv[1], UINT64_MAX, &id)) {
+        g_string_append(out, "err usage: ack ID\n");
+        return;
+    }
+    QLIST_FOREACH(w, &b->waiters, next) {
+        if (w->id == id) {
+            sim_release(w);
+            g_string_append(out, "ok\n");
+            return;
+        }
+    }
+    g_string_append_printf(out, "err no core waits for ack %" PRIu64 "\n",
+                           id);
+}
+
 static const struct {
     const char *name;
     void (*fn)(Tc4xSimBridge *b, int argc, char **argv, GString *out);
@@ -287,6 +375,7 @@ static const struct {
     { "set", sim_set },
     { "vmstop", sim_vmstop },
     { "vmcont", sim_vmcont },
+    { "ack", sim_ack },
 };
 
 static int sim_add_servers(Object *obj, void *opaque)
@@ -486,8 +575,20 @@ static void sim_chr_event(void *opaque, QEMUChrEvent event)
 {
     Tc4xSimBridge *b = opaque;
 
-    if (event == CHR_EVENT_CLOSED) {
+    switch (event) {
+    case CHR_EVENT_OPENED:
+        b->connected = true;
+        break;
+    case CHR_EVENT_CLOSED:
+        /* no one acknowledges what waits */
+        b->connected = false;
         g_string_truncate(b->line, 0);
+        while (!QLIST_EMPTY(&b->waiters)) {
+            sim_release(QLIST_FIRST(&b->waiters));
+        }
+        break;
+    default:
+        break;
     }
 }
 
@@ -508,6 +609,7 @@ static void tc4x_sim_bridge_realize(DeviceState *dev, Error **errp)
                                        (GDestroyNotify)g_ptr_array_unref);
     b->legacy = g_array_new(false, false, sizeof(Tc4xSimLegacyCommand));
     b->attrs = tc4x_master_attrs(TC4X_MASTER_DEBUG, false);
+    QLIST_INIT(&b->waiters);
     qemu_chr_fe_set_handlers(&b->chr, sim_can_receive, sim_receive,
                              sim_chr_event, NULL, b, NULL, true);
     sim_bridge = b;

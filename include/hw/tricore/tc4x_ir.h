@@ -52,13 +52,4 @@ typedef void (*Tc4xIrAckFn)(void *opaque, uint32_t src);
 void tc4x_ir_add_ack_listener(Tc4xIr *ir, uint32_t src, Tc4xIrAckFn fn,
                               void *opaque);
 
-/*
- * Guest writes of the SRC register at @src call @fn before they take effect
- * (@on), or no longer (!@on).  One @fn for all watched registers.
- */
-typedef void (*Tc4xIrWatchFn)(void *opaque, uint32_t src, uint32_t val,
-                              unsigned size);
-void tc4x_ir_set_watch_fn(Tc4xIr *ir, Tc4xIrWatchFn fn, void *opaque);
-void tc4x_ir_watch(Tc4xIr *ir, uint32_t src, bool on);
-
 #endif

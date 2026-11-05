@@ -1025,18 +1025,10 @@ static bool soc_sfr_write(void *opaque, uint32_t addr, uint32_t *val)
     return false;
 }
 
-static void soc_sfr_watched(void *opaque, uint32_t addr, uint32_t val,
-                            unsigned size)
-{
-    tc4x_sim_event("w 0x%08x 0x%08x %u %d", addr, val, size,
-                   current_cpu ? current_cpu->cpu_index : -1);
-}
-
 static const Tc4xSfrModelOps soc_sfr_models = {
     .read_lockless = soc_sfr_read_lockless,
     .read = soc_sfr_read,
     .write = soc_sfr_write,
-    .watched = soc_sfr_watched,
 };
 
 void tc4x_sfr_add_write_hook(Tc4xSoc *s, uint32_t addr, Tc4xSfrWriteFn fn,
@@ -1095,9 +1087,40 @@ static void soc_cores(Tc4xSoc *s, GString *out)
 }
 
 /*
+ * watch ADDR [sync], unwatch ADDR: through the register's owner, the
+ * store or a device that implements the watch method
+ */
+static void soc_watch(Tc4xSoc *s, uint32_t addr, Tc4xSimWatch mode,
+                      GString *out)
+{
+    Object *owner = tc4x_sfr_store_owner(s->sfr, addr & ~3u);
+    Tc4xSimCommandsClass *k;
+    Error *err = NULL;
+
+    if (!owner) {
+        owner = OBJECT(s->sfr);
+    }
+    k = object_dynamic_cast(owner, TYPE_TC4X_SIM_COMMANDS) ?
+        TC4X_SIM_COMMANDS_GET_CLASS(owner) : NULL;
+    if (!k || !k->watch) {
+        g_autofree char *path = object_get_canonical_path(owner);
+
+        g_string_append_printf(out, "err 0x%08x owned by %s, which does "
+                               "not report writes\n", addr, path);
+        return;
+    }
+    if (!k->watch(TC4X_SIM_COMMANDS(owner), addr & ~3u, mode, &err)) {
+        g_string_append_printf(out, "err %s\n", error_get_pretty(err));
+        error_free(err);
+        return;
+    }
+    g_string_append(out, "ok\n");
+}
+
+/*
  * poke ADDR VAL, force ADDR VAL [MASK], unforce ADDR: stored values of
- * the store's registers; watch ADDR, unwatch ADDR: report guest writes;
- * cores: the state of the cores
+ * the store's registers; watch ADDR [sync], unwatch ADDR: report guest
+ * writes; cores: the state of the cores
  */
 static bool soc_sim_run(Tc4xSimCommands *obj, int argc, char **argv,
                         GString *out)
@@ -1105,7 +1128,7 @@ static bool soc_sim_run(Tc4xSimCommands *obj, int argc, char **argv,
     Tc4xSoc *s = TC4X_SOC(obj);
     const char *cmd = argv[0];
     uint64_t addr = 0, val = 0, mask = UINT32_MAX;
-    bool ok;
+    bool ok, sync = false;
 
     if (!strcmp(cmd, "cores")) {
         if (argc != 1) {
@@ -1120,28 +1143,27 @@ static bool soc_sim_run(Tc4xSimCommands *obj, int argc, char **argv,
     } else if (!strcmp(cmd, "force")) {
         ok = argc == 3 || (argc == 4 &&
                            tc4x_sim_parse_uint(argv[3], UINT32_MAX, &mask));
+    } else if (!strcmp(cmd, "watch")) {
+        sync = argc == 3 && !strcmp(argv[2], "sync");
+        ok = argc == 2 || sync;
     } else {
-        ok = argc == 2;     /* unforce, watch, unwatch */
+        ok = argc == 2;     /* unforce, unwatch */
     }
     ok = ok && tc4x_sim_parse_uint(argv[1], UINT32_MAX, &addr) &&
-         (argc < 3 || tc4x_sim_parse_uint(argv[2], UINT32_MAX, &val));
+         (argc < 3 || sync ||
+          tc4x_sim_parse_uint(argv[2], UINT32_MAX, &val));
     if (!ok) {
         g_string_append_printf(out, "err usage: %s ADDR%s\n", cmd,
                                !strcmp(cmd, "poke") ? " VAL" :
-                               !strcmp(cmd, "force") ? " VAL [MASK]" : "");
+                               !strcmp(cmd, "force") ? " VAL [MASK]" :
+                               !strcmp(cmd, "watch") ? " [sync]" : "");
         return true;
     }
 
     if (!strcmp(cmd, "watch") || !strcmp(cmd, "unwatch")) {
-        bool on = !strcmp(cmd, "watch");
-
-        if (tc4x_ir_is_src(addr)) {
-            tc4x_ir_watch(s->ir, addr & ~3u, on);
-        } else if (sim_store_backed(s, addr, out)) {
-            tc4x_sfr_store_watch(s->sfr, addr & ~3u, on);
-        } else {
-            return true;
-        }
+        soc_watch(s, addr, !strcmp(cmd, "unwatch") ? TC4X_SIM_WATCH_OFF :
+                  sync ? TC4X_SIM_WATCH_SYNC : TC4X_SIM_WATCH_ON, out);
+        return true;
     } else if (!sim_store_backed(s, addr, out)) {
         return true;
     } else if (!strcmp(cmd, "poke")) {
@@ -1420,7 +1442,6 @@ static bool tc4x_soc_add_ir(Tc4xSoc *s, Error **errp)
         return false;
     }
     s->ir = TC4X_IR(dev);
-    tc4x_ir_set_watch_fn(s->ir, soc_sfr_watched, s);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, TC4X_IR_SRC_BASE);
     return true;
 }
