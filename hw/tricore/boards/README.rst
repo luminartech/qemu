@@ -20,7 +20,21 @@ A board directory holds a ``meson.build`` that adds its sources to
 
   tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('myboard.c'))
 
-and C sources that register one or more QOM types derived from
+The include path has ``hw/tricore/boards``, so a board source includes
+the board's headers as ``NAME/path`` (``"myboard/sensor.h"``); no board
+header can then shadow a header of the tree.
+
+A board directory may hold a ``trace-events`` file
+(``docs/devel/tracing.rst``).  Its events belong to the group
+``hw_tricore_boards_NAME``; the board's sources include the generated
+header through a ``trace.h`` in the board directory (``"trace.h"`` from
+a source next to it, ``"myboard/trace.h"`` from a subdirectory):
+
+.. code-block:: c
+
+  #include "trace/trace-hw_tricore_boards_myboard.h"
+
+It also holds C sources that register one or more QOM types derived from
 ``TYPE_TC4X_BOARD``, named ``TC4X_BOARD_TYPE_NAME("NAME")`` so that
 ``-M tc4x,board=NAME`` selects them.  The board code follows the QEMU
 coding style and uses the SoC services of ``include/hw/tricore/tc4x.h``

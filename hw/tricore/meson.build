@@ -18,7 +18,14 @@ tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_pacer.c'))
 tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_sim_bridge.c'))
 tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_kit.c'))
 
-# Board extensions: each hw/tricore/boards/NAME adds its files to tricore_ss
+# Board extensions: each hw/tricore/boards/NAME adds its files to tricore_ss.
+# The include path has hw/tricore/boards, not the board directories: board
+# sources include their headers as "NAME/...", and no board header can
+# shadow one that another source of tricore_ss includes.
+if get_option('tc4x_boards').length() > 0
+  tricore_ss.add(when: 'CONFIG_TC4X', if_true: declare_dependency(
+    include_directories: include_directories('boards')))
+endif
 foreach board : get_option('tc4x_boards')
   subdir('boards' / board)
 endforeach

@@ -3671,6 +3671,12 @@ if have_system
     'ui',
     'hw/remote',
   ]
+  # TC4x board extensions (hw/tricore/boards) with trace events of their own
+  foreach board : get_option('tc4x_boards')
+    if fs.is_file('hw/tricore/boards' / board / 'trace-events')
+      trace_events_subdirs += [ 'hw/tricore/boards' / board ]
+    endif
+  endforeach
 endif
 if have_system or have_user
   trace_events_subdirs += [
