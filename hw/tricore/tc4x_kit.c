@@ -31,6 +31,7 @@
 #include "hw/tricore/tc4x_board.h"
 #include "hw/tricore/tc4x_machine.h"
 #include "hw/tricore/tc4x_sim_bridge.h"
+#include "migration/vmstate.h"
 #include "system/reset.h"
 #include "trace.h"
 
@@ -223,6 +224,11 @@ static void kit_phy_init(Object *obj)
     KIT_PHY(obj)->cable = true;
 }
 
+static const VMStateDescription vmstate_kit_phy = {
+    .name = TYPE_KIT_PHY,
+    .unmigratable = 1,
+};
+
 static void kit_phy_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -231,6 +237,7 @@ static void kit_phy_class_init(ObjectClass *oc, const void *data)
 
     dc->desc = "TI DP83825I Ethernet PHY of the TC4D7 lite kit";
     dc->user_creatable = false;
+    dc->vmsd = &vmstate_kit_phy;
     rc->phases.hold = kit_phy_reset_hold;
     pc->read22 = kit_phy_read22;
     pc->write22 = kit_phy_write22;

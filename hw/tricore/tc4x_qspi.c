@@ -585,9 +585,18 @@ static void tc4x_qspi_peripheral_realize(SSIPeripheral *s, Error **errp)
 {
 }
 
+/* Inherited by the peripherals: one that migrates its state sets its own */
+static const VMStateDescription vmstate_tc4x_qspi_peripheral = {
+    .name = TYPE_TC4X_QSPI_PERIPHERAL,
+    .unmigratable = 1,
+};
+
 static void tc4x_qspi_peripheral_class_init(ObjectClass *oc, const void *data)
 {
+    DeviceClass *dc = DEVICE_CLASS(oc);
     SSIPeripheralClass *sc = SSI_PERIPHERAL_CLASS(oc);
+
+    dc->vmsd = &vmstate_tc4x_qspi_peripheral;
 
     sc->realize = tc4x_qspi_peripheral_realize;
     sc->cs_polarity = SSI_CS_LOW;

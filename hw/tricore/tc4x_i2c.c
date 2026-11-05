@@ -515,6 +515,11 @@ static uint8_t tc4x_i2c_legacy_recv(I2CSlave *s)
     return data;
 }
 
+static const VMStateDescription vmstate_tc4x_i2c_legacy = {
+    .name = TYPE_TC4X_I2C_LEGACY,
+    .unmigratable = 1,
+};
+
 static void tc4x_i2c_legacy_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -523,6 +528,7 @@ static void tc4x_i2c_legacy_class_init(ObjectClass *oc, const void *data)
     dc->desc = "TC4x board I2C slave (Tc4xI2cSlaveOps)";
     /* created by tc4x_i2c_attach() */
     dc->user_creatable = false;
+    dc->vmsd = &vmstate_tc4x_i2c_legacy;
     sc->event = tc4x_i2c_legacy_event;
     sc->send = tc4x_i2c_legacy_send;
     sc->recv = tc4x_i2c_legacy_recv;

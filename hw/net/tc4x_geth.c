@@ -43,6 +43,7 @@
 #include "hw/core/qdev-properties-system.h"
 #include "hw/net/tc4x_geth.h"
 #include "hw/tricore/tc4x_master.h"
+#include "migration/vmstate.h"
 #include "net/net.h"
 #include "net/eth.h"
 #include "net/checksum.h"
@@ -1461,6 +1462,11 @@ static const Property geth_properties[] = {
     DEFINE_PROP_UINT8("phy1-addr", Tc4xGethState, port[1].phy_addr, 0),
 };
 
+static const VMStateDescription vmstate_tc4x_geth = {
+    .name = TYPE_TC4X_GETH,
+    .unmigratable = 1,
+};
+
 static void geth_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1468,6 +1474,7 @@ static void geth_class_init(ObjectClass *klass, const void *data)
 
     dc->desc = "TC4x GETH Ethernet controller";
     dc->realize = geth_realize;
+    dc->vmsd = &vmstate_tc4x_geth;
     rc->phases.hold = geth_reset_hold;
     device_class_set_props(dc, geth_properties);
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);

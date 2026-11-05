@@ -1740,6 +1740,11 @@ static const char *const soc_sim_commands[] = {
     "poke", "force", "unforce", "watch", "unwatch", "cores", NULL
 };
 
+static const VMStateDescription vmstate_tc4x_soc = {
+    .name = TYPE_TC4X_SOC,
+    .unmigratable = 1,
+};
+
 static void tc4x_soc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -1750,6 +1755,7 @@ static void tc4x_soc_class_init(ObjectClass *oc, const void *data)
     dc->realize = tc4x_soc_realize;
     /* created by the tc4x machines only */
     dc->user_creatable = false;
+    dc->vmsd = &vmstate_tc4x_soc;
     rc->phases.hold = tc4x_soc_reset_hold;
     sc->commands = soc_sim_commands;
     sc->run = soc_sim_run;
