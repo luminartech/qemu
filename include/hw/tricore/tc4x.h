@@ -48,14 +48,20 @@ void tc4x_irq_raise(Tc4xSoc *soc, uint32_t src);
 /*
  * A slave on one chip select of a QSPI module.  BACONENTRY writes that
  * select it start a frame (@bacon: word length, bit order); every TX word
- * clocks one word in and its reply into the RX FIFO.  Called with the QSPI
- * lock held, from any thread: the ops must not take the BQL.
+ * clocks one word in and its reply into the RX FIFO.  Called with the
+ * module's bus lock held, from any thread: the ops must not take the BQL
+ * (the contract of TYPE_TC4X_QSPI_PERIPHERAL, tc4x_qspi.h).
  */
 typedef struct Tc4xQspiSlaveOps {
     void (*frame)(void *opaque, uint32_t bacon);
     uint32_t (*word)(void *opaque, uint32_t mosi);
 } Tc4xQspiSlaveOps;
 
+/*
+ * Attach a slave at chip select @cs of QSPI @module (a peripheral on the
+ * module's bus), replacing an attached slave there.  A chip select taken by
+ * another device ends QEMU with an error.  Machine init only.
+ */
 void tc4x_qspi_attach(Tc4xSoc *soc, unsigned module, unsigned cs,
                       const Tc4xQspiSlaveOps *ops, void *opaque);
 
@@ -65,7 +71,10 @@ void tc4x_qspi_attach(Tc4xSoc *soc, unsigned module, unsigned cs,
  */
 void tc4x_qspi_set_rx_fed(Tc4xSoc *soc, unsigned module, bool fed);
 
-/* The lock QSPI slaves run under, for board code that shares their state */
+/*
+ * The bus locks of all QSPI modules, which their slaves run under, for
+ * board code that shares their state (taken after the BQL)
+ */
 void tc4x_qspi_lock(Tc4xSoc *soc);
 void tc4x_qspi_unlock(Tc4xSoc *soc);
 
@@ -241,7 +250,7 @@ void tc4x_time_add_retime_notifier(Tc4xSoc *soc, Tc4xRetimeFn fn,
  * Sim-bridge and sfr-script commands whose name starts with @prefix.  @fn
  * returns false for a command it does not know, else appends its reply
  * lines (ending in "ok ..." or "err ...") to @out.  With @qspi_lock the
- * command runs under the QSPI lock (it touches QSPI slave state).
+ * command runs under the QSPI bus locks (it touches QSPI slave state).
  */
 typedef bool (*Tc4xSimCommandFn)(void *opaque, int argc, char **argv,
                                  GString *out);

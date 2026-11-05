@@ -18,3 +18,4 @@ config TC4X
     depends on TRICORE
     select TC4X_GETH
     select I2C
+    select SSI

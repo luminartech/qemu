@@ -12,6 +12,7 @@ tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_timebase.c'))
 tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_gpio.c'))
 tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_adc.c'))
 tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_i2c.c'))
+tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_qspi.c'))
 tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_pacer.c'))
 tricore_ss.add(when: 'CONFIG_TC4X', if_true: files('tc4x_kit.c'))
 

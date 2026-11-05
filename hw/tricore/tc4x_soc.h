@@ -1,6 +1,6 @@
 /*
  * Internals shared by the tc4x SoC models (tc4x.c, tc4x_gpio.c, tc4x_adc.c,
- * tc4x_i2c.c) and the tc4x machines.
+ * tc4x_i2c.c, tc4x_qspi.c) and the tc4x machines.
  *
  * Copyright (c) 2026 MicroVision, Inc.
  *
@@ -14,6 +14,7 @@
 #include "hw/tricore/tc4x.h"
 #include "hw/tricore/tc4x_board.h"
 #include "hw/tricore/tc4x_i2c.h"
+#include "hw/tricore/tc4x_qspi.h"
 
 #define TC4X_NUM_CORES      7           /* CPU0..5 and CPUcs (core 6) */
 #define TC4X_CORE_RAM_SIZE  (2 * MiB)       /* DSPR + PSPR (at +1 MiB) */
@@ -40,6 +41,8 @@ uint32_t tc4x_reg_cmpxchg(Tc4xSoc *soc, uint32_t addr, uint32_t old,
 Tc4xAdc *tc4x_soc_adc(Tc4xSoc *soc);
 /* I2C controller @n (below TC4X_I2C_COUNT) */
 Tc4xI2c *tc4x_soc_i2c(Tc4xSoc *soc, unsigned n);
+/* QSPI module @n (below TC4X_QSPI_COUNT) */
+Tc4xQspi *tc4x_soc_qspi(Tc4xSoc *soc, unsigned n);
 
 /* Add register write semantics and kernel resets, replacing earlier ones */
 void tc4x_soc_add_semantics(Tc4xSoc *soc, const Tc4xRegSemantics *sem,
