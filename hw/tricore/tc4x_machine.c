@@ -225,6 +225,9 @@ static void tc4x_init(MachineState *ms)
         }
         tc4x_add_shm_ram(m, "lmu", "lmu-memdev", TC4X_LMU_SIZE);
     }
+    if (bc->wire) {
+        bc->wire(m->board, m->soc);
+    }
     qdev_realize_and_unref(dev, NULL, &error_fatal);
     qemu_register_resettable(OBJECT(dev));
 

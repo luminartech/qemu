@@ -1345,10 +1345,8 @@ void tc4x_geth_attach_phy(DeviceState *dev, unsigned port, uint8_t addr,
     p->phy_opaque = opaque;
 }
 
-DeviceState *tc4x_geth_create(MemoryRegion *sysmem)
+void tc4x_geth_configure_nics(DeviceState *dev)
 {
-    DeviceState *dev = qdev_new(TYPE_TC4X_GETH);
-    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     NICInfo *nd;
 
     qemu_configure_nic_device(dev, true, NULL);
@@ -1360,10 +1358,4 @@ DeviceState *tc4x_geth_create(MemoryRegion *sysmem)
         }
         nd->instantiated = 1;
     }
-    sysbus_realize_and_unref(sbd, &error_fatal);
-    memory_region_add_subregion_overlap(sysmem, TC4X_GETH_BASE,
-                                        sysbus_mmio_get_region(sbd, 0), 1);
-    memory_region_add_subregion_overlap(sysmem, TC4X_HSPHY_BASE,
-                                        sysbus_mmio_get_region(sbd, 1), 1);
-    return dev;
 }

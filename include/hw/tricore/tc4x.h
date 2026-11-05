@@ -91,6 +91,12 @@ void tc4x_qspi_set_rx_fed(Tc4xSoc *soc, unsigned module, bool fed);
 void tc4x_qspi_lock(Tc4xSoc *soc);
 void tc4x_qspi_unlock(Tc4xSoc *soc);
 
+/*
+ * GETH0 (TYPE_TC4X_GETH): machine init sets its PHY and port backend links
+ * before the SoC realizes
+ */
+DeviceState *tc4x_soc_geth(Tc4xSoc *soc);
+
 /* Attach a PHY at MDIO address @addr of GETH0 @port (see tc4x_geth.h) */
 void tc4x_geth_attach(Tc4xSoc *soc, unsigned port, uint8_t addr,
                       const Tc4xGethPhyOps *ops, void *opaque);

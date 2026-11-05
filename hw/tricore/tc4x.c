@@ -1460,17 +1460,34 @@ void tc4x_soc_boot(Tc4xSoc *s, uint32_t entry)
     }
 }
 
-/* GETH0 lines 0..15 -> SRC_GETH0_DMA0..15, 16 -> SRC_GETH0_INTR */
-static void tc4x_geth_init(Tc4xSoc *s, MemoryRegion *sysmem)
+/*
+ * GETH0 with the -nic configurations of its ports, over the store;
+ * lines 0..15 -> SRC_GETH0_DMA0..15, 16 -> SRC_GETH0_INTR
+ */
+static bool tc4x_soc_add_geth(Tc4xSoc *s, MemoryRegion *sysmem, Error **errp)
 {
-    s->geth = tc4x_geth_create(sysmem);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(s->geth);
+
+    tc4x_geth_configure_nics(s->geth);
+    if (!sysbus_realize(sbd, errp)) {
+        return false;
+    }
+    memory_region_add_subregion_overlap(sysmem, TC4X_GETH_BASE,
+                                        sysbus_mmio_get_region(sbd, 0), 1);
+    memory_region_add_subregion_overlap(sysmem, TC4X_HSPHY_BASE,
+                                        sysbus_mmio_get_region(sbd, 1), 1);
     for (int i = 0; i < TC4X_GETH_NUM_IRQ; i++) {
         uint32_t src = i == TC4X_GETH_IRQ_MAC ? A_SRC_GETH0_INTR :
                        A_SRC_GETH0_DMA0 + 4 * i;
 
-        sysbus_connect_irq(SYS_BUS_DEVICE(s->geth), i,
-                           tc4x_ir_src(s->ir, src));
+        sysbus_connect_irq(sbd, i, tc4x_ir_src(s->ir, src));
     }
+    return true;
+}
+
+DeviceState *tc4x_soc_geth(Tc4xSoc *s)
+{
+    return s->geth;
 }
 
 void tc4x_geth_attach(Tc4xSoc *s, unsigned port, uint8_t addr,
@@ -1809,7 +1826,9 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
     s->bridge_time_request = tc4x_timebase_new_request(s->timebase);
     s->bridge_attrs = tc4x_master_attrs(TC4X_MASTER_DEBUG, false);
     tc4x_force_soc_status(s);
-    tc4x_geth_init(s, sysmem);
+    if (!tc4x_soc_add_geth(s, sysmem, errp)) {
+        return;
+    }
 
     qemu_chr_fe_set_handlers(&s->uart, uart_can_receive, uart_receive, NULL,
                              NULL, s, NULL, true);
@@ -1848,6 +1867,10 @@ static void tc4x_soc_init(Object *obj)
     Tc4xSoc *s = TC4X_SOC(obj);
 
     object_initialize_child(obj, "flash", &s->flash, TYPE_TC4X_FLASH);
+    /* created here so that board code can link its PHYs before realize */
+    s->geth = qdev_new(TYPE_TC4X_GETH);
+    object_property_add_child(obj, "geth", OBJECT(s->geth));
+    object_unref(OBJECT(s->geth));
     object_property_add_alias(obj, "pflash", OBJECT(&s->flash), "pflash");
     object_property_add_alias(obj, "dflash", OBJECT(&s->flash), "dflash");
     /* set by board code after the SoC is realized */

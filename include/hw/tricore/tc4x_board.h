@@ -45,6 +45,11 @@ struct Tc4xBoardClass {
     size_t n_reg_semantics;
     const Tc4xKernelReset *kernel_resets;
     size_t n_kernel_resets;
+    /*
+     * Before the SoC realizes: creates the board devices that SoC devices
+     * link to and sets those links (tc4x_soc_geth())
+     */
+    void (*wire)(Tc4xBoard *board, Tc4xSoc *soc);
     /* Adds the board code, at the end of machine init before the sfr-script */
     void (*init)(Tc4xBoard *board, Tc4xSoc *soc);
     /*

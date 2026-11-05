@@ -49,11 +49,10 @@ typedef struct Tc4xGethPhyOps {
 #define TC4X_GETH_NUM_IRQ     (TC4X_GETH_IRQ_MAC + 1)
 
 /*
- * Create and realize GETH0 with the -nic configurations of models
- * "tc4x-geth" (port 0) and "tc4x-geth-port1" (port 1), and map it over
- * @sysmem with priority 1.
+ * Before realize: take the -nic configurations of models "tc4x-geth"
+ * (port 0) and "tc4x-geth-port1" (port 1)
  */
-DeviceState *tc4x_geth_create(MemoryRegion *sysmem);
+void tc4x_geth_configure_nics(DeviceState *dev);
 
 /*
  * Attach the PHY that board code wires to MDIO address @addr of @port.
