@@ -1,6 +1,6 @@
 /*
- * Services of the tc4x machine for board code: the code that adds what
- * sits around the SoC on one board.
+ * Services of the tc4x SoC (TYPE_TC4X_SOC) for board code: the code that
+ * adds what sits around the SoC on one board.
  *
  * Unless noted otherwise, a function runs in the main loop with the BQL
  * held.  "Any thread" functions may also run on a vCPU thread without the
@@ -14,9 +14,11 @@
 #ifndef HW_TRICORE_TC4X_H
 #define HW_TRICORE_TC4X_H
 
+#include "qom/object.h"
 #include "hw/net/tc4x_geth.h"
 
-typedef struct Tc4xSoc Tc4xSoc;
+#define TYPE_TC4X_SOC "tc4x-soc"
+OBJECT_DECLARE_SIMPLE_TYPE(Tc4xSoc, TC4X_SOC)
 
 /* Stored value of the SFR at @addr (any thread) */
 uint32_t tc4x_reg_get(Tc4xSoc *soc, uint32_t addr);

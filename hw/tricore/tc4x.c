@@ -1,5 +1,5 @@
 /*
- * Infineon AURIX TC4Dx machine: six TriCore 1.8 cores, their scratchpad
+ * Infineon AURIX TC4Dx SoC: six TriCore 1.8 cores, their scratchpad
  * RAMs, the LMU and the flashes, and the on-chip peripherals on top of a
  * sparse SFR register file.
  *
@@ -29,12 +29,15 @@
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
+#include "qom/object_interfaces.h"
 #include "chardev/char-fe.h"
 #include "system/system.h"
 #include "system/runstate.h"
 #include "system/reset.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "system/hostmem.h"
 #include "migration/vmstate.h"
 #include "elf.h"
 #include "cpu.h"
@@ -46,9 +49,13 @@
 #include "hw/tricore/tc4x_pacer.h"
 #include "tc4x_soc.h"
 
-#define TC4X_NUM_CORES      7           /* CPU0..5 and CPUcs (core 6) */
-#define TC4X_CORE_RAM_SIZE  (2 * MiB)       /* DSPR + PSPR (at +1 MiB) */
 #define TC4X_PSPR_OFFSET    (1 * MiB)
+/* CPUcs, core 6, lands in segment 1 */
+#define TC4X_CORE_RAM_BASE(c) (0x70000000u - (c) * 0x10000000u)
+#define TC4X_LMU_BASE       0x90000000u
+#define TC4X_LMU_NC_BASE    0xB0000000u
+#define TC4X_PFLASH_SIZE    (80 * MiB)
+#define TC4X_DFLASH_SIZE    (32 * MiB)
 #define TC4X_LOCAL_DSPR     0xD0000000u
 #define TC4X_LOCAL_PSPR     0xC0000000u
 
@@ -277,12 +284,9 @@
 #define TC4X_ACK_LISTENERS_MAX  8
 #define TC4X_RETIME_MAX         16
 
-#define TYPE_TC4X_MACHINE MACHINE_TYPE_NAME("tc4x")
-OBJECT_DECLARE_SIMPLE_TYPE(Tc4xSoc, TC4X_MACHINE)
-
 typedef struct Tc4xStmPage {
     MemoryRegion mr;
-    Tc4xSoc *machine;
+    Tc4xSoc *soc;
     uint32_t base;
 } Tc4xStmPage;
 
@@ -391,7 +395,9 @@ typedef struct Tc4xSimCommand {
 } Tc4xSimCommand;
 
 struct Tc4xSoc {
-    MachineState parent_obj;
+    DeviceState parent_obj;
+
+    char *cpu_type;
 
     TriCoreCPU *cpu[TC4X_NUM_CORES];
     MemoryRegion cpu_root[TC4X_NUM_CORES];
@@ -400,7 +406,13 @@ struct Tc4xSoc {
     MemoryRegion cpu_sys_alias[TC4X_NUM_CORES];
     MemoryRegion cpu_local_dspr[TC4X_NUM_CORES];
     MemoryRegion cpu_local_pspr[TC4X_NUM_CORES];
-    MemoryRegion core_ram[TC4X_NUM_CORES];
+    /* the core and LMU RAMs: own RAMs, or those of the memory backends */
+    MemoryRegion *core_ram[TC4X_NUM_CORES];
+    MemoryRegion *lmu;
+    MemoryRegion own_core_ram[TC4X_NUM_CORES];
+    MemoryRegion own_lmu;
+    HostMemoryBackend *core_memdev[TC4X_NUM_CORES];
+    HostMemoryBackend *lmu_memdev;
     MemoryRegion pflash, dflash;
     AddressSpace pflash_as, dflash_as;
     MemoryRegion pflash_win[2], pflash_linear[2], dflash_win;
@@ -410,7 +422,7 @@ struct Tc4xSoc {
     void *flash_locate_opaque;
     Tc4xDmuHookFn dmu_hook;
     void *dmu_hook_opaque;
-    MemoryRegion lmu, lmu_alias;
+    MemoryRegion lmu_alias;
     MemoryRegion sfr_e, sfr_f;
 
     Tc4xSfrPage **sfr_l1[SFR_L1_SIZE];
@@ -452,7 +464,7 @@ struct Tc4xSoc {
 
     Tc4xStmTimer stm[TC4X_NUM_CORES][CPU_STM_VM_COUNT][2];
 
-    unsigned console;       /* ASCLIN instance on serial0 */
+    uint32_t console;       /* ASCLIN instance of the console chardev */
     CharFrontend uart;
     uint8_t rx_fifo[ASCLIN_RXFIFO_DEPTH];
     unsigned rx_head, rx_count;
@@ -485,14 +497,10 @@ struct Tc4xSoc {
     Tc4xDmuIf dmu_if[2];        /* host, CSRM */
     Tc4xDmuIf *dmu_cur;         /* the interface running a command */
 
-    uint32_t boot_pc;
     uint32_t boot_pc_board;     /* this reset's start address from the board */
     bool boot_hold;             /* this reset leaves core 0 halted */
-    char *sfr_script;
-    char *board_name;
-    Tc4xBoard *board;
-    char *shm_dir;
     char *flash_dir;
+    bool keep_flash;            /* flash files that exist keep their contents */
     bool flash_kept;
     uint8_t *kept_pflash, *kept_dflash;
     bool imprecise_io;      /* SFR accesses skip the TCG I/O rewind */
@@ -2362,10 +2370,10 @@ static uint64_t cpu_stm_page_read(void *opaque, hwaddr off, unsigned size)
     Tc4xStmPage *pg = opaque;
 
     if (off >= CPU_STM_ABS && off + size <= CPU_STM_ABS + 8) {
-        return extract64(stm_now(pg->machine), (off - CPU_STM_ABS) * 8,
+        return extract64(stm_now(pg->soc), (off - CPU_STM_ABS) * 8,
                          size * 8);
     }
-    return sfr_region_read(pg->machine, cpu_stm_page_offset(off), size,
+    return sfr_region_read(pg->soc, cpu_stm_page_offset(off), size,
                            pg->base);
 }
 
@@ -2374,7 +2382,7 @@ static void cpu_stm_page_write(void *opaque, hwaddr off, uint64_t val,
 {
     Tc4xStmPage *pg = opaque;
 
-    sfr_region_write(pg->machine, cpu_stm_page_offset(off), val, size,
+    sfr_region_write(pg->soc, cpu_stm_page_offset(off), val, size,
                      pg->base);
 }
 
@@ -2395,9 +2403,9 @@ static uint64_t tbu_page_read(void *opaque, hwaddr off, unsigned size)
     Tc4xStmPage *pg = opaque;
 
     if (off == EGTM_TBU_CH0_BASE && size == 4) {
-        return stm_now(pg->machine) & EGTM_TBU_MASK;
+        return stm_now(pg->soc) & EGTM_TBU_MASK;
     }
-    return sfr_region_read(pg->machine, off, size, pg->base);
+    return sfr_region_read(pg->soc, off, size, pg->base);
 }
 
 static void tbu_page_write(void *opaque, hwaddr off, uint64_t val,
@@ -2405,7 +2413,7 @@ static void tbu_page_write(void *opaque, hwaddr off, uint64_t val,
 {
     Tc4xStmPage *pg = opaque;
 
-    sfr_region_write(pg->machine, off, val, size, pg->base);
+    sfr_region_write(pg->soc, off, val, size, pg->base);
 }
 
 static const MemoryRegionOps tbu_page_ops = {
@@ -2810,7 +2818,7 @@ static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
     }
 }
 
-static void sim_exec(Tc4xSoc *s, char *line)
+void tc4x_sim_exec(Tc4xSoc *s, char *line)
 {
     g_auto(GStrv) argv = g_strsplit_set(g_strstrip(line), " \t", -1);
     int argc = g_strv_length(argv);
@@ -2837,7 +2845,7 @@ static void sim_receive(void *opaque, const uint8_t *buf, int size)
 
     for (int i = 0; i < size; i++) {
         if (buf[i] == '\n') {
-            sim_exec(s, s->sim_line->str);
+            tc4x_sim_exec(s, s->sim_line->str);
             g_string_truncate(s->sim_line, 0);
         } else if (buf[i] != '\r') {
             g_string_append_c(s->sim_line, buf[i]);
@@ -2846,69 +2854,102 @@ static void sim_receive(void *opaque, const uint8_t *buf, int size)
 }
 
 /*
- * With a directory, a RAM is a shared file "<dir>/<name>" that external
- * processes can map; true when that file already existed at this size.
+ * With a directory, a flash is a shared file "<dir>/<name>" that external
+ * processes can map; *@existed tells whether that file already existed at
+ * this size.
  */
-static bool init_ram(MemoryRegion *mr, const char *dir, const char *name,
-                     uint64_t size)
+static bool init_flash(Tc4xSoc *s, MemoryRegion *mr, const char *name,
+                       uint64_t size, bool *existed, Error **errp)
 {
-    bool existed = false;
-
-    if (dir) {
-        g_autofree char *path = g_strdup_printf("%s/%s", dir, name);
+    *existed = false;
+    if (!s->flash_dir) {
+        return memory_region_init_ram(mr, OBJECT(s), name, size, errp);
+    } else {
+        g_autofree char *path = g_build_filename(s->flash_dir, name, NULL);
         struct stat st;
 
-        existed = stat(path, &st) == 0 && (uint64_t)st.st_size == size;
-        g_mkdir_with_parents(dir, 0700);
-        memory_region_init_ram_from_file(mr, NULL, name, size, 0, RAM_SHARED,
-                                         path, 0, &error_fatal);
+        *existed = stat(path, &st) == 0 && (uint64_t)st.st_size == size;
+        g_mkdir_with_parents(s->flash_dir, 0700);
+        if (!memory_region_init_ram_from_file(mr, OBJECT(s), name, size, 0,
+                                              RAM_SHARED, path, 0, errp)) {
+            return false;
+        }
         vmstate_register_ram_global(mr);
-    } else {
-        memory_region_init_ram(mr, NULL, name, size, &error_fatal);
+        return true;
     }
-    return existed;
-}
-
-static void add_ram(Tc4xSoc *s, MemoryRegion *mr, const char *name,
-                    hwaddr base, uint64_t size)
-{
-    init_ram(mr, s->shm_dir, name, size);
-    memory_region_add_subregion(get_system_memory(), base, mr);
 }
 
 /*
- * The flashes live in flash-dir when it is set (else shm-dir, if any);
- * flash files that already existed keep their contents over the image.
+ * A RAM of the SoC at @base: the memory of the backend @memdev when it is
+ * set, else @own as a plain RAM
  */
-static void add_flashes(Tc4xSoc *s)
+static MemoryRegion *add_ram(Tc4xSoc *s, MemoryRegion *own,
+                             HostMemoryBackend *memdev, const char *name,
+                             hwaddr base, uint64_t size, Error **errp)
+{
+    MemoryRegion *mr = own;
+
+    if (memdev) {
+        mr = host_memory_backend_get_memory(memdev);
+        if (host_memory_backend_is_mapped(memdev)) {
+            error_setg(errp, "memory backend '%s' of %s is already in use",
+                       object_get_canonical_path_component(OBJECT(memdev)),
+                       name);
+            return NULL;
+        }
+        if (memory_region_size(mr) != size) {
+            error_setg(errp, "memory backend '%s' of %s must have %" PRIu64
+                       " bytes",
+                       object_get_canonical_path_component(OBJECT(memdev)),
+                       name, size);
+            return NULL;
+        }
+        host_memory_backend_set_mapped(memdev, true);
+        vmstate_register_ram(mr, DEVICE(s));
+    } else if (!memory_region_init_ram(own, OBJECT(s), name, size, errp)) {
+        return NULL;
+    }
+    memory_region_add_subregion(get_system_memory(), base, mr);
+    return mr;
+}
+
+/*
+ * The flashes live in flash-dir when it is set; with keep-flash, flash
+ * files that already existed keep their contents over the image.
+ */
+static bool add_flashes(Tc4xSoc *s, Error **errp)
 {
     static const hwaddr win_base[2] = { PFLASH_BASE_C, PFLASH_BASE_NC };
     static const char *const win_name[2] = { "pflash.win", "pflash.win.nc" };
-    const char *dir = s->flash_dir ? s->flash_dir : s->shm_dir;
-    bool kept;
+    bool pflash_existed, dflash_existed;
 
-    kept = init_ram(&s->pflash, dir, "pflash", 80 * MiB);
-    kept &= init_ram(&s->dflash, dir, "dflash", 32 * MiB);
-    s->flash_kept = s->flash_dir && kept;
+    if (!init_flash(s, &s->pflash, "pflash", TC4X_PFLASH_SIZE,
+                    &pflash_existed, errp) ||
+        !init_flash(s, &s->dflash, "dflash", TC4X_DFLASH_SIZE,
+                    &dflash_existed, errp)) {
+        return false;
+    }
+    s->flash_kept = s->keep_flash && pflash_existed && dflash_existed;
     address_space_init(&s->pflash_as, &s->pflash, "pflash.storage");
     address_space_init(&s->dflash_as, &s->dflash, "dflash.storage");
     for (int w = 0; w < 2; w++) {
         uint64_t size = memory_region_size(&s->pflash);
 
-        memory_region_init(&s->pflash_win[w], NULL, win_name[w], size);
-        memory_region_init_alias(&s->pflash_linear[w], NULL, "pflash.linear",
-                                 &s->pflash, 0, size);
+        memory_region_init(&s->pflash_win[w], OBJECT(s), win_name[w], size);
+        memory_region_init_alias(&s->pflash_linear[w], OBJECT(s),
+                                 "pflash.linear", &s->pflash, 0, size);
         memory_region_add_subregion(&s->pflash_win[w], 0,
                                     &s->pflash_linear[w]);
         memory_region_add_subregion(get_system_memory(), win_base[w],
                                     &s->pflash_win[w]);
     }
-    memory_region_init_alias(&s->dflash_win, NULL, "dflash.win", &s->dflash, 0,
-                             memory_region_size(&s->dflash));
+    memory_region_init_alias(&s->dflash_win, OBJECT(s), "dflash.win",
+                             &s->dflash, 0, memory_region_size(&s->dflash));
     memory_region_add_subregion(get_system_memory(), DMU_DFLASH_BASE,
                                 &s->dflash_win);
     s->flash_locate = flash_locate_linear;
     s->flash_locate_opaque = s;
+    return true;
 }
 
 bool tc4x_flash_kept(Tc4xSoc *s)
@@ -3010,41 +3051,20 @@ void tc4x_pflash_set_maps(Tc4xSoc *s, const Tc4xPflashMap *maps, unsigned n)
     memory_region_transaction_commit();
 }
 
-static void add_alias(MemoryRegion *alias, const char *name,
-                      MemoryRegion *orig, hwaddr base)
+void tc4x_soc_keep_flash(Tc4xSoc *s)
 {
-    memory_region_init_alias(alias, NULL, name, orig, 0,
-                             memory_region_size(orig));
-    memory_region_add_subregion(get_system_memory(), base, alias);
-}
-
-static void tc4x_load_image(Tc4xSoc *s, const char *file)
-{
-    hwaddr entry = 0;
-    uint64_t elf_entry = 0;
-    ssize_t size;
-
-    if (g_str_has_suffix(file, ".hex")) {
-        size = load_targphys_hex_as(file, &entry, &address_space_memory);
-    } else {
-        size = load_elf(file, NULL, NULL, NULL, &elf_entry, NULL, NULL, NULL,
-                        ELFDATA2LSB, EM_TRICORE, 1, 0);
-        entry = elf_entry;
-    }
-    if (size <= 0) {
-        error_report("tc4x: cannot load '%s'", file);
-        exit(1);
-    }
-    if (s->boot_pc == 0) {
-        s->boot_pc = entry;
+    if (s->flash_kept) {
+        s->kept_pflash = g_memdup2(memory_region_get_ram_ptr(&s->pflash),
+                                   memory_region_size(&s->pflash));
+        s->kept_dflash = g_memdup2(memory_region_get_ram_ptr(&s->dflash),
+                                   memory_region_size(&s->dflash));
     }
 }
 
-static void tc4x_reset(MachineState *ms, ResetType type)
+static void tc4x_soc_reset_hold(Object *obj, ResetType type)
 {
-    Tc4xSoc *s = TC4X_MACHINE(ms);
+    Tc4xSoc *s = TC4X_SOC(obj);
 
-    qemu_devices_reset(type);
     if (s->kept_pflash) {
         /* the kept flash contents, which the image only seeded the RAMs over */
         memcpy(memory_region_get_ram_ptr(&s->pflash), s->kept_pflash,
@@ -3064,10 +3084,11 @@ static void tc4x_reset(MachineState *ms, ResetType type)
     ir_update(s);
     s->boot_pc_board = 0;
     s->boot_hold = false;
-    if (TC4X_BOARD_GET_CLASS(s->board)->reset) {
-        TC4X_BOARD_GET_CLASS(s->board)->reset(s->board, s);
-    }
-    s->cpu[0]->env.PC = s->boot_pc_board ? s->boot_pc_board : s->boot_pc;
+}
+
+void tc4x_soc_boot(Tc4xSoc *s, uint32_t entry)
+{
+    s->cpu[0]->env.PC = s->boot_pc_board ? s->boot_pc_board : entry;
     if (s->boot_hold) {
         s->cpu[0]->env.boot_halted = true;
         CPU(s->cpu[0])->halted = 1;
@@ -3106,44 +3127,10 @@ void tc4x_geth_attach(Tc4xSoc *s, unsigned port, uint8_t addr,
     tc4x_geth_attach_phy(s->geth, port, addr, ops, opaque);
 }
 
-static void tc4x_board_list(void)
-{
-    g_autoptr(GSList) list = object_class_get_list_sorted(TYPE_TC4X_BOARD,
-                                                          false);
-
-    printf("Supported boards are:\n");
-    for (GSList *el = list; el; el = el->next) {
-        Tc4xBoardClass *bc = el->data;
-        const char *type = object_class_get_name(OBJECT_CLASS(bc));
-        g_autofree char *name = g_strndup(type, strlen(type) -
-                                          strlen("-" TYPE_TC4X_BOARD));
-
-        printf("%-20s %s\n", name, bc->desc);
-    }
-}
-
-static Tc4xBoard *tc4x_board_create(const char *name)
-{
-    g_autofree char *type = g_strdup_printf("%s-" TYPE_TC4X_BOARD, name);
-    ObjectClass *oc = object_class_by_name(type);
-
-    if (!strcmp(name, "help")) {
-        tc4x_board_list();
-        exit(0);
-    }
-    if (!oc || !object_class_dynamic_cast(oc, TYPE_TC4X_BOARD) ||
-        object_class_is_abstract(oc)) {
-        error_report("tc4x: unknown board '%s' (board=help lists them)",
-                     name);
-        exit(1);
-    }
-    return TC4X_BOARD(object_new(type));
-}
-
 /* Register write semantics and kernel resets; later entries replace earlier */
-static void tc4x_add_semantics(Tc4xSoc *s, const Tc4xRegSemantics *sem,
-                               size_t n_sem, const Tc4xKernelReset *kr,
-                               size_t n_kr)
+void tc4x_soc_add_semantics(Tc4xSoc *s, const Tc4xRegSemantics *sem,
+                            size_t n_sem, const Tc4xKernelReset *kr,
+                            size_t n_kr)
 {
     for (size_t i = 0; i < n_sem; i++) {
         g_hash_table_insert(s->reg_semantics, GUINT_TO_POINTER(sem[i].addr),
@@ -3153,17 +3140,6 @@ static void tc4x_add_semantics(Tc4xSoc *s, const Tc4xRegSemantics *sem,
         g_hash_table_insert(s->kresets, GUINT_TO_POINTER(kr[i].ctrlb),
                             (gpointer)&kr[i]);
     }
-}
-
-static void tc4x_apply_board(Tc4xSoc *s, const Tc4xBoardClass *bc)
-{
-    for (unsigned i = 0; i < bc->n_inputs; i++) {
-        const Tc4xBoardInput *in = &bc->inputs[i];
-
-        tc4x_gpio_set_input(s, in->port, in->pin, in->level);
-    }
-    tc4x_add_semantics(s, bc->reg_semantics, bc->n_reg_semantics,
-                       bc->kernel_resets, bc->n_kernel_resets);
 }
 
 static void tc4x_force_soc_status(Tc4xSoc *s)
@@ -3178,16 +3154,82 @@ static void tc4x_force_soc_status(Tc4xSoc *s)
     }
 }
 
-static void tc4x_init(MachineState *ms)
+/* Core @c, its view of memory (local DSPR and PSPR) and its STM timers */
+static bool tc4x_soc_add_cpu(Tc4xSoc *s, int c, Error **errp)
 {
-    Tc4xSoc *s = TC4X_MACHINE(ms);
-    MemoryRegion *sysmem = get_system_memory();
-    Tc4xBoardClass *bc;
+    g_autofree char *name = g_strdup_printf("cpu[%d]", c);
+    g_autofree char *root = g_strdup_printf("core%d.view", c);
+    Object *cpuobj = object_new(s->cpu_type);
 
-    s->board = tc4x_board_create(s->board_name ? s->board_name : "generic");
-    bc = TC4X_BOARD_GET_CLASS(s->board);
-    assert(bc->console < ASCLIN_COUNT);
-    s->console = bc->console;
+    object_property_add_child(OBJECT(s), name, cpuobj);
+    object_unref(cpuobj);
+    memory_region_init(&s->cpu_root[c], OBJECT(s), root, UINT64_MAX);
+    memory_region_init_alias(&s->cpu_sys_alias[c], OBJECT(s), "sys",
+                             get_system_memory(), 0, UINT64_MAX);
+    memory_region_add_subregion_overlap(&s->cpu_root[c], 0,
+                                        &s->cpu_sys_alias[c], 0);
+    memory_region_init_alias(&s->cpu_local_dspr[c], OBJECT(s), "dspr.local",
+                             s->core_ram[c], 0, TC4X_PSPR_OFFSET);
+    memory_region_add_subregion_overlap(&s->cpu_root[c], TC4X_LOCAL_DSPR,
+                                        &s->cpu_local_dspr[c], 1);
+    memory_region_init_alias(&s->cpu_local_pspr[c], OBJECT(s), "pspr.local",
+                             s->core_ram[c], TC4X_PSPR_OFFSET,
+                             TC4X_CORE_RAM_SIZE - TC4X_PSPR_OFFSET);
+    memory_region_add_subregion_overlap(&s->cpu_root[c], TC4X_LOCAL_PSPR,
+                                        &s->cpu_local_pspr[c], 1);
+
+    if (!object_property_set_uint(cpuobj, "core-id", c, errp) ||
+        !object_property_set_bool(cpuobj, "start-halted", c != 0, errp) ||
+        !object_property_set_link(cpuobj, "memory", OBJECT(&s->cpu_root[c]),
+                                  errp) ||
+        !qdev_realize(DEVICE(cpuobj), NULL, errp)) {
+        return false;
+    }
+    s->cpu[c] = TRICORE_CPU(cpuobj);
+    s->cpu[c]->irq_ack = ir_ack;
+    s->cpu[c]->irq_ack_opaque = s;
+
+    for (int vm = 0; vm < CPU_STM_VM_COUNT; vm++) {
+        for (int cmp = 0; cmp < 2; cmp++) {
+            Tc4xStmTimer *t = &s->stm[c][vm][cmp];
+
+            t->s = s;
+            t->core = c;
+            t->vm = vm;
+            t->cmp = cmp;
+            t->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stm_fire, t);
+        }
+    }
+    return true;
+}
+
+/* An SFR region served without the BQL where the access allows it */
+static void tc4x_soc_init_sfr_io(Tc4xSoc *s, MemoryRegion *mr,
+                                 const MemoryRegionOps *ops, void *opaque,
+                                 const char *name, uint64_t size)
+{
+    memory_region_init_io(mr, OBJECT(s), ops, opaque, name, size);
+    memory_region_enable_lockless_io(mr);
+    memory_region_set_imprecise_io(mr, s->imprecise_io);
+}
+
+static void tc4x_soc_realize(DeviceState *dev, Error **errp)
+{
+    Tc4xSoc *s = TC4X_SOC(dev);
+    MemoryRegion *sysmem = get_system_memory();
+    ObjectClass *cpu_class;
+
+    cpu_class = s->cpu_type ? object_class_by_name(s->cpu_type) : NULL;
+    if (!cpu_class || !object_class_dynamic_cast(cpu_class, TYPE_TRICORE_CPU)) {
+        error_setg(errp, "cpu-type must name a TriCore CPU");
+        return;
+    }
+    if (s->console >= ASCLIN_COUNT) {
+        error_setg(errp, "console must be an ASCLIN instance below %u",
+                   ASCLIN_COUNT);
+        return;
+    }
+
     s->watches = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->reg_semantics = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->kresets = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -3223,134 +3265,288 @@ static void tc4x_init(MachineState *ms)
     s->adc = tc4x_adc_new(s);
     s->i2c = tc4x_i2c_new(s);
     /* the SoC's own, from the iLLD SFR headers (tc4x_sfr_tables.c) */
-    tc4x_add_semantics(s, tc4x_reg_semantics, tc4x_n_reg_semantics,
-                       tc4x_kernel_resets, tc4x_n_kernel_resets);
-    tc4x_apply_board(s, bc);
+    tc4x_soc_add_semantics(s, tc4x_reg_semantics, tc4x_n_reg_semantics,
+                           tc4x_kernel_resets, tc4x_n_kernel_resets);
     tc4x_force_soc_status(s);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         g_autofree char *name = g_strdup_printf("core%d.spr", c);
-        /* CPUcs, core 6, lands in segment 1 */
-        hwaddr base = 0x70000000u - c * 0x10000000u;
 
-        add_ram(s, &s->core_ram[c], name, base, TC4X_CORE_RAM_SIZE);
+        s->core_ram[c] = add_ram(s, &s->own_core_ram[c], s->core_memdev[c],
+                                 name, TC4X_CORE_RAM_BASE(c),
+                                 TC4X_CORE_RAM_SIZE, errp);
+        if (!s->core_ram[c]) {
+            return;
+        }
     }
-    add_flashes(s);
-    add_ram(s, &s->lmu, "lmu", 0x90000000u, 64 * MiB);
-    add_alias(&s->lmu_alias, "lmu.nc", &s->lmu, 0xB0000000u);
+    if (!add_flashes(s, errp)) {
+        return;
+    }
+    s->lmu = add_ram(s, &s->own_lmu, s->lmu_memdev, "lmu", TC4X_LMU_BASE,
+                     TC4X_LMU_SIZE, errp);
+    if (!s->lmu) {
+        return;
+    }
+    memory_region_init_alias(&s->lmu_alias, OBJECT(s), "lmu.nc", s->lmu, 0,
+                             TC4X_LMU_SIZE);
+    memory_region_add_subregion(sysmem, TC4X_LMU_NC_BASE, &s->lmu_alias);
 
-    memory_region_init_io(&s->sfr_e, NULL, &sfr_e_ops, s, "sfr.e",
-                          0x10000000u);
-    memory_region_enable_lockless_io(&s->sfr_e);
-    memory_region_set_imprecise_io(&s->sfr_e, s->imprecise_io);
+    tc4x_soc_init_sfr_io(s, &s->sfr_e, &sfr_e_ops, s, "sfr.e", 0x10000000u);
     memory_region_add_subregion(sysmem, 0xE0000000u, &s->sfr_e);
-    memory_region_init_io(&s->sfr_f, NULL, &sfr_f_ops, s, "sfr.f",
-                          0x10000000u);
-    memory_region_enable_lockless_io(&s->sfr_f);
-    memory_region_set_imprecise_io(&s->sfr_f, s->imprecise_io);
+    tc4x_soc_init_sfr_io(s, &s->sfr_f, &sfr_f_ops, s, "sfr.f", 0x10000000u);
     memory_region_add_subregion(sysmem, 0xF0000000u, &s->sfr_f);
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         g_autofree char *name = g_strdup_printf("cpu%d.stm_page", c);
         Tc4xStmPage *pg = &s->stm_page[c];
 
-        pg->machine = s;
+        pg->soc = s;
         pg->base = CPU_SFR_BASE + c * CPU_SFR_STRIDE;
-        memory_region_init_io(&pg->mr, NULL, &cpu_stm_page_ops, pg, name,
-                              CPU_STM_PAGE_SIZE);
-        memory_region_enable_lockless_io(&pg->mr);
-        memory_region_set_imprecise_io(&pg->mr, s->imprecise_io);
+        tc4x_soc_init_sfr_io(s, &pg->mr, &cpu_stm_page_ops, pg, name,
+                             CPU_STM_PAGE_SIZE);
         memory_region_add_subregion_overlap(&s->sfr_f, pg->base - 0xF0000000u,
                                             &pg->mr, 1);
     }
-    s->tbu_page.machine = s;
+    s->tbu_page.soc = s;
     s->tbu_page.base = EGTM_TBU_PAGE;
-    memory_region_init_io(&s->tbu_page.mr, NULL, &tbu_page_ops, &s->tbu_page,
-                          "egtm.tbu_page", CPU_STM_PAGE_SIZE);
-    memory_region_enable_lockless_io(&s->tbu_page.mr);
-    memory_region_set_imprecise_io(&s->tbu_page.mr, s->imprecise_io);
+    tc4x_soc_init_sfr_io(s, &s->tbu_page.mr, &tbu_page_ops, &s->tbu_page,
+                         "egtm.tbu_page", CPU_STM_PAGE_SIZE);
     memory_region_add_subregion_overlap(&s->sfr_f, EGTM_TBU_PAGE - 0xF0000000u,
                                         &s->tbu_page.mr, 1);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
-        Object *cpuobj = object_new(ms->cpu_type);
-        g_autofree char *root = g_strdup_printf("core%d.view", c);
-
-        memory_region_init(&s->cpu_root[c], NULL, root, UINT64_MAX);
-        memory_region_init_alias(&s->cpu_sys_alias[c], NULL, "sys", sysmem,
-                                 0, UINT64_MAX);
-        memory_region_add_subregion_overlap(&s->cpu_root[c], 0,
-                                            &s->cpu_sys_alias[c], 0);
-        memory_region_init_alias(&s->cpu_local_dspr[c], NULL, "dspr.local",
-                                 &s->core_ram[c], 0, TC4X_PSPR_OFFSET);
-        memory_region_add_subregion_overlap(&s->cpu_root[c], TC4X_LOCAL_DSPR,
-                                            &s->cpu_local_dspr[c], 1);
-        memory_region_init_alias(&s->cpu_local_pspr[c], NULL, "pspr.local",
-                                 &s->core_ram[c], TC4X_PSPR_OFFSET,
-                                 TC4X_CORE_RAM_SIZE - TC4X_PSPR_OFFSET);
-        memory_region_add_subregion_overlap(&s->cpu_root[c], TC4X_LOCAL_PSPR,
-                                            &s->cpu_local_pspr[c], 1);
-
-        object_property_set_uint(cpuobj, "core-id", c, &error_fatal);
-        object_property_set_bool(cpuobj, "start-halted", c != 0, &error_fatal);
-        object_property_set_link(cpuobj, "memory", OBJECT(&s->cpu_root[c]),
-                                 &error_fatal);
-        qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
-        s->cpu[c] = TRICORE_CPU(cpuobj);
-        s->cpu[c]->irq_ack = ir_ack;
-        s->cpu[c]->irq_ack_opaque = s;
-
-        for (int vm = 0; vm < CPU_STM_VM_COUNT; vm++) {
-            for (int cmp = 0; cmp < 2; cmp++) {
-                Tc4xStmTimer *t = &s->stm[c][vm][cmp];
-
-                t->s = s;
-                t->core = c;
-                t->vm = vm;
-                t->cmp = cmp;
-                t->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stm_fire, t);
-            }
+        if (!tc4x_soc_add_cpu(s, c, errp)) {
+            return;
         }
     }
     tc4x_geth_init(s, sysmem);
 
-    qemu_chr_fe_init(&s->uart, serial_hd(0), &error_abort);
     qemu_chr_fe_set_handlers(&s->uart, uart_can_receive, uart_receive, NULL,
                              NULL, s, NULL, true);
-    if (serial_hd(1)) {
-        qemu_chr_fe_init(&s->sim, serial_hd(1), &error_abort);
-        qemu_chr_fe_set_handlers(&s->sim, sim_can_receive, sim_receive, NULL,
-                                 NULL, s, NULL, true);
-    }
+    qemu_chr_fe_set_handlers(&s->sim, sim_can_receive, sim_receive, NULL,
+                             NULL, s, NULL, true);
+}
 
+static const Property tc4x_soc_properties[] = {
+    DEFINE_PROP_STRING("cpu-type", Tc4xSoc, cpu_type),
+    DEFINE_PROP_UINT32("console", Tc4xSoc, console, 0),
+    DEFINE_PROP_CHR("console-chardev", Tc4xSoc, uart),
+    DEFINE_PROP_CHR("sim-chardev", Tc4xSoc, sim),
+    DEFINE_PROP_BOOL("imprecise-io", Tc4xSoc, imprecise_io, false),
+    DEFINE_PROP_STRING("flash-dir", Tc4xSoc, flash_dir),
+    DEFINE_PROP_BOOL("keep-flash", Tc4xSoc, keep_flash, false),
+    DEFINE_PROP_LINK("lmu-memdev", Tc4xSoc, lmu_memdev, TYPE_MEMORY_BACKEND,
+                     HostMemoryBackend *),
+    DEFINE_PROP_LINK("core0-memdev", Tc4xSoc, core_memdev[0],
+                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_LINK("core1-memdev", Tc4xSoc, core_memdev[1],
+                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_LINK("core2-memdev", Tc4xSoc, core_memdev[2],
+                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_LINK("core3-memdev", Tc4xSoc, core_memdev[3],
+                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_LINK("core4-memdev", Tc4xSoc, core_memdev[4],
+                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_LINK("core5-memdev", Tc4xSoc, core_memdev[5],
+                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_LINK("core6-memdev", Tc4xSoc, core_memdev[6],
+                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+};
+
+static void tc4x_soc_class_init(ObjectClass *oc, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+    ResettableClass *rc = RESETTABLE_CLASS(oc);
+
+    dc->desc = "Infineon AURIX TC4Dx SoC";
+    dc->realize = tc4x_soc_realize;
+    /* created by the tc4x machines only */
+    dc->user_creatable = false;
+    rc->phases.hold = tc4x_soc_reset_hold;
+    device_class_set_props(dc, tc4x_soc_properties);
+}
+
+/* The tc4x machine: the SoC and the board around it */
+
+#define TYPE_TC4X_MACHINE MACHINE_TYPE_NAME("tc4x")
+OBJECT_DECLARE_SIMPLE_TYPE(Tc4xMachineState, TC4X_MACHINE)
+
+struct Tc4xMachineState {
+    MachineState parent_obj;
+
+    Tc4xSoc *soc;
+    Tc4xBoard *board;
+    uint32_t entry;         /* entry point of the first image */
+    char *sfr_script;
+    char *board_name;
+    char *shm_dir;
+    char *flash_dir;
+    bool imprecise_io;
+};
+
+static void tc4x_load_image(Tc4xMachineState *m, const char *file)
+{
+    hwaddr entry = 0;
+    uint64_t elf_entry = 0;
+    ssize_t size;
+
+    if (g_str_has_suffix(file, ".hex")) {
+        size = load_targphys_hex_as(file, &entry, &address_space_memory);
+    } else {
+        size = load_elf(file, NULL, NULL, NULL, &elf_entry, NULL, NULL, NULL,
+                        ELFDATA2LSB, EM_TRICORE, 1, 0);
+        entry = elf_entry;
+    }
+    if (size <= 0) {
+        error_report("tc4x: cannot load '%s'", file);
+        exit(1);
+    }
+    if (m->entry == 0) {
+        m->entry = entry;
+    }
+}
+
+static void tc4x_reset(MachineState *ms, ResetType type)
+{
+    Tc4xMachineState *m = TC4X_MACHINE(ms);
+    Tc4xBoardClass *bc = TC4X_BOARD_GET_CLASS(m->board);
+
+    qemu_devices_reset(type);
+    if (bc->reset) {
+        bc->reset(m->board, m->soc);
+    }
+    tc4x_soc_boot(m->soc, m->entry);
+}
+
+static void tc4x_board_list(void)
+{
+    g_autoptr(GSList) list = object_class_get_list_sorted(TYPE_TC4X_BOARD,
+                                                          false);
+
+    printf("Supported boards are:\n");
+    for (GSList *el = list; el; el = el->next) {
+        Tc4xBoardClass *bc = el->data;
+        const char *type = object_class_get_name(OBJECT_CLASS(bc));
+        g_autofree char *name = g_strndup(type, strlen(type) -
+                                          strlen("-" TYPE_TC4X_BOARD));
+
+        printf("%-20s %s\n", name, bc->desc);
+    }
+}
+
+static Tc4xBoard *tc4x_board_create(const char *name)
+{
+    g_autofree char *type = g_strdup_printf("%s-" TYPE_TC4X_BOARD, name);
+    ObjectClass *oc = object_class_by_name(type);
+
+    if (!strcmp(name, "help")) {
+        tc4x_board_list();
+        exit(0);
+    }
+    if (!oc || !object_class_dynamic_cast(oc, TYPE_TC4X_BOARD) ||
+        object_class_is_abstract(oc)) {
+        error_report("tc4x: unknown board '%s' (board=help lists them)",
+                     name);
+        exit(1);
+    }
+    return TC4X_BOARD(object_new(type));
+}
+
+static void tc4x_apply_board(Tc4xSoc *soc, const Tc4xBoardClass *bc)
+{
+    for (unsigned i = 0; i < bc->n_inputs; i++) {
+        const Tc4xBoardInput *in = &bc->inputs[i];
+
+        tc4x_gpio_set_input(soc, in->port, in->pin, in->level);
+    }
+    tc4x_soc_add_semantics(soc, bc->reg_semantics, bc->n_reg_semantics,
+                           bc->kernel_resets, bc->n_kernel_resets);
+}
+
+/* shm-dir: the RAM @name of the SoC is the shared file <shm-dir>/@name */
+static void tc4x_add_shm_ram(Tc4xMachineState *m, const char *name,
+                             const char *link, uint64_t size)
+{
+    Object *obj = object_new(TYPE_MEMORY_BACKEND_FILE);
+    g_autofree char *path = g_build_filename(m->shm_dir, name, NULL);
+
+    if (object_property_get_link(OBJECT(m->soc), link, &error_abort)) {
+        error_report("tc4x: shm-dir and %s both give the RAM %s", link, name);
+        exit(1);
+    }
+    object_property_set_str(obj, "mem-path", path, &error_fatal);
+    object_property_set_int(obj, "size", size, &error_fatal);
+    object_property_set_bool(obj, "share", true, &error_fatal);
+    /* the RAM block keeps the RAM's name */
+    object_property_set_bool(obj, "x-use-canonical-path-for-ramblock-id",
+                             false, &error_fatal);
+    object_property_add_child(object_get_objects_root(), name, obj);
+    user_creatable_complete(USER_CREATABLE(obj), &error_fatal);
+    object_property_set_link(OBJECT(m->soc), link, obj, &error_fatal);
+    object_unref(obj);
+}
+
+static void tc4x_init(MachineState *ms)
+{
+    Tc4xMachineState *m = TC4X_MACHINE(ms);
+    Tc4xBoardClass *bc;
+    DeviceState *dev;
+
+    m->board = tc4x_board_create(m->board_name ? m->board_name : "generic");
+    object_property_add_child(OBJECT(ms), "tc4x-board", OBJECT(m->board));
+    object_unref(OBJECT(m->board));
+    bc = TC4X_BOARD_GET_CLASS(m->board);
+
+    dev = qdev_new(TYPE_TC4X_SOC);
+    m->soc = TC4X_SOC(dev);
+    object_property_add_child(OBJECT(ms), "soc", OBJECT(dev));
+    qdev_prop_set_string(dev, "cpu-type", ms->cpu_type);
+    qdev_prop_set_uint32(dev, "console", bc->console);
+    qdev_prop_set_chr(dev, "console-chardev", serial_hd(0));
+    qdev_prop_set_chr(dev, "sim-chardev", serial_hd(1));
+    qdev_prop_set_bit(dev, "imprecise-io", m->imprecise_io);
+    if (m->flash_dir || m->shm_dir) {
+        qdev_prop_set_string(dev, "flash-dir",
+                             m->flash_dir ? m->flash_dir : m->shm_dir);
+    }
+    qdev_prop_set_bit(dev, "keep-flash", m->flash_dir != NULL);
+    if (m->shm_dir) {
+        g_mkdir_with_parents(m->shm_dir, 0700);
+        for (int c = 0; c < TC4X_NUM_CORES; c++) {
+            g_autofree char *name = g_strdup_printf("core%d.spr", c);
+            g_autofree char *link = g_strdup_printf("core%d-memdev", c);
+
+            tc4x_add_shm_ram(m, name, link, TC4X_CORE_RAM_SIZE);
+        }
+        tc4x_add_shm_ram(m, "lmu", "lmu-memdev", TC4X_LMU_SIZE);
+    }
+    qdev_realize_and_unref(dev, NULL, &error_fatal);
+    qemu_register_resettable(OBJECT(dev));
+
+    tc4x_apply_board(m->soc, bc);
     if (bc->init) {
-        bc->init(s->board, s);
+        bc->init(m->board, m->soc);
     }
 
-    if (s->sfr_script) {
+    if (m->sfr_script) {
         g_autofree char *text = NULL;
         g_auto(GStrv) lines = NULL;
 
-        if (!g_file_get_contents(s->sfr_script, &text, NULL, NULL)) {
-            error_report("tc4x: cannot read sfr-script '%s'", s->sfr_script);
+        if (!g_file_get_contents(m->sfr_script, &text, NULL, NULL)) {
+            error_report("tc4x: cannot read sfr-script '%s'", m->sfr_script);
             exit(1);
         }
         lines = g_strsplit(text, "\n", -1);
         for (int i = 0; lines[i]; i++) {
-            sim_exec(s, lines[i]);
+            tc4x_sim_exec(m->soc, lines[i]);
         }
     }
 
     if (ms->kernel_filename) {
         g_auto(GStrv) files = g_strsplit(ms->kernel_filename, ",", -1);
 
-        if (s->flash_kept) {
-            s->kept_pflash = g_memdup2(memory_region_get_ram_ptr(&s->pflash),
-                                       memory_region_size(&s->pflash));
-            s->kept_dflash = g_memdup2(memory_region_get_ram_ptr(&s->dflash),
-                                       memory_region_size(&s->dflash));
-        }
+        tc4x_soc_keep_flash(m->soc);
         for (int i = 0; files[i]; i++) {
-            tc4x_load_image(s, files[i]);
+            tc4x_load_image(m, files[i]);
         }
     }
 }
@@ -3362,10 +3558,10 @@ static char *tc4x_get_sfr_script(Object *obj, Error **errp)
 
 static void tc4x_set_sfr_script(Object *obj, const char *value, Error **errp)
 {
-    Tc4xSoc *s = TC4X_MACHINE(obj);
+    Tc4xMachineState *m = TC4X_MACHINE(obj);
 
-    g_free(s->sfr_script);
-    s->sfr_script = g_strdup(value);
+    g_free(m->sfr_script);
+    m->sfr_script = g_strdup(value);
 }
 
 static char *tc4x_get_board(Object *obj, Error **errp)
@@ -3375,10 +3571,10 @@ static char *tc4x_get_board(Object *obj, Error **errp)
 
 static void tc4x_set_board(Object *obj, const char *value, Error **errp)
 {
-    Tc4xSoc *s = TC4X_MACHINE(obj);
+    Tc4xMachineState *m = TC4X_MACHINE(obj);
 
-    g_free(s->board_name);
-    s->board_name = g_strdup(value);
+    g_free(m->board_name);
+    m->board_name = g_strdup(value);
 }
 
 static char *tc4x_get_shm_dir(Object *obj, Error **errp)
@@ -3388,10 +3584,10 @@ static char *tc4x_get_shm_dir(Object *obj, Error **errp)
 
 static void tc4x_set_shm_dir(Object *obj, const char *value, Error **errp)
 {
-    Tc4xSoc *s = TC4X_MACHINE(obj);
+    Tc4xMachineState *m = TC4X_MACHINE(obj);
 
-    g_free(s->shm_dir);
-    s->shm_dir = g_strdup(value);
+    g_free(m->shm_dir);
+    m->shm_dir = g_strdup(value);
 }
 
 static char *tc4x_get_flash_dir(Object *obj, Error **errp)
@@ -3401,10 +3597,10 @@ static char *tc4x_get_flash_dir(Object *obj, Error **errp)
 
 static void tc4x_set_flash_dir(Object *obj, const char *value, Error **errp)
 {
-    Tc4xSoc *s = TC4X_MACHINE(obj);
+    Tc4xMachineState *m = TC4X_MACHINE(obj);
 
-    g_free(s->flash_dir);
-    s->flash_dir = g_strdup(value);
+    g_free(m->flash_dir);
+    m->flash_dir = g_strdup(value);
 }
 
 static bool tc4x_get_imprecise_io(Object *obj, Error **errp)
@@ -3466,9 +3662,14 @@ static void tc4x_generic_board_class_init(ObjectClass *oc, const void *data)
 
 static const TypeInfo tc4x_types[] = {
     {
+        .name = TYPE_TC4X_SOC,
+        .parent = TYPE_DEVICE,
+        .instance_size = sizeof(Tc4xSoc),
+        .class_init = tc4x_soc_class_init,
+    }, {
         .name = TYPE_TC4X_MACHINE,
         .parent = TYPE_MACHINE,
-        .instance_size = sizeof(Tc4xSoc),
+        .instance_size = sizeof(Tc4xMachineState),
         .class_init = tc4x_class_init,
     }, {
         .name = TYPE_TC4X_BOARD,
