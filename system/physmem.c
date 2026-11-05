@@ -1378,6 +1378,12 @@ static void register_subpage(FlatView *fv, MemoryRegionSection *section)
     }
     start = section->offset_within_address_space & ~TARGET_PAGE_MASK;
     end = start + int128_get64(section->size) - 1;
+    if (!section->mr->lockless_io && !memory_region_is_ram(section->mr)) {
+        subpage->iomem.lockless_io = false;
+    }
+    if (!section->mr->imprecise_io) {
+        memory_region_set_imprecise_io(&subpage->iomem, false);
+    }
     subpage_register(subpage, start, end,
                      phys_section_add(&d->map, section));
 }
@@ -2980,6 +2986,15 @@ static subpage_t *subpage_init(FlatView *fv, hwaddr base)
     memory_region_init_io(&mmio->iomem, NULL, &subpage_ops, mmio,
                           NULL, TARGET_PAGE_SIZE);
     mmio->iomem.subpage = true;
+    /*
+     * The page is lockless_io while no section in it needs the BQL, and
+     * imprecise_io while every section in it is (register_subpage).  A
+     * page with a section that needs the BQL keeps it for the whole
+     * access, so the sections' valid.accepts callbacks and an access that
+     * spans two sections run under one hold of the lock.
+     */
+    memory_region_enable_lockless_io(&mmio->iomem);
+    memory_region_set_imprecise_io(&mmio->iomem, true);
     trace_subpage_init(mmio, base, TARGET_PAGE_SIZE);
 
     return mmio;
