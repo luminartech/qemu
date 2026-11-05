@@ -1,6 +1,7 @@
 /*
- * Boards of the tc4x machine, selected with -M tc4x,board=NAME (default
- * "generic", board=help lists them).  A board is a QOM type derived from
+ * Boards of the tc4x machines, selected with -M tc4x,board=NAME (default
+ * "generic", board=help lists them) or by a machine type derived from
+ * TYPE_TC4X_MACHINE that names one.  A board is a QOM type derived from
  * TYPE_TC4X_BOARD; board code kept outside the tree is built in from
  * hw/tricore/boards/ (see the README there).
  *

@@ -27,6 +27,7 @@
 #include "qemu/cutils.h"
 #include "hw/tricore/tc4x.h"
 #include "hw/tricore/tc4x_board.h"
+#include "hw/tricore/tc4x_machine.h"
 #include "trace.h"
 
 #define KIT_LED_PORT        3u
@@ -69,7 +70,8 @@
 #define DP83825I_PHYID1     0x2000u
 #define DP83825I_PHYID2     0xA140u
 
-#define TYPE_KIT_TC4D7_LITE TC4X_BOARD_TYPE_NAME("kit-tc4d7-lite")
+#define KIT_NAME            "kit-tc4d7-lite"
+#define TYPE_KIT_TC4D7_LITE TC4X_BOARD_TYPE_NAME(KIT_NAME)
 OBJECT_DECLARE_SIMPLE_TYPE(KitTc4d7Lite, KIT_TC4D7_LITE)
 
 struct KitTc4d7Lite {
@@ -276,12 +278,26 @@ static void kit_class_init(ObjectClass *oc, const void *data)
     bc->init = kit_init;
 }
 
+/* -M kit-tc4d7-lite: the tc4x machine with board=kit-tc4d7-lite */
+static void kit_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    Tc4xMachineClass *tmc = TC4X_MACHINE_CLASS(oc);
+
+    mc->desc = "Infineon AURIX TC4D7 lite kit (KIT_A3G_TC4D7_LITE)";
+    tmc->board = KIT_NAME;
+}
+
 static const TypeInfo kit_types[] = {
     {
         .name = TYPE_KIT_TC4D7_LITE,
         .parent = TYPE_TC4X_BOARD,
         .instance_size = sizeof(KitTc4d7Lite),
         .class_init = kit_class_init,
+    }, {
+        .name = MACHINE_TYPE_NAME(KIT_NAME),
+        .parent = TYPE_TC4X_MACHINE,
+        .class_init = kit_machine_class_init,
     },
 };
 

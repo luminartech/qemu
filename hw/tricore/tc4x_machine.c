@@ -1,5 +1,5 @@
 /*
- * Infineon AURIX TC4Dx machine: the tc4x SoC and the board around it.
+ * Infineon AURIX TC4Dx machines: the tc4x SoC and the board around it.
  *
  * Copyright (c) 2026 MicroVision, Inc.
  *
@@ -20,24 +20,8 @@
 #include "system/hostmem.h"
 #include "elf.h"
 #include "cpu.h"
-#include "hw/tricore/tc4x_board.h"
+#include "hw/tricore/tc4x_machine.h"
 #include "tc4x_soc.h"
-
-#define TYPE_TC4X_MACHINE MACHINE_TYPE_NAME("tc4x")
-OBJECT_DECLARE_SIMPLE_TYPE(Tc4xMachineState, TC4X_MACHINE)
-
-struct Tc4xMachineState {
-    MachineState parent_obj;
-
-    Tc4xSoc *soc;
-    Tc4xBoard *board;
-    uint32_t entry;         /* entry point of the first image */
-    char *sfr_script;
-    char *board_name;
-    char *shm_dir;
-    char *flash_dir;
-    bool imprecise_io;
-};
 
 static void tc4x_load_image(Tc4xMachineState *m, const char *file)
 {
@@ -144,10 +128,12 @@ static void tc4x_add_shm_ram(Tc4xMachineState *m, const char *name,
 static void tc4x_init(MachineState *ms)
 {
     Tc4xMachineState *m = TC4X_MACHINE(ms);
+    Tc4xMachineClass *tmc = TC4X_MACHINE_GET_CLASS(m);
     Tc4xBoardClass *bc;
     DeviceState *dev;
 
-    m->board = tc4x_board_create(m->board_name ? m->board_name : "generic");
+    assert(m->board_name || tmc->board);
+    m->board = tc4x_board_create(m->board_name ? m->board_name : tmc->board);
     object_property_add_child(OBJECT(ms), "tc4x-board", OBJECT(m->board));
     object_unref(OBJECT(m->board));
     bc = TC4X_BOARD_GET_CLASS(m->board);
@@ -273,7 +259,7 @@ static void tc4x_set_imprecise_io(Object *obj, bool value, Error **errp)
     TC4X_MACHINE(obj)->imprecise_io = value;
 }
 
-static void tc4x_class_init(ObjectClass *oc, const void *data)
+static void tc4x_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
@@ -288,11 +274,6 @@ static void tc4x_class_init(ObjectClass *oc, const void *data)
         "Directory for the PFLASH and DFLASH files: kept files keep their "
         "contents, the image seeding only the RAMs");
 
-    object_class_property_add_str(oc, "board", tc4x_get_board,
-                                  tc4x_set_board);
-    object_class_property_set_description(oc, "board",
-        "Board around the SoC (default generic, board=help lists them)");
-
     object_class_property_add_str(oc, "sfr-script", tc4x_get_sfr_script,
                                   tc4x_set_sfr_script);
     object_class_property_set_description(oc, "sfr-script",
@@ -304,13 +285,26 @@ static void tc4x_class_init(ObjectClass *oc, const void *data)
         "SFR accesses take effect at the next TB instead of the next "
         "instruction: faster, not instruction-precise (default off)");
 
-    mc->desc = "Infineon AURIX TC4Dx (6x TriCore 1.8)";
     mc->init = tc4x_init;
     mc->reset = tc4x_reset;
     mc->max_cpus = TC4X_NUM_CORES;
     mc->default_cpus = TC4X_NUM_CORES;
     mc->min_cpus = TC4X_NUM_CORES;
     mc->default_cpu_type = TRICORE_CPU_TYPE_NAME("tc4x");
+}
+
+static void tc4x_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    Tc4xMachineClass *tmc = TC4X_MACHINE_CLASS(oc);
+
+    object_class_property_add_str(oc, "board", tc4x_get_board,
+                                  tc4x_set_board);
+    object_class_property_set_description(oc, "board",
+        "Board around the SoC (default generic, board=help lists them)");
+
+    mc->desc = "Infineon AURIX TC4Dx (6x TriCore 1.8)";
+    tmc->board = "generic";
 }
 
 static void tc4x_generic_board_class_init(ObjectClass *oc, const void *data)
@@ -324,7 +318,13 @@ static const TypeInfo tc4x_machine_types[] = {
     {
         .name = TYPE_TC4X_MACHINE,
         .parent = TYPE_MACHINE,
+        .abstract = true,
         .instance_size = sizeof(Tc4xMachineState),
+        .class_size = sizeof(Tc4xMachineClass),
+        .class_init = tc4x_machine_class_init,
+    }, {
+        .name = MACHINE_TYPE_NAME("tc4x"),
+        .parent = TYPE_TC4X_MACHINE,
         .class_init = tc4x_class_init,
     }, {
         .name = TYPE_TC4X_BOARD,

@@ -7,7 +7,8 @@ The ``tc4x`` machine models an Infineon AURIX TC4Dx: seven TriCore 1.8
 cores (CPU type ``tc4x``) running in parallel under MTTCG, their local
 scratchpad RAMs, the LMU, program and data flash, and the on-chip
 peripherals listed below.  It loads TC4Dx images from Intel HEX or ELF
-files.
+files.  The ``kit-tc4d7-lite`` machine is the same SoC on Infineon's TC4D7
+lite kit, the ``tc4x`` machine with ``board=kit-tc4d7-lite``.
 
 Quick start
 -----------
@@ -31,7 +32,7 @@ public examples`_).  To run an ELF or Intel HEX image of your own:
 
 .. code-block:: console
 
-  $ ./qemu-system-tricore -M tc4x,board=kit-tc4d7-lite -display none \
+  $ ./qemu-system-tricore -M kit-tc4d7-lite -display none \
         -serial stdio -kernel blinky.elf -trace tc4x_kit_led
 
 The console (ASCLIN0, the kit's USB debug UART) is on standard input and
@@ -93,14 +94,16 @@ Machine properties:
 
 ``board=NAME``
   Board around the SoC (default ``generic``); ``board=help`` lists the
-  boards built in.
+  boards built in.  ``tc4x`` machine only: the other machines name their
+  board.
 
 ``sfr-script=FILE``
   File of sim-bridge commands run at machine init (after the board).
 
 ``shm-dir=DIR``
   Back every RAM with a shared file ``DIR/NAME`` that external processes
-  can map.
+  can map.  The core and LMU RAMs are ``memory-backend-file`` objects
+  named after the RAMs.
 
 ``flash-dir=DIR``
   Keep the program and data flash in files ``DIR/pflash`` and
@@ -113,6 +116,13 @@ Machine properties:
   (no TCG I/O rewind).  Faster for firmware that polls registers in tight
   loops, but no longer instruction-precise; off by default, and icount
   keeps the precise behaviour.
+
+The SoC is the device ``tc4x-soc``, the machine's child ``soc``.  Its
+properties ``lmu-memdev`` and ``core0-memdev`` .. ``core6-memdev`` take
+the LMU (64 MiB) and the scratchpad RAMs of a core (2 MiB) from a memory
+backend, for example
+``-object memory-backend-file,id=lmu,size=64M,mem-path=/dev/shm/lmu,share=on
+-global tc4x-soc.lmu-memdev=lmu``; shm-dir cannot be combined with them.
 
 CPU property, with ``-global tc4x-tricore-cpu.csa-cache=on``:
 
@@ -177,6 +187,8 @@ must not take the BQL.
 Boards
 ------
 
+A tc4x machine is a machine type derived from ``tc4x-common-machine``
+(see ``include/hw/tricore/tc4x_machine.h``), whose class names its board.
 A board is a QOM type derived from ``tc4x-board`` (see
 ``include/hw/tricore/tc4x_board.h``).  Its class states what the SoC
 applies itself: the console ASCLIN instance, GPIO inputs held by straps or
