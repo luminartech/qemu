@@ -32,6 +32,7 @@ typedef struct Tc4xAdc Tc4xAdc;
 typedef struct Tc4xI2c Tc4xI2c;
 
 Tc4xGpio *tc4x_soc_gpio(Tc4xSoc *soc);
+Tc4xTimebase *tc4x_soc_timebase(Tc4xSoc *soc);
 
 /* Store @val if @addr holds @old; returns the value found (any thread) */
 uint32_t tc4x_reg_cmpxchg(Tc4xSoc *soc, uint32_t addr, uint32_t old,

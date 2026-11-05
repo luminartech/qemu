@@ -91,6 +91,13 @@ void tc4x_sfr_store_force(Tc4xSfrStore *st, uint32_t addr, uint32_t value,
  */
 Object *tc4x_sfr_store_owner(Tc4xSfrStore *st, uint32_t addr);
 
+/*
+ * @mr, a region of another device over the store, serves some registers
+ * itself and passes the other accesses to tc4x_sfr_store_access_read/write:
+ * its addresses count as the store's
+ */
+void tc4x_sfr_store_add_passthrough(Tc4xSfrStore *st, MemoryRegion *mr);
+
 /* Report guest writes of @addr to the models' watched() (on) or stop */
 void tc4x_sfr_store_watch(Tc4xSfrStore *st, uint32_t addr, bool on);
 

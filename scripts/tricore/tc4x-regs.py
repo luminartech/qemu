@@ -36,6 +36,11 @@ REGISTERS = [
     # CPU0 (CPUn at a fixed stride)
     "CPU0_HRA_PC", "CPU0_HRA_CORE_ID", "CPU0_HRA_BOOTCON",
     "CPU1_HRA_PC",
+    # CPU0 system timer: VM0 of the hypervisor view, the VM view (STM_*)
+    "CPU0_STM_CLC", "CPU0_STM_ABS", "CPU0_STMHV_VM0_CMP0",
+    "CPU0_STMHV_VM0_CMP1",
+    "CPU0_STMHV_VM0_CMCON", "CPU0_STMHV_VM0_STM_ICR", "CPU0_STMHV_VM0_ISCR",
+    "CPU0_STMHV_VM0_ISR", "CPU0_STMHV_VM1_CMP0", "CPU0_STM_CMP0",
     # interrupt router: GPSR software triggers and service request nodes
     "INT_GPSRG0_SWC0", "INT_GPSRG0_SWC1", "INT_GPSRG1_SWC0",
     "INT_GPSRG0_SWCACCEN0",

@@ -88,6 +88,7 @@ struct Tc4xSfrStore {
     GHashTable *write_hooks;    /* addr -> Tc4xSfrWriteHook */
     GHashTable *read_hooks;     /* addr -> Tc4xSfrReadHook */
     GHashTable *watches;        /* addrs */
+    GPtrArray *passthrough;     /* MemoryRegions that forward to the store */
 
     const Tc4xSfrModelOps *models;
     void *models_opaque;
@@ -316,15 +317,21 @@ Object *tc4x_sfr_store_owner(Tc4xSfrStore *st, uint32_t addr)
 {
     MemoryRegionSection sec = memory_region_find(get_system_memory(), addr, 4);
     Object *owner = sec.mr ? memory_region_owner(sec.mr) : NULL;
+    bool store = owner == OBJECT(st) ||
+                 (sec.mr && g_ptr_array_find(st->passthrough, sec.mr, NULL));
 
     if (sec.mr) {
         memory_region_unref(sec.mr);
     }
-    /* the SoC's own pages (STM, TBU) forward to the store */
-    if (owner == OBJECT(st) || owner == OBJECT(st)->parent) {
+    if (store) {
         return NULL;
     }
     return owner ? owner : OBJECT(get_system_memory());
+}
+
+void tc4x_sfr_store_add_passthrough(Tc4xSfrStore *st, MemoryRegion *mr)
+{
+    g_ptr_array_add(st->passthrough, mr);
 }
 
 void tc4x_sfr_store_watch(Tc4xSfrStore *st, uint32_t addr, bool on)
@@ -654,6 +661,7 @@ static void tc4x_sfr_store_init(Object *obj)
         sysbus_init_mmio(SYS_BUS_DEVICE(obj), &st->seg[i]);
     }
     st->semantics = g_hash_table_new(g_direct_hash, g_direct_equal);
+    st->passthrough = g_ptr_array_new();
     st->kresets = g_hash_table_new(g_direct_hash, g_direct_equal);
     st->write_hooks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                             NULL, g_free);

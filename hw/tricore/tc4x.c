@@ -44,6 +44,7 @@
 #include "hw/tricore/tc4x_regs.h"
 #include "hw/tricore/tc4x_sfr_store.h"
 #include "hw/tricore/tc4x_ir.h"
+#include "hw/tricore/tc4x_timebase.h"
 #include "tc4x_soc.h"
 
 #define TC4X_PSPR_OFFSET    (1 * MiB)
@@ -56,20 +57,8 @@
 #define TC4X_LOCAL_DSPR     0xD0000000u
 #define TC4X_LOCAL_PSPR     0xC0000000u
 
-#define TC4X_STM_HZ         500000000ULL
-
 #define CPU_SFR_BASE        0xF8800000u
 #define CPU_SFR_STRIDE      0x40000u
-#define CPU_STM_ABS         0x20u
-#define CPU_STM_VM_BASE     0x100u
-#define CPU_STM_VM_STRIDE   0x20u
-#define CPU_STM_VM_COUNT    8
-#define STM_CMP0            0x00u
-#define STM_CMP1            0x04u
-#define STM_CMCON           0x08u
-#define STM_ICR             0x0Cu
-#define STM_ISCR            0x10u
-#define STM_ISR             0x14u
 #define CPU_HRA_PC          0x1FE08u
 #define CPU_HRA_CORE_ID     0x1FE1Cu
 #define CPU_HRA_BOOTCON     0x1FE60u
@@ -84,8 +73,6 @@
 #define INT_GPSRG_SWC_SETR  BIT(29)
 #define SRC_GPSR0_SR0       0xF4433460u
 #define SRC_GPSR_STRIDE     0x20u
-#define SRC_STMCPU_BASE     (SRC_BASE + 0x20u)
-#define SRC_STMCPU_STRIDE   0x40u
 #define SRC_ASCLIN_TX(n)    (SRC_BASE + 0x2B0u + (n) * 12u)
 #define SRC_ASCLIN_RX(n)    (SRC_BASE + 0x2B4u + (n) * 12u)
 
@@ -238,12 +225,6 @@
 #define QSPI_MCCON_IALS     BIT(23)
 #define SRC_QSPI_STRIDE     0x14u
 
-/* eGTM TBU channel 0: 27 bits of the STM time base */
-#define EGTM_TBU_PAGE       0xF9080000u
-#define EGTM_TBU_CH0_BASE   0x108u
-#define EGTM_TBU_CH0        (EGTM_TBU_PAGE + EGTM_TBU_CH0_BASE)
-#define EGTM_TBU_MASK       0x07FFFFFFu
-
 /*
  * Start-up status reported as done: CLOCK_RAMPSTAT.ACTIVE (IfxClock.c),
  * VMTn_MEMDONE(CS) (the memory test sequence of IfxVmt.h).
@@ -253,29 +234,10 @@
 #define VMT_STRIDE          (A_VMT1_MEMDONE - A_VMT0_MEMDONE)
 #define VMT_COUNT           7u
 
-#define TC4X_RETIME_MAX         16
-
-typedef struct Tc4xStmPage {
-    MemoryRegion mr;
-    Tc4xSoc *soc;
-    uint32_t base;
-} Tc4xStmPage;
-
 typedef struct Tc4xTomCounter {
     uint32_t start;     /* CN0 value written by software */
     int64_t t0_ns;      /* guest time of that write */
 } Tc4xTomCounter;
-
-typedef struct Tc4xStmTimer {
-    struct Tc4xSoc *s;
-    QEMUTimer *timer;
-    uint8_t core;
-    uint8_t vm;
-    uint8_t cmp;
-    bool fired;
-    uint64_t fired_target;  /* compare value of the last match */
-    uint64_t due;           /* STM count the timer is armed for */
-} Tc4xStmTimer;
 
 /* A DMU command interface: the host's (HCI) or the CSRM's (CSCI) */
 typedef struct Tc4xDmuIf {
@@ -295,15 +257,6 @@ typedef struct Tc4xQspiSlave {
     void *opaque;
 } Tc4xQspiSlave;
 
-typedef struct Tc4xRetimeNotifier {
-    Tc4xRetimeFn fn;
-    void *opaque;
-} Tc4xRetimeNotifier;
-
-typedef struct Tc4xTimeRequest {
-    uint32_t scale;
-} Tc4xTimeRequest;
-
 typedef struct Tc4xSimCommand {
     const char *prefix;
     Tc4xSimCommandFn fn;
@@ -318,8 +271,6 @@ struct Tc4xSoc {
 
     TriCoreCPU *cpu[TC4X_NUM_CORES];
     MemoryRegion cpu_root[TC4X_NUM_CORES];
-    Tc4xStmPage stm_page[TC4X_NUM_CORES];
-    Tc4xStmPage tbu_page;
     MemoryRegion cpu_sys_alias[TC4X_NUM_CORES];
     MemoryRegion cpu_local_dspr[TC4X_NUM_CORES];
     MemoryRegion cpu_local_pspr[TC4X_NUM_CORES];
@@ -346,21 +297,8 @@ struct Tc4xSoc {
     DeviceState *geth;
     Tc4xIr *ir;
 
-    /*
-     * Guest time: the STM and eGTM run at 1/time_scale of QEMU virtual time
-     * and stop at time_barrier.  Read on any thread under time_lock.
-     */
-    uint32_t time_scale;
-    int64_t time_base_host;
-    int64_t time_base_guest;
-    int64_t time_barrier;
-    QemuSeqLock time_lock;
-    GPtrArray *time_requests;
+    Tc4xTimebase *timebase;
     Tc4xTimeRequest *bridge_time_request;
-    Tc4xRetimeNotifier retime[TC4X_RETIME_MAX];
-    unsigned n_retime;
-
-    Tc4xStmTimer stm[TC4X_NUM_CORES][CPU_STM_VM_COUNT][2];
 
     uint32_t console;       /* ASCLIN instance of the console chardev */
     CharFrontend uart;
@@ -407,6 +345,11 @@ struct Tc4xSoc {
 Tc4xGpio *tc4x_soc_gpio(Tc4xSoc *s)
 {
     return s->gpio;
+}
+
+Tc4xTimebase *tc4x_soc_timebase(Tc4xSoc *s)
+{
+    return s->timebase;
 }
 
 Tc4xAdc *tc4x_soc_adc(Tc4xSoc *s)
@@ -475,123 +418,14 @@ void tc4x_irq_raise(Tc4xSoc *s, uint32_t src)
     qemu_irq_pulse(tc4x_ir_src(s->ir, src));
 }
 
-/*
- * Slowing guest time gives external processes more wall time per emulated
- * millisecond.  Guest time does not run past time_barrier: an interrupt
- * pacer stops it at its next tick, which the main loop raises late.
- */
-/* Guest time at QEMU virtual time @virt_ns, before any barrier */
-static int64_t guest_at(Tc4xSoc *s, int64_t virt_ns)
-{
-    return qatomic_read(&s->time_base_guest) +
-           (virt_ns - qatomic_read(&s->time_base_host)) /
-           qatomic_read(&s->time_scale);
-}
-
-static int64_t guest_ns(Tc4xSoc *s)
-{
-    int64_t ns;
-    unsigned start;
-
-    do {
-        start = seqlock_read_begin(&s->time_lock);
-        ns = guest_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-        ns = MIN(ns, qatomic_read(&s->time_barrier));
-    } while (seqlock_read_retry(&s->time_lock, start));
-    return ns;
-}
-
-static int64_t host_ns_for_guest(Tc4xSoc *s, int64_t ns)
-{
-    return s->time_base_host + (ns - s->time_base_guest) * s->time_scale;
-}
-
 int64_t tc4x_guest_ns(Tc4xSoc *s)
 {
-    return guest_ns(s);
+    return tc4x_timebase_ns(s->timebase);
 }
 
 int64_t tc4x_host_ns_for_guest(Tc4xSoc *s, int64_t guest_ns)
 {
-    return host_ns_for_guest(s, guest_ns);
-}
-
-static uint64_t stm_now(Tc4xSoc *s)
-{
-    /* read on every timer poll: keep it a division by a constant */
-    QEMU_BUILD_BUG_ON(NANOSECONDS_PER_SECOND % TC4X_STM_HZ);
-    return guest_ns(s) / (NANOSECONDS_PER_SECOND / TC4X_STM_HZ);
-}
-
-static uint32_t stm_vm_reg(int core, int vm, uint32_t off)
-{
-    return CPU_SFR_BASE + core * CPU_SFR_STRIDE + CPU_STM_VM_BASE +
-           vm * CPU_STM_VM_STRIDE + off;
-}
-
-#define STM_LATE_WINDOW     (TC4X_STM_HZ / 10)     /* 100 ms */
-
-static void stm_schedule(Tc4xSoc *s, int core, int vm, int cmp)
-{
-    Tc4xStmTimer *t = &s->stm[core][vm][cmp];
-    uint32_t icr = reg_get(s, stm_vm_reg(core, vm, STM_ICR));
-    uint32_t cmcon = reg_get(s, stm_vm_reg(core, vm, STM_CMCON)) >>
-                     (cmp ? 16 : 0);
-    uint32_t msize = cmcon & 0x1F;
-    uint32_t mstart = (cmcon >> 8) & 0x3F;
-    uint64_t mask = (2ULL << msize) - 1;
-    uint64_t now = stm_now(s);
-    uint64_t cur, target, delta, due;
-
-    if (!(icr & (cmp ? BIT(4) : BIT(0)))) {
-        timer_del(t->timer);
-        return;
-    }
-    target = reg_get(s, stm_vm_reg(core, vm, cmp ? STM_CMP1 : STM_CMP0)) &
-             mask;
-    cur = (now >> mstart) & mask;
-    delta = (target - cur) & mask;
-    if (delta == 0) {
-        delta = mask + 1;
-    }
-    /*
-     * A compare can be found slightly behind the counter without having
-     * matched: software that re-arms with CMP = ABS + period can be
-     * preempted for a period in between, or a time-scale change reschedules
-     * a timer whose callback had not run yet.  Rather than waiting 8.6 s for
-     * the 32-bit wrap, treat it as due now unless this value already fired.
-     */
-    if (mask > 2 * STM_LATE_WINDOW &&
-        ((cur - target) & mask) < STM_LATE_WINDOW &&
-        !(t->fired && (t->fired_target & mask) == target)) {
-        delta = 1;
-    }
-    due = (now >> mstart << mstart) + (delta << mstart);
-    t->due = due;
-    timer_mod(t->timer, host_ns_for_guest(s, muldiv64(due,
-                                                      NANOSECONDS_PER_SECOND,
-                                                      TC4X_STM_HZ)));
-}
-
-static void stm_fire(void *opaque)
-{
-    Tc4xStmTimer *t = opaque;
-    Tc4xSoc *s = t->s;
-    uint32_t isr_addr = stm_vm_reg(t->core, t->vm, STM_ISR);
-    uint32_t icr = reg_get(s, stm_vm_reg(t->core, t->vm, STM_ICR));
-    uint32_t os = (icr >> (t->cmp ? 5 : 1)) & 1;
-
-    if (stm_now(s) < t->due) {
-        /* guest time stands at a barrier, which re-arms it when it moves */
-        return;
-    }
-    reg_set(s, isr_addr, reg_get(s, isr_addr) | BIT(t->cmp));
-    t->fired = true;
-    t->fired_target = reg_get(s, stm_vm_reg(t->core, t->vm,
-                                            t->cmp ? STM_CMP1 : STM_CMP0));
-    src_raise(s, SRC_STMCPU_BASE + t->core * SRC_STMCPU_STRIDE +
-                 (2 * t->vm + os) * 4);
-    stm_schedule(s, t->core, t->vm, t->cmp);
+    return tc4x_timebase_host_ns(s->timebase, guest_ns);
 }
 
 static uint32_t asclin_reg(unsigned n, uint32_t off)
@@ -1404,7 +1238,7 @@ static uint32_t tom_cn0_read(Tc4xSoc *s, uint32_t addr)
     Tc4xTomCounter *c = g_hash_table_lookup(s->tom_cn0, GUINT_TO_POINTER(addr));
     uint64_t period = reg_get(s, addr - EGTM_TOM_CN0 + EGTM_TOM_CM0) &
                       EGTM_TOM_CN0_MASK;
-    int64_t now = guest_ns(s);
+    int64_t now = tc4x_timebase_ns(s->timebase);
     uint64_t ticks;
 
     if (!c) {
@@ -1454,7 +1288,7 @@ static void tom_cn0_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
     Tc4xTomCounter *c = g_new0(Tc4xTomCounter, 1);
 
     c->start = val & EGTM_TOM_CN0_MASK;
-    c->t0_ns = guest_ns(s);
+    c->t0_ns = tc4x_timebase_ns(s->timebase);
     g_hash_table_insert(s->tom_cn0, GUINT_TO_POINTER(addr), c);
 }
 
@@ -1489,8 +1323,6 @@ static bool soc_read_word(Tc4xSoc *s, uint32_t addr, uint32_t *val)
     if (tc4x_gpio_read(s->gpio, addr, val) ||
         tc4x_i2c_read(s->i2c, addr, val) || tc4x_adc_read(s->adc, addr, val)) {
         /* a pin or bus model */
-    } else if (addr == EGTM_TBU_CH0) {
-        *val = stm_now(s) & EGTM_TBU_MASK;
     } else if (sfr_is_cpu(addr, &core, &off)) {
         if (off == CPU_HRA_CORE_ID || off == CPU_HRHV_CORE_ID) {
             *val = core;
@@ -1567,7 +1399,7 @@ static Tc4xSfrPath soc_sfr_read_lockless(void *opaque, uint32_t addr,
         tc4x_adc_read(s->adc, word, val)) {
         return TC4X_SFR_PATH_SERVED;
     }
-    if (tc4x_i2c_owns(word) || word == EGTM_TBU_CH0) {
+    if (tc4x_i2c_owns(word)) {
         return TC4X_SFR_PATH_LOCKED;
     }
     if (!qspi_decode(word, &qn, &qoff)) {
@@ -1637,23 +1469,8 @@ static void soc_cpu_write(Tc4xSoc *s, uint32_t addr, int core, uint32_t off,
         uint32_t pc = reg_get(s, addr - CPU_HRA_BOOTCON + CPU_HRA_PC) & ~1u;
 
         tricore_cpu_release_boot_halt(s->cpu[core], pc);
-    } else if (off >= CPU_STM_VM_BASE &&
-               off < CPU_STM_VM_BASE + CPU_STM_VM_COUNT * CPU_STM_VM_STRIDE) {
-        int vm = (off - CPU_STM_VM_BASE) / CPU_STM_VM_STRIDE;
-        uint32_t r = (off - CPU_STM_VM_BASE) % CPU_STM_VM_STRIDE;
-
-        if (r == STM_ISCR) {
-            uint32_t isr_addr = stm_vm_reg(core, vm, STM_ISR);
-            uint32_t isr = reg_get(s, isr_addr);
-
-            isr &= ~((val & BIT(0) ? BIT(0) : 0) | (val & BIT(2) ? BIT(1) : 0));
-            isr |= (val & BIT(1) ? BIT(0) : 0) | (val & BIT(3) ? BIT(1) : 0);
-            reg_set(s, isr_addr, isr);
-            reg_set(s, addr, 0);
-        } else if (r <= STM_ICR) {
-            stm_schedule(s, core, vm, 0);
-            stm_schedule(s, core, vm, 1);
-        }
+    } else {
+        tc4x_timebase_cpu_sfr_written(s->timebase, addr, val);
     }
 }
 
@@ -1781,341 +1598,15 @@ void tc4x_sfr_add_read_hook(Tc4xSoc *s, uint32_t addr, Tc4xSfrReadFn fn,
     tc4x_sfr_store_add_read_hook(s->sfr, addr, fn, opaque);
 }
 
-/*
- * Idle cores poll CPUx_STM_ABS continuously.  Its page is a lockless_io
- * region of its own (a smaller region would sit behind a subpage container
- * that takes the BQL); the page's other registers take the usual path.
- */
-#define CPU_STM_PAGE_SIZE   (1u << TARGET_PAGE_BITS)
-#define CPU_STM_VIEW        0x120u
-
-/*
- * The CPUx_STM view at +0x120 shows the registers of the VM the CPU runs
- * in.  Without a hypervisor model that is VM0.
- */
-static hwaddr cpu_stm_page_offset(hwaddr off)
-{
-    if (off >= CPU_STM_VIEW && off < CPU_STM_VIEW + CPU_STM_VM_STRIDE) {
-        return off - CPU_STM_VIEW + CPU_STM_VM_BASE;
-    }
-    return off;
-}
-
-static uint64_t cpu_stm_page_read(void *opaque, hwaddr off, unsigned size)
-{
-    Tc4xStmPage *pg = opaque;
-
-    if (off >= CPU_STM_ABS && off + size <= CPU_STM_ABS + 8) {
-        return extract64(stm_now(pg->soc), (off - CPU_STM_ABS) * 8,
-                         size * 8);
-    }
-    return tc4x_sfr_store_access_read(pg->soc->sfr,
-                                      pg->base + cpu_stm_page_offset(off),
-                                      size);
-}
-
-static void cpu_stm_page_write(void *opaque, hwaddr off, uint64_t val,
-                               unsigned size)
-{
-    Tc4xStmPage *pg = opaque;
-
-    tc4x_sfr_store_access_write(pg->soc->sfr,
-                                pg->base + cpu_stm_page_offset(off), val,
-                                size);
-}
-
-static const MemoryRegionOps cpu_stm_page_ops = {
-    .read = cpu_stm_page_read,
-    .write = cpu_stm_page_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 8 },
-    .impl = { .min_access_size = 1, .max_access_size = 4 },
-};
-
-/*
- * Served without the BQL like the STM, so that back-to-back STM and TBU
- * reads see the same delay.
- */
-static uint64_t tbu_page_read(void *opaque, hwaddr off, unsigned size)
-{
-    Tc4xStmPage *pg = opaque;
-
-    if (off == EGTM_TBU_CH0_BASE && size == 4) {
-        return stm_now(pg->soc) & EGTM_TBU_MASK;
-    }
-    return tc4x_sfr_store_access_read(pg->soc->sfr, pg->base + off, size);
-}
-
-static void tbu_page_write(void *opaque, hwaddr off, uint64_t val,
-                           unsigned size)
-{
-    Tc4xStmPage *pg = opaque;
-
-    tc4x_sfr_store_access_write(pg->soc->sfr, pg->base + off, val, size);
-}
-
-static const MemoryRegionOps tbu_page_ops = {
-    .read = tbu_page_read,
-    .write = tbu_page_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 8 },
-    .impl = { .min_access_size = 1, .max_access_size = 4 },
-};
-
-static void retime_all(Tc4xSoc *s)
-{
-    for (int c = 0; c < TC4X_NUM_CORES; c++) {
-        for (int vm = 0; vm < CPU_STM_VM_COUNT; vm++) {
-            stm_schedule(s, c, vm, 0);
-            stm_schedule(s, c, vm, 1);
-        }
-    }
-    for (unsigned i = 0; i < s->n_retime; i++) {
-        s->retime[i].fn(s->retime[i].opaque);
-    }
-}
-
 void tc4x_time_add_retime_notifier(Tc4xSoc *s, Tc4xRetimeFn fn, void *opaque)
 {
-    assert(s->n_retime < TC4X_RETIME_MAX);
-    s->retime[s->n_retime++] = (Tc4xRetimeNotifier) { fn, opaque };
-}
-
-/*
- * Move the guest-time barrier to @barrier (INT64_MAX: none).  If guest time
- * stood at the old barrier, it resumes from there (the wall time it stood
- * still is not made up), so the mapping changes and timers are re-armed.
- */
-static void time_barrier(Tc4xSoc *s, int64_t barrier)
-{
-    int64_t v, old, unclamped, now;
-    bool stood, held = false;
-
-    /*
-     * One clock sample inside the write section, so readers see guest time
-     * continue from the same instant across the update.  Guest time never
-     * runs backwards: a barrier behind it (a slot guest time ran past while
-     * the barrier was lifted, e.g. during a long tick hold) holds guest time
-     * where it is instead.
-     */
-    seqlock_write_begin(&s->time_lock);
-    v = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    old = qatomic_read(&s->time_barrier);
-    unclamped = guest_at(s, v);
-    stood = unclamped > old;
-    now = MIN(unclamped, old);
-    if (barrier < now) {
-        barrier = now;
-        held = true;
-    }
-    if (stood) {
-        qatomic_set(&s->time_base_host, v);
-        qatomic_set(&s->time_base_guest, now);
-    }
-    qatomic_set(&s->time_barrier, barrier);
-    seqlock_write_end(&s->time_lock);
-    trace_tc4x_time_barrier(barrier, held, stood);
-    if (stood) {
-        retime_all(s);
-    }
-}
-
-/* Guest time runs at 1/N of virtual time, continuous across the change */
-static void set_timescale(Tc4xSoc *s, uint32_t n)
-{
-    int64_t v, now;
-
-    seqlock_write_begin(&s->time_lock);
-    v = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    now = MIN(guest_at(s, v), qatomic_read(&s->time_barrier));
-    qatomic_set(&s->time_base_host, v);
-    qatomic_set(&s->time_base_guest, now);
-    qatomic_set(&s->time_scale, MAX(1, n));
-    seqlock_write_end(&s->time_lock);
-    trace_tc4x_time_scale(n, now);
-    retime_all(s);
-}
-
-/* Guest time runs at the slowest scale any client requests */
-static Tc4xTimeRequest *time_request_new(Tc4xSoc *s)
-{
-    Tc4xTimeRequest *r = g_new(Tc4xTimeRequest, 1);
-
-    r->scale = 1;
-    g_ptr_array_add(s->time_requests, r);
-    return r;
-}
-
-static void time_request(Tc4xSoc *s, Tc4xTimeRequest *r, uint32_t n)
-{
-    uint32_t eff = 1;
-
-    r->scale = MAX(1, n);
-    for (guint i = 0; i < s->time_requests->len; i++) {
-        Tc4xTimeRequest *q = g_ptr_array_index(s->time_requests, i);
-
-        eff = MAX(eff, q->scale);
-    }
-    if (eff != s->time_scale) {
-        set_timescale(s, eff);
-    }
-}
-
-typedef struct Tc4xSocPacer {
-    Tc4xSoc *soc;
-    Tc4xPacer *pacer;
-    Tc4xTimeRequest *time_request;
-    QEMUTimer *timer[TC4X_PACER_TIMERS];
-} Tc4xSocPacer;
-
-static int64_t pacer_guest_ns(void *opaque)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    return guest_ns(sp->soc);
-}
-
-static int64_t pacer_host_ns(void *opaque)
-{
-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-}
-
-static int64_t pacer_host_ns_for_guest(void *opaque, int64_t ns)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    return host_ns_for_guest(sp->soc, ns);
-}
-
-static void pacer_barrier(void *opaque, int64_t ns)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    time_barrier(sp->soc, ns);
-}
-
-static void pacer_request_scale(void *opaque, uint32_t scale)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    time_request(sp->soc, sp->time_request, scale);
-}
-
-static uint32_t pacer_requested_scale(void *opaque)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    return sp->time_request->scale;
-}
-
-static bool pacer_pending(void *opaque, uint32_t src)
-{
-    Tc4xSocPacer *sp = opaque;
-    uint32_t v = tc4x_ir_src_get(sp->soc->ir, src);
-    uint32_t mask = R_SRC_SRCR_SRE_MASK | R_SRC_SRCR_SRR_MASK;
-
-    return (v & mask) == mask;
-}
-
-static void pacer_raise(void *opaque, uint32_t src)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    src_raise(sp->soc, src);
-}
-
-static uint32_t pacer_cpu_prio(void *opaque, unsigned core)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    return sp->soc->cpu[core]->env.ICR & 0xFFu;
-}
-
-static void pacer_timer_mod(void *opaque, Tc4xPacerTimer t, int64_t ns)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    timer_mod(sp->timer[t], ns);
-}
-
-static void pacer_timer_del(void *opaque, Tc4xPacerTimer t)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    timer_del(sp->timer[t]);
-}
-
-static const Tc4xPacerHost pacer_host = {
-    .guest_ns = pacer_guest_ns,
-    .host_ns = pacer_host_ns,
-    .host_ns_for_guest = pacer_host_ns_for_guest,
-    .barrier = pacer_barrier,
-    .request_scale = pacer_request_scale,
-    .requested_scale = pacer_requested_scale,
-    .pending = pacer_pending,
-    .raise = pacer_raise,
-    .cpu_prio = pacer_cpu_prio,
-    .timer_mod = pacer_timer_mod,
-    .timer_del = pacer_timer_del,
-};
-
-static void pacer_tick_timer(void *opaque)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    tc4x_pacer_timer(sp->pacer, TC4X_PACER_TIMER_TICK);
-}
-
-static void pacer_check_timer(void *opaque)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    tc4x_pacer_timer(sp->pacer, TC4X_PACER_TIMER_CHECK);
-}
-
-static void pacer_hold_timer(void *opaque)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    tc4x_pacer_timer(sp->pacer, TC4X_PACER_TIMER_HOLD);
-}
-
-static void pacer_acked(void *opaque, uint32_t src)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    tc4x_pacer_acked(sp->pacer, src);
-}
-
-static void pacer_retime(void *opaque)
-{
-    Tc4xSocPacer *sp = opaque;
-
-    tc4x_pacer_retime(sp->pacer);
+    tc4x_timebase_add_retime_notifier(s->timebase, fn, opaque);
 }
 
 Tc4xPacer *tc4x_pacer_new(Tc4xSoc *s, const Tc4xPacerConfig *cfg,
                           const Tc4xPacerOps *ops, void *opaque)
 {
-    Tc4xSocPacer *sp = g_new0(Tc4xSocPacer, 1);
-
-    sp->soc = s;
-    sp->time_request = time_request_new(s);
-    sp->timer[TC4X_PACER_TIMER_TICK] =
-        timer_new_ns(QEMU_CLOCK_VIRTUAL, pacer_tick_timer, sp);
-    sp->timer[TC4X_PACER_TIMER_CHECK] =
-        timer_new_ns(QEMU_CLOCK_VIRTUAL, pacer_check_timer, sp);
-    sp->timer[TC4X_PACER_TIMER_HOLD] =
-        timer_new_ns(QEMU_CLOCK_VIRTUAL, pacer_hold_timer, sp);
-    sp->pacer = tc4x_pacer_create(&pacer_host, sp, cfg, ops, opaque);
-    for (unsigned i = 0; i < cfg->n_srcs; i++) {
-        tc4x_ir_add_ack_listener(s->ir, cfg->srcs[i], pacer_acked, sp);
-    }
-    if (cfg->hold_src) {
-        tc4x_ir_add_ack_listener(s->ir, cfg->hold_src, pacer_acked, sp);
-    }
-    tc4x_time_add_retime_notifier(s, pacer_retime, sp);
-    return sp->pacer;
+    return tc4x_timebase_new_pacer(s->timebase, cfg, ops, opaque);
 }
 
 void tc4x_sim_add_command(Tc4xSoc *s, const char *prefix, Tc4xSimCommandFn fn,
@@ -2249,8 +1740,8 @@ static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
         vm_start();
         sim_printf(s, "ok\n");
     } else if (!strcmp(argv[0], "timescale") && argc >= 2) {
-        time_request(s, s->bridge_time_request, a[1]);
-        sim_printf(s, "ok %u\n", s->time_scale);
+        tc4x_timebase_request(s->timebase, s->bridge_time_request, a[1]);
+        sim_printf(s, "ok %u\n", tc4x_timebase_scale(s->timebase));
     } else {
         g_autoptr(GString) out = g_string_new(NULL);
 
@@ -2526,12 +2017,6 @@ static void tc4x_soc_reset_hold(Object *obj, ResetType type)
     }
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         cpu_reset(CPU(s->cpu[c]));
-        for (int vm = 0; vm < CPU_STM_VM_COUNT; vm++) {
-            for (int cmp = 0; cmp < 2; cmp++) {
-                timer_del(s->stm[c][vm][cmp].timer);
-                s->stm[c][vm][cmp].fired = false;
-            }
-        }
     }
     /* state that mirrors registers the store resets */
     g_hash_table_remove_all(s->tom_cn0);
@@ -2604,7 +2089,7 @@ static void tc4x_force_soc_status(Tc4xSoc *s)
     }
 }
 
-/* Core @c, its view of memory (local DSPR and PSPR) and its STM timers */
+/* Core @c and its view of memory (local DSPR and PSPR) */
 static bool tc4x_soc_add_cpu(Tc4xSoc *s, int c, Error **errp)
 {
     g_autofree char *name = g_strdup_printf("cpu[%d]", c);
@@ -2636,29 +2121,7 @@ static bool tc4x_soc_add_cpu(Tc4xSoc *s, int c, Error **errp)
         return false;
     }
     s->cpu[c] = TRICORE_CPU(cpuobj);
-
-    for (int vm = 0; vm < CPU_STM_VM_COUNT; vm++) {
-        for (int cmp = 0; cmp < 2; cmp++) {
-            Tc4xStmTimer *t = &s->stm[c][vm][cmp];
-
-            t->s = s;
-            t->core = c;
-            t->vm = vm;
-            t->cmp = cmp;
-            t->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stm_fire, t);
-        }
-    }
     return true;
-}
-
-/* An SFR region served without the BQL where the access allows it */
-static void tc4x_soc_init_sfr_io(Tc4xSoc *s, MemoryRegion *mr,
-                                 const MemoryRegionOps *ops, void *opaque,
-                                 const char *name, uint64_t size)
-{
-    memory_region_init_io(mr, OBJECT(s), ops, opaque, name, size);
-    memory_region_enable_lockless_io(mr);
-    memory_region_set_imprecise_io(mr, s->imprecise_io);
 }
 
 /* The interrupt router, over the store at the SRC registers */
@@ -2680,6 +2143,46 @@ static bool tc4x_soc_add_ir(Tc4xSoc *s, Error **errp)
     s->ir = TC4X_IR(dev);
     tc4x_ir_set_watch_fn(s->ir, soc_sfr_watched, s);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, TC4X_IR_SRC_BASE);
+    return true;
+}
+
+/*
+ * The time base: STM and TBU pages over the store, the STM service
+ * requests on their router lines
+ */
+static bool tc4x_soc_add_timebase(Tc4xSoc *s, Error **errp)
+{
+    DeviceState *dev = qdev_new(TYPE_TC4X_TIMEBASE);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    uint32_t src_stride = A_SRC_STMCPU1_SR0 - A_SRC_STMCPU0_SR0;
+
+    object_property_add_child(OBJECT(s), "timebase", OBJECT(dev));
+    qdev_prop_set_bit(dev, "imprecise-io", s->imprecise_io);
+    object_property_set_link(OBJECT(dev), "sfr-store", OBJECT(s->sfr),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "ir", OBJECT(s->ir), &error_abort);
+    for (int c = 0; c < TC4X_NUM_CORES; c++) {
+        g_autofree char *name = g_strdup_printf("cpu%d", c);
+
+        object_property_set_link(OBJECT(dev), name, OBJECT(s->cpu[c]),
+                                 &error_abort);
+    }
+    if (!sysbus_realize_and_unref(sbd, errp)) {
+        return false;
+    }
+    s->timebase = TC4X_TIMEBASE(dev);
+    for (int c = 0; c < TC4X_NUM_CORES; c++) {
+        sysbus_mmio_map_overlap(sbd, c, CPU_SFR_BASE + c * CPU_SFR_STRIDE, 0);
+        for (int k = 0; k < TC4X_STM_IRQS_PER_CPU; k++) {
+            qdev_connect_gpio_out_named(dev, "stm",
+                                        c * TC4X_STM_IRQS_PER_CPU + k,
+                                        tc4x_ir_src(s->ir,
+                                                    A_SRC_STMCPU0_SR0 +
+                                                    c * src_stride + 4 * k));
+        }
+    }
+    sysbus_mmio_map_overlap(sbd, TC4X_TIMEBASE_TBU_MMIO,
+                            A_EGTM_CLS0_TBU_CH0_BASE & TARGET_PAGE_MASK, 0);
     return true;
 }
 
@@ -2750,16 +2253,6 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
         s->qspi_rx[n] = g_queue_new();
         s->qspi_cs[n] = -1;
     }
-    s->time_scale = 1;
-    s->time_barrier = INT64_MAX;
-    seqlock_init(&s->time_lock);
-    s->time_requests = g_ptr_array_new_with_free_func(g_free);
-    s->bridge_time_request = time_request_new(s);
-
-    s->gpio = tc4x_gpio_new(s);
-    s->adc = tc4x_adc_new(s);
-    s->i2c = tc4x_i2c_new(s);
-    tc4x_force_soc_status(s);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         g_autofree char *name = g_strdup_printf("core%d.spr", c);
@@ -2784,30 +2277,18 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion(sysmem, TC4X_LMU_NC_BASE, &s->lmu_alias);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
-        g_autofree char *name = g_strdup_printf("cpu%d.stm_page", c);
-        Tc4xStmPage *pg = &s->stm_page[c];
-
-        pg->soc = s;
-        pg->base = CPU_SFR_BASE + c * CPU_SFR_STRIDE;
-        tc4x_soc_init_sfr_io(s, &pg->mr, &cpu_stm_page_ops, pg, name,
-                             CPU_STM_PAGE_SIZE);
-        memory_region_add_subregion_overlap(sysmem, pg->base, &pg->mr, 0);
-    }
-    s->tbu_page.soc = s;
-    s->tbu_page.base = EGTM_TBU_PAGE;
-    tc4x_soc_init_sfr_io(s, &s->tbu_page.mr, &tbu_page_ops, &s->tbu_page,
-                         "egtm.tbu_page", CPU_STM_PAGE_SIZE);
-    memory_region_add_subregion_overlap(sysmem, EGTM_TBU_PAGE, &s->tbu_page.mr,
-                                        0);
-
-    for (int c = 0; c < TC4X_NUM_CORES; c++) {
         if (!tc4x_soc_add_cpu(s, c, errp)) {
             return;
         }
     }
-    if (!tc4x_soc_add_ir(s, errp)) {
+    if (!tc4x_soc_add_ir(s, errp) || !tc4x_soc_add_timebase(s, errp)) {
         return;
     }
+    s->bridge_time_request = tc4x_timebase_new_request(s->timebase);
+    s->gpio = tc4x_gpio_new(s);
+    s->adc = tc4x_adc_new(s);
+    s->i2c = tc4x_i2c_new(s);
+    tc4x_force_soc_status(s);
     tc4x_geth_init(s, sysmem);
 
     qemu_chr_fe_set_handlers(&s->uart, uart_can_receive, uart_receive, NULL,

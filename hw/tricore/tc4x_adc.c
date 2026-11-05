@@ -54,7 +54,7 @@ typedef struct AdcInput {
 typedef struct AdcTrigger {
     struct Tc4xAdc *adc;
     unsigned n, sr;
-    QEMUTimer *timer;
+    Tc4xGuestTimer timer;
     int64_t period_ns;
     int64_t due_ns;         /* guest time of the next round (0: not armed) */
 } AdcTrigger;
@@ -136,23 +136,13 @@ static uint32_t adc_result(Tc4xAdc *a, unsigned n, unsigned k)
     return 0;
 }
 
-/*
- * Rounds are due at absolute guest times: the guest time scale can change
- * between rounds, and a timer armed relative to the scale of the moment
- * would land far off once the scale changes again.
- */
-static void adc_arm(AdcTrigger *t)
-{
-    timer_mod(t->timer, tc4x_host_ns_for_guest(t->adc->soc, t->due_ns));
-}
-
 /* Next round one period after the last one (or from now) */
 static void adc_schedule(AdcTrigger *t)
 {
     int64_t now = tc4x_guest_ns(t->adc->soc);
 
     if (!t->period_ns) {
-        timer_del(t->timer);
+        tc4x_guest_timer_del(&t->timer);
         t->due_ns = 0;
         return;
     }
@@ -160,20 +150,7 @@ static void adc_schedule(AdcTrigger *t)
     if (t->due_ns <= now) {
         t->due_ns = now + t->period_ns;
     }
-    adc_arm(t);
-}
-
-static void adc_retime(void *opaque)
-{
-    Tc4xAdc *a = opaque;
-
-    for (unsigned n = 0; n < TMADC_COUNT; n++) {
-        for (unsigned i = 0; i < TMADC_SR_COUNT; i++) {
-            if (timer_pending(a->trig[n][i].timer)) {
-                adc_arm(&a->trig[n][i]);
-            }
-        }
-    }
+    tc4x_guest_timer_mod(&t->timer, t->due_ns);
 }
 
 /* One conversion round: the service request sees new results */
@@ -199,7 +176,7 @@ static void adc_tick(void *opaque)
 static void adc_start(Tc4xAdc *a, unsigned n)
 {
     for (unsigned i = 0; i < TMADC_SR_COUNT; i++) {
-        if (!timer_pending(a->trig[n][i].timer)) {
+        if (!tc4x_guest_timer_pending(&a->trig[n][i].timer)) {
             adc_schedule(&a->trig[n][i]);
         }
     }
@@ -281,10 +258,10 @@ Tc4xAdc *tc4x_adc_new(Tc4xSoc *soc)
             t->n = n;
             t->sr = i;
             t->period_ns = ADC_DEFAULT_PERIOD_NS;
-            t->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, adc_tick, t);
+            tc4x_guest_timer_init(&t->timer, tc4x_soc_timebase(soc), adc_tick,
+                                  t);
         }
     }
-    tc4x_time_add_retime_notifier(soc, adc_retime, a);
     tc4x_sim_add_command(soc, "adc", adc_command, a, false);
     return a;
 }
