@@ -65,6 +65,13 @@ int64_t icount_to_ns(int64_t icount);
  */
 bool icount_configure(QemuOpts *opts, Error **errp);
 
+/*
+ * Whether icount is enabled with sleep=on (the default), where idle CPUs
+ * let QEMU_CLOCK_VIRTUAL follow real time, rather than with sleep=off,
+ * where it jumps to the next timer deadline.  False without icount.
+ */
+bool icount_sleep_enabled(void);
+
 /* used by tcg vcpu thread to calc icount budget */
 int64_t icount_round(int64_t count);
 

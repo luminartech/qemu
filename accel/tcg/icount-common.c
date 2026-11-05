@@ -415,6 +415,11 @@ void icount_account_warp_timer(void)
     icount_warp_rt();
 }
 
+bool icount_sleep_enabled(void)
+{
+    return icount_enabled() && icount_sleep;
+}
+
 bool icount_configure(QemuOpts *opts, Error **errp)
 {
     const char *option = qemu_opt_get(opts, "shift");

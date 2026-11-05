@@ -87,6 +87,11 @@ void qemu_guest_random_seed_thread_part2(uint64_t seed)
     }
 }
 
+bool qemu_guest_random_seeded(void)
+{
+    return deterministic;
+}
+
 int qemu_guest_random_seed_main(const char *seedstr, Error **errp)
 {
     uint64_t seed;

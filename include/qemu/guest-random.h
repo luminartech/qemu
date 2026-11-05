@@ -25,6 +25,13 @@
 int qemu_guest_random_seed_main(const char *seedstr, Error **errp);
 
 /**
+ * qemu_guest_random_seeded(void)
+ *
+ * Returns true if -seed put qemu_guest_getrandom into deterministic mode.
+ */
+bool qemu_guest_random_seeded(void);
+
+/**
  * qemu_guest_random_seed_thread_part1(void)
  *
  * If qemu_getrandom is in deterministic mode, returns an

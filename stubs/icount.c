@@ -13,6 +13,10 @@ bool icount_configure(QemuOpts *opts, Error **errp)
 
     return false;
 }
+bool icount_sleep_enabled(void)
+{
+    return false;
+}
 int64_t icount_get_raw(void)
 {
     abort();
