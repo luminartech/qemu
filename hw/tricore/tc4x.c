@@ -168,15 +168,6 @@
 #define DMA_SHCT_LINKED     0xCu
 #define DMA_MAX_CHAIN       4096u
 
-/*
- * TMADC kernels: MODSTAT follows the clock enable and MODCFG.RUN;
- * IfxAdc_Tmadc_runModule() waits for the calibration phase (CALPH)
- */
-#define TMADC_MODSTAT       0x1D4u
-#define TMADC_MODSTAT_DIS   BIT(0)
-#define TMADC_MODSTAT_RUN   BIT(1)
-#define TMADC_MODSTAT_CALPH_DONE (2u << 2)
-
 /* eGTM TOM channels: CN0 counts up at the CMU clock and wraps at CM0 */
 #define EGTM_TOM_BASE       0xF9081000u
 #define EGTM_CLS_STRIDE     0x20000u
@@ -282,7 +273,7 @@ struct Tc4xSoc {
     unsigned long dma_htre[BITS_TO_LONGS(DMA_NUM_CH)];
 
     Tc4xPorts *ports;
-    Tc4xAdc *adc;
+    Tc4xTmadc *tmadc;
     Tc4xI2c *i2c[TC4X_I2C_COUNT];
     Tc4xQspi *qspi[TC4X_QSPI_COUNT];
 
@@ -310,9 +301,9 @@ Tc4xTimebase *tc4x_soc_timebase(Tc4xSoc *s)
     return s->timebase;
 }
 
-Tc4xAdc *tc4x_soc_adc(Tc4xSoc *s)
+Tc4xTmadc *tc4x_soc_tmadc(Tc4xSoc *s)
 {
-    return s->adc;
+    return s->tmadc;
 }
 
 Tc4xI2c *tc4x_soc_i2c(Tc4xSoc *s, unsigned n)
@@ -1135,13 +1126,6 @@ static bool sfr_is_cpu(uint32_t addr, int *core, uint32_t *off)
     return true;
 }
 
-static bool sfr_is_tmadc_modstat(uint32_t addr)
-{
-    return addr >= TMADC_BASE &&
-           addr < TMADC_BASE + TMADC_COUNT * TMADC_STRIDE &&
-           (addr - TMADC_BASE) % TMADC_STRIDE == TMADC_MODSTAT;
-}
-
 /*
  * A read of the word at @addr served by a model, under the BQL; *@val holds
  * the stored word
@@ -1151,26 +1135,12 @@ static bool soc_read_word(Tc4xSoc *s, uint32_t addr, uint32_t *val)
     uint32_t off;
     int core;
 
-    if (tc4x_adc_read(s->adc, addr, val)) {
-        /* the ADC results */
-    } else if (sfr_is_cpu(addr, &core, &off)) {
+    if (sfr_is_cpu(addr, &core, &off)) {
         if (off == CPU_HRA_CORE_ID || off == CPU_HRHV_CORE_ID) {
             *val = core;
         } else if (off == CPU_HRA_BOOTCON) {
             *val = (*val & ~1u) | (s->cpu[core]->env.boot_halted ? 1 : 0);
         }
-    } else if (sfr_is_tmadc_modstat(addr)) {
-        uint32_t n = (addr - TMADC_BASE) / TMADC_STRIDE;
-        bool clk = reg_get(s, ADC_CLKEN_TMADC) & BIT(n);
-        bool run = reg_get(s, TMADC_BASE + n * TMADC_STRIDE + TMADC_MODCFG) &
-                   TMADC_RUN;
-
-        /*
-         * The power-on calibration phase completes at once: MODSTAT.CALPH
-         * reads 10B (calibration completed) as soon as the clock runs.
-         */
-        *val = (clk ? TMADC_MODSTAT_CALPH_DONE : TMADC_MODSTAT_DIS) |
-               (clk && run ? TMADC_MODSTAT_RUN : 0);
     } else if (tom_is_cn0(addr)) {
         *val = tom_cn0_read(s, addr);
     } else if (addr == A_CLOCK_SYSPLLSTAT || addr == A_CLOCK_PERPLLSTAT) {
@@ -1193,25 +1163,19 @@ static bool soc_sfr_read(void *opaque, uint32_t addr, uint32_t *val)
 }
 
 /*
- * Reads without the BQL: values computed from atomic state only (ADC
- * results).  Reads with side effects and time-derived or
- * CPU-specific values take the BQL.
+ * Reads with side effects and time-derived or CPU-specific values take
+ * the BQL; the store serves the others without it
  */
 static Tc4xSfrPath soc_sfr_read_lockless(void *opaque, uint32_t addr,
                                          unsigned size, uint32_t *val)
 {
-    Tc4xSoc *s = opaque;
     uint32_t word = addr & ~3u;
     uint32_t off;
     int core;
 
     if (sfr_is_cpu(word, &core, &off) || tom_is_cn0(word) ||
-        (word >= ASCLIN_BASE && word < ASCLIN_END) ||
-        sfr_is_tmadc_modstat(word)) {
+        (word >= ASCLIN_BASE && word < ASCLIN_END)) {
         return TC4X_SFR_PATH_LOCKED;
-    }
-    if (tc4x_adc_read(s->adc, word, val)) {
-        return TC4X_SFR_PATH_SERVED;
     }
     return TC4X_SFR_PATH_STORE;
 }
@@ -1236,8 +1200,7 @@ static bool soc_sfr_write(void *opaque, uint32_t addr, uint32_t *val)
     uint32_t off;
     int core;
 
-    if (asclin_write(s, addr, *val) || dma_write(s, addr, *val) ||
-        tc4x_adc_write(s->adc, addr, *val)) {
+    if (asclin_write(s, addr, *val) || dma_write(s, addr, *val)) {
         return true;
     }
     if (addr >= INT_GPSRG_SWC0 &&
@@ -1945,6 +1908,38 @@ static bool tc4x_soc_add_qspi(Tc4xSoc *s, Error **errp)
     return true;
 }
 
+/*
+ * The TMADC kernels over the store at their registers, their service
+ * requests on the router lines
+ */
+static bool tc4x_soc_add_tmadc(Tc4xSoc *s, Error **errp)
+{
+    DeviceState *dev = qdev_new(TYPE_TC4X_TMADC);
+    uint32_t stride = A_SRC_TMADC1_SR0 - A_SRC_TMADC0_SR0;
+
+    object_property_add_child(OBJECT(s), "tmadc", OBJECT(dev));
+    qdev_prop_set_bit(dev, "imprecise-io", s->imprecise_io);
+    object_property_set_link(OBJECT(dev), "sfr-store", OBJECT(s->sfr),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "timebase", OBJECT(s->timebase),
+                             &error_abort);
+    if (!sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), errp)) {
+        return false;
+    }
+    s->tmadc = TC4X_TMADC(dev);
+    for (unsigned k = 0; k < TC4X_TMADC_COUNT; k++) {
+        for (unsigned i = 0; i < TC4X_TMADC_SR_COUNT; i++) {
+            qdev_connect_gpio_out_named(dev, "sr",
+                                        k * TC4X_TMADC_SR_COUNT + i,
+                                        tc4x_ir_src(s->ir, A_SRC_TMADC0_SR0 +
+                                                    k * stride + 4 * i));
+        }
+    }
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, tc4x_tmadc_base(), 0);
+    tc4x_sim_add_command(s, "adc", tc4x_tmadc_command, s->tmadc, false);
+    return true;
+}
+
 /* The GPIO ports over the store, held at the board's straps */
 static bool tc4x_soc_add_ports(Tc4xSoc *s, Error **errp)
 {
@@ -2059,11 +2054,10 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
     }
     if (!tc4x_soc_add_ir(s, errp) || !tc4x_soc_add_timebase(s, errp) ||
         !tc4x_soc_add_i2c(s, errp) || !tc4x_soc_add_qspi(s, errp) ||
-        !tc4x_soc_add_ports(s, errp)) {
+        !tc4x_soc_add_ports(s, errp) || !tc4x_soc_add_tmadc(s, errp)) {
         return;
     }
     s->bridge_time_request = tc4x_timebase_new_request(s->timebase);
-    s->adc = tc4x_adc_new(s);
     tc4x_force_soc_status(s);
     tc4x_geth_init(s, sysmem);
 
