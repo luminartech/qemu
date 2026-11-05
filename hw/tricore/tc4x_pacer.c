@@ -257,7 +257,8 @@ void tc4x_pacer_sample(Tc4xPacer *p)
         next = MIN(p->live_scale + p->live_scale / 4 + 1, p->tune.max_scale);
     } else if (p->window_holds < p->tune.holds_low &&
                p->window_task > p->tune.task_high) {
-        next = MAX(p->live_scale - p->live_scale / 10, p->floor_scale);
+        next = MAX(p->live_scale - MAX(p->live_scale / 10, 1u),
+                   p->floor_scale);
     }
     p->stats.task_share = p->window_task * 1000 / p->tune.window;
     p->window_ticks = 0;

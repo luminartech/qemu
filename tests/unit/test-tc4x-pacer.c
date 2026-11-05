@@ -399,6 +399,36 @@ static void test_adaptive_scale(void)
     fake_free(f);
 }
 
+/* Below scale 10 the scale still falls, by 1 per window, to its floor */
+static void test_adaptive_step_down(void)
+{
+    Fake *f = fake_new();
+
+    tc4x_pacer_set_scale(f->p, 4, true, 1.0);
+    f->sample = true;
+    first_tick(f);
+    f->take_at_once = false;
+    for (int k = 0; k < WINDOW; k++) {
+        fire_until(f, TC4X_PACER_TIMER_TICK);
+        fire_until(f, TC4X_PACER_TIMER_CHECK);
+        ack(f, SRC_A);
+        ack(f, SRC_B);
+    }
+    g_assert_cmpuint(stats(f).scale, ==, 6);
+    f->take_at_once = true;
+    for (uint32_t want = 5; want >= 4; want--) {
+        for (int k = 0; k < WINDOW; k++) {
+            fire_until(f, TC4X_PACER_TIMER_TICK);
+        }
+        g_assert_cmpuint(stats(f).scale, ==, want);
+    }
+    for (int k = 0; k < WINDOW; k++) {
+        fire_until(f, TC4X_PACER_TIMER_TICK);
+    }
+    g_assert_cmpuint(stats(f).scale, ==, 4);
+    fake_free(f);
+}
+
 /* tc4x_pacer_hold() slows guest time until hold_src is taken */
 static void test_src_hold(void)
 {
@@ -444,6 +474,8 @@ int main(int argc, char **argv)
                     test_late_tick_restarts_grid);
     g_test_add_func("/tc4x-pacer/idle", test_idle);
     g_test_add_func("/tc4x-pacer/adaptive-scale", test_adaptive_scale);
+    g_test_add_func("/tc4x-pacer/adaptive-step-down",
+                    test_adaptive_step_down);
     g_test_add_func("/tc4x-pacer/src-hold", test_src_hold);
     g_test_add_func("/tc4x-pacer/disable-releases", test_disable_releases);
     return g_test_run();
