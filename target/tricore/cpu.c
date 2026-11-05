@@ -88,10 +88,9 @@ static void tricore_cpu_reset_hold(Object *obj, ResetType type)
         tcc->parent_phases.hold(obj, type);
     }
 
+    memset(cpu_env(cs), 0, offsetof(CPUTriCoreState, end_reset_fields));
     cpu_state_reset(cpu_env(cs));
-    memset(cpu_env(cs)->csfr_generic, 0, sizeof(cpu_env(cs)->csfr_generic));
     cpu_env(cs)->CORE_ID = TRICORE_CPU(obj)->core_id;
-    cpu_env(cs)->pending_irq_prio = 0;
     cpu_env(cs)->csa_page[0] = cpu_env(cs)->csa_page[1] = 1;
     cpu_env(cs)->boot_halted = TRICORE_CPU(obj)->start_halted;
     cs->halted = cpu_env(cs)->boot_halted;

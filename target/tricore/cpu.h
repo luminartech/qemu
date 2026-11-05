@@ -68,6 +68,9 @@ typedef struct CPUArchState {
     /* Core is parked in boot-halt until released through BOOTCON.BHALT */
     bool boot_halted;
 
+    /* Fields up to here are cleared at reset */
+    struct {} end_reset_fields;
+
     /* Internal CPU feature flags.  */
     uint64_t features;
 
