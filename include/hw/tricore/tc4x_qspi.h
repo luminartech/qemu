@@ -89,7 +89,8 @@ void tc4x_qspi_set_dma(Tc4xQspi *q, const Tc4xQspiDmaOps *ops, void *opaque);
 
 /*
  * A peripheral on one chip select of a QSPI module (an SSI peripheral with
- * an active-low chip select).  A BACONENTRY write that selects it starts a
+ * an active-low chip select).  A BACONENTRY write that selects it, or the
+ * first word after a frame under that entry ended (BACON.LAST), starts a
  * frame: frame() sees the BACON entry (word length, bit order, chip
  * select); each word written to DATAENTRY is then one transfer() whose
  * result goes to the receive FIFO.

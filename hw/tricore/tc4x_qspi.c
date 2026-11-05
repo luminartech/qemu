@@ -1,10 +1,14 @@
 /*
  * TC4x QSPI modules (QSPI0..7).
  *
- * A transfer completes at once: a BACONENTRY write selects the chip select
- * of the next frame and every DATAENTRY word is clocked through the
- * selected peripheral, its reply pushed to the receive FIFO.  The transmit
- * FIFO is therefore always empty and the phase transitions done.  With
+ * A transfer completes at once: a BACONENTRY write starts a frame on the
+ * chip select it names and every DATAENTRY word is clocked through the
+ * selected peripheral, its reply pushed to the receive FIFO.  A word under
+ * a BACON entry with LAST set ends the frame and releases the chip select;
+ * the next word starts a frame with the same entry.  The transmit FIFO is
+ * therefore always empty and the phase transitions done.  A frame driven
+ * by a CPU raises PT at its end when GLOBALCON1 enables a phase transition
+ * event that the frame passes.  With
  * TXEN / RXEN set and the service request routed to a CPU, each word raises
  * TX (FIFO empty again) and RX (word received), as an interrupt-driven SPI
  * master expects.
@@ -70,6 +74,8 @@ struct Tc4xQspi {
     GQueue *rx;             /* receive FIFO */
     uint32_t rx_level;      /* length of rx */
     int sel;                /* chip select of the frame, -1: none */
+    uint32_t bacon;         /* BACON entry of the frames */
+    bool bacon_valid;       /* a BACON entry was written since reset */
     bool rx_fed;            /* receive data fed by board code */
     bool dma_busy;          /* hardware-request DMA job in progress */
 };
@@ -203,9 +209,10 @@ static void qspi_kick_bh(void *opaque)
     qspi_dma_kick(q);
 }
 
-/* BACONENTRY starts a frame on the chip select it names */
-static void qspi_bacon(Tc4xQspi *q, uint32_t bacon)
+/* A frame starts on the chip select the BACON entry names */
+static void qspi_frame_start(Tc4xQspi *q)
 {
+    uint32_t bacon = q->bacon;
     int cs = FIELD_EX32(bacon, QSPI_BACONENTRY, CS);
     DeviceState *dev;
     Tc4xQspiPeripheral *p;
@@ -228,13 +235,60 @@ static void qspi_bacon(Tc4xQspi *q, uint32_t bacon)
     }
 }
 
+/* BACONENTRY starts a frame; its entry holds for the frames that follow */
+static void qspi_bacon(Tc4xQspi *q, uint32_t bacon)
+{
+    q->bacon = bacon;
+    q->bacon_valid = true;
+    qspi_frame_start(q);
+}
+
+/*
+ * Phase transition events of GLOBALCON1.PT1/PT2 that every frame passes
+ * (IfxQspi_PhaseTransitionEvent of the iLLD: end of wait, start of frame,
+ * transmit buffer emptied, receive buffer filled, end of frame); the
+ * others (clock polarity change, expect phase) have no frame-end meaning
+ */
+static bool qspi_pt_in_frame(uint32_t event)
+{
+    return event == 0 || (event >= 2 && event <= 5);
+}
+
+/*
+ * The last word of a frame (BACON.LAST) releases the chip select.  On the
+ * CPU path (no hardware-request DMA job, whose end raises PT itself) the
+ * enabled phase transition events of the frame raise PT.
+ */
+static void qspi_frame_end(Tc4xQspi *q)
+{
+    uint32_t con1 = qspi_store_get(q, QSPI_REG(GLOBALCON1));
+    bool pt = (FIELD_EX32(con1, QSPI_GLOBALCON1, PT1EN) &&
+               qspi_pt_in_frame(FIELD_EX32(con1, QSPI_GLOBALCON1, PT1))) ||
+              (FIELD_EX32(con1, QSPI_GLOBALCON1, PT2EN) &&
+               qspi_pt_in_frame(FIELD_EX32(con1, QSPI_GLOBALCON1, PT2)));
+
+    trace_tc4x_qspi_frame_end(q->index, q->sel, pt);
+    qemu_irq_raise(q->cs[q->sel]);
+    q->sel = -1;
+    if (pt && !q->dma_busy && !q->rx_fed && !qspi_dma_armed(q)) {
+        qspi_cpu_event(q, TC4X_QSPI_IRQ_PT);
+    }
+}
+
 static void qspi_transmit(Tc4xQspi *q, uint32_t val)
 {
-    uint32_t reply = ssi_transfer(q->bus, val);
+    uint32_t reply;
 
+    if (q->sel < 0 && q->bacon_valid) {
+        qspi_frame_start(q);
+    }
+    reply = ssi_transfer(q->bus, val);
     g_queue_push_tail(q->rx, GUINT_TO_POINTER(reply));
     qatomic_set(&q->rx_level, g_queue_get_length(q->rx));
     qspi_word_events(q);
+    if (q->sel >= 0 && FIELD_EX32(q->bacon, QSPI_BACONENTRY, LAST)) {
+        qspi_frame_end(q);
+    }
 }
 
 static uint32_t qspi_rx_pop(Tc4xQspi *q)
@@ -373,6 +427,8 @@ static void tc4x_qspi_reset_hold(Object *obj, ResetType type)
     g_queue_clear(q->rx);
     qatomic_set(&q->rx_level, 0);
     q->sel = -1;
+    q->bacon = 0;
+    q->bacon_valid = false;
     q->dma_busy = false;
     for (unsigned cs = 0; cs < TC4X_QSPI_CS_COUNT; cs++) {
         qemu_irq_raise(q->cs[cs]);

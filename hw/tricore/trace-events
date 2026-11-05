@@ -20,6 +20,7 @@ tc4x_i2c_transfer(unsigned bus, unsigned addr, bool read, unsigned len, bool ack
 
 # tc4x_qspi.c
 tc4x_qspi_frame(unsigned n, unsigned cs, uint32_t bacon) "qspi%u cs %u bacon 0x%08x"
+tc4x_qspi_frame_end(unsigned n, int cs, bool pt) "qspi%u cs %d pt %d"
 tc4x_qspi_dma_job(unsigned n, bool ran) "qspi%u ran %d"
 
 # tc4x_kit.c
