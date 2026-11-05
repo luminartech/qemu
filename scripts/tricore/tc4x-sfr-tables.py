@@ -105,7 +105,7 @@ def main():
     out += [" */",
             "",
             '#include "qemu/osdep.h"',
-            '#include "hw/tricore/tc4x_board.h"',
+            '#include "hw/tricore/tc4x_sfr_store.h"',
             "",
             "const Tc4xRegSemantics tc4x_reg_semantics[] = {"]
     out += [f"    {{ {a:#x}, {p:#x}, {c1:#x}, {c0:#x}, {s1:#x} }},"

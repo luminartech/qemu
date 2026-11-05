@@ -16,6 +16,7 @@
 
 #include "qom/object.h"
 #include "hw/net/tc4x_geth.h"
+#include "hw/tricore/tc4x_sfr_store.h"
 
 #define TYPE_TC4X_SOC "tc4x-soc"
 OBJECT_DECLARE_SIMPLE_TYPE(Tc4xSoc, TC4X_SOC)
@@ -26,21 +27,9 @@ uint32_t tc4x_reg_get(Tc4xSoc *soc, uint32_t addr);
 /* Store @val at @addr, no side effects (any thread) */
 void tc4x_reg_set(Tc4xSoc *soc, uint32_t addr, uint32_t val);
 
-/*
- * Guest writes of @addr call @fn first; when it returns true the write is
- * consumed, else it continues as if there were no hook.  Writes of @addr
- * always take the BQL.  Hooks are added during machine init only.
- */
-typedef bool (*Tc4xSfrWriteFn)(void *opaque, uint32_t addr, uint32_t val);
+/* Hooks of the SFR store at @addr (see tc4x_sfr_store.h) */
 void tc4x_sfr_add_write_hook(Tc4xSoc *soc, uint32_t addr, Tc4xSfrWriteFn fn,
                              void *opaque);
-
-/*
- * Guest reads of @addr call @fn under the BQL; when it returns true, *@val
- * is the value read, else the read continues as if there were no hook.
- * Hooks are added during machine init only.
- */
-typedef bool (*Tc4xSfrReadFn)(void *opaque, uint32_t addr, uint32_t *val);
 void tc4x_sfr_add_read_hook(Tc4xSoc *soc, uint32_t addr, Tc4xSfrReadFn fn,
                             void *opaque);
 

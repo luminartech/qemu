@@ -42,6 +42,7 @@
 #include "hw/tricore/tc4x_board.h"
 #include "hw/tricore/tc4x_pacer.h"
 #include "hw/tricore/tc4x_regs.h"
+#include "hw/tricore/tc4x_sfr_store.h"
 #include "tc4x_soc.h"
 
 #define TC4X_PSPR_OFFSET    (1 * MiB)
@@ -271,9 +272,6 @@ typedef struct Tc4xStmPage {
     uint32_t base;
 } Tc4xStmPage;
 
-#define RST_KRST            BIT(0)
-#define RST_CTRLB_STATCLR   BIT(31)
-
 typedef struct Tc4xTomCounter {
     uint32_t start;     /* CN0 value written by software */
     int64_t t0_ns;      /* guest time of that write */
@@ -289,49 +287,6 @@ typedef struct Tc4xStmTimer {
     uint64_t fired_target;  /* compare value of the last match */
     uint64_t due;           /* STM count the timer is armed for */
 } Tc4xStmTimer;
-
-/*
- * SFR storage: 4 KiB pages of 32-bit words in a two-level table, allocated
- * on first use and never freed.  Values and per-word flags are atomic, so
- * reads without side effects can be served outside the BQL
- * (sfr_read_lockless); everything that changes state runs under the BQL.
- */
-#define SFR_PAGE_BITS       12
-#define SFR_PAGE_WORDS      (1u << (SFR_PAGE_BITS - 2))
-#define SFR_L2_BITS         10
-#define SFR_L2_SIZE         (1u << SFR_L2_BITS)
-#define SFR_L1_SIZE         (1u << (32 - SFR_PAGE_BITS - SFR_L2_BITS))
-
-/* Bits pinned for reads whatever the register holds */
-typedef struct Tc4xSfrForces {
-    uint32_t value[SFR_PAGE_WORDS];
-    uint32_t mask[SFR_PAGE_WORDS];
-} Tc4xSfrForces;
-
-typedef struct Tc4xSfrPage {
-    uint32_t val[SFR_PAGE_WORDS];
-    uint32_t reads[SFR_PAGE_WORDS];     /* since the last "hot" query */
-    /* written, or its first read logged as unimplemented */
-    unsigned long known[BITS_TO_LONGS(SFR_PAGE_WORDS)];
-    /* a TOM shadow register write was plain storage: see sfr_write_lockless */
-    unsigned long plain_write[BITS_TO_LONGS(SFR_PAGE_WORDS)];
-    uint32_t plain_persist[SFR_PAGE_WORDS]; /* bits such a write changes */
-    /* accesses take the BQL path */
-    unsigned long bql_only[BITS_TO_LONGS(SFR_PAGE_WORDS)];
-    /* reads call a board hook, under the BQL */
-    unsigned long read_hooked[BITS_TO_LONGS(SFR_PAGE_WORDS)];
-    Tc4xSfrForces *forces;
-} Tc4xSfrPage;
-
-typedef struct Tc4xSfrWriteHook {
-    Tc4xSfrWriteFn fn;
-    void *opaque;
-} Tc4xSfrWriteHook;
-
-typedef struct Tc4xSfrReadHook {
-    Tc4xSfrReadFn fn;
-    void *opaque;
-} Tc4xSfrReadHook;
 
 /* A DMU command interface: the host's (HCI) or the CSRM's (CSCI) */
 typedef struct Tc4xDmuIf {
@@ -404,16 +359,10 @@ struct Tc4xSoc {
     Tc4xDmuHookFn dmu_hook;
     void *dmu_hook_opaque;
     MemoryRegion lmu_alias;
-    MemoryRegion sfr_e, sfr_f;
 
-    Tc4xSfrPage **sfr_l1[SFR_L1_SIZE];
-    GHashTable *reg_semantics;  /* addr -> const Tc4xRegSemantics */
-    GHashTable *kresets;   /* RST_CTRLB addr -> const Tc4xKernelReset */
+    Tc4xSfrStore *sfr;
     GHashTable *tom_cn0;   /* TOM CN0 addr -> Tc4xTomCounter */
-    GHashTable *watches;
     DeviceState *geth;
-    GHashTable *write_hooks;    /* addr -> Tc4xSfrWriteHook */
-    GHashTable *read_hooks;     /* addr -> Tc4xSfrReadHook */
     /*
      * Interrupt router.  Cores acknowledge interrupts without the BQL, so
      * pending, cpu_prio and the SRC registers' SRR bits are under ir_lock;
@@ -502,57 +451,14 @@ Tc4xI2c *tc4x_soc_i2c(Tc4xSoc *s)
     return s->i2c;
 }
 
-static void *sfr_publish(void **slot, size_t size)
-{
-    void *fresh = g_malloc0(size);
-    void *old = qatomic_cmpxchg(slot, NULL, fresh);
-
-    if (old) {
-        g_free(fresh);
-        return old;
-    }
-    return fresh;
-}
-
-static Tc4xSfrPage *sfr_page(Tc4xSoc *s, uint32_t addr, bool alloc)
-{
-    Tc4xSfrPage ***l1 = &s->sfr_l1[addr >> (SFR_PAGE_BITS + SFR_L2_BITS)];
-    Tc4xSfrPage **l2 = qatomic_load_acquire(l1);
-    Tc4xSfrPage **slot;
-    Tc4xSfrPage *pg;
-
-    if (!l2) {
-        if (!alloc) {
-            return NULL;
-        }
-        l2 = sfr_publish((void **)l1, SFR_L2_SIZE * sizeof(*l2));
-    }
-    slot = &l2[(addr >> SFR_PAGE_BITS) & (SFR_L2_SIZE - 1)];
-    pg = qatomic_load_acquire(slot);
-    if (!pg && alloc) {
-        pg = sfr_publish((void **)slot, sizeof(*pg));
-    }
-    return pg;
-}
-
-static unsigned sfr_word(uint32_t addr)
-{
-    return (addr >> 2) & (SFR_PAGE_WORDS - 1);
-}
-
 static uint32_t reg_get(Tc4xSoc *s, uint32_t addr)
 {
-    Tc4xSfrPage *pg = sfr_page(s, addr, false);
-
-    return pg ? qatomic_read(&pg->val[sfr_word(addr)]) : 0;
+    return tc4x_sfr_store_get(s->sfr, addr);
 }
 
 static void reg_set(Tc4xSoc *s, uint32_t addr, uint32_t val)
 {
-    Tc4xSfrPage *pg = sfr_page(s, addr, true);
-
-    qatomic_set(&pg->val[sfr_word(addr)], val);
-    set_bit_atomic(sfr_word(addr), pg->known);
+    tc4x_sfr_store_set(s->sfr, addr, val);
 }
 
 uint32_t tc4x_reg_get(Tc4xSoc *s, uint32_t addr)
@@ -568,32 +474,7 @@ void tc4x_reg_set(Tc4xSoc *s, uint32_t addr, uint32_t val)
 uint32_t tc4x_reg_cmpxchg(Tc4xSoc *s, uint32_t addr, uint32_t old,
                           uint32_t val)
 {
-    Tc4xSfrPage *pg = sfr_page(s, addr, true);
-    uint32_t found = qatomic_cmpxchg(&pg->val[sfr_word(addr)], old, val);
-
-    if (found == old) {
-        set_bit_atomic(sfr_word(addr), pg->known);
-    }
-    return found;
-}
-
-/* Pin the bits in @mask of @addr to @value for every read (mask 0: release) */
-static void reg_force(Tc4xSoc *s, uint32_t addr, uint32_t value,
-                      uint32_t mask)
-{
-    Tc4xSfrPage *pg = sfr_page(s, addr, true);
-    Tc4xSfrForces *f = sfr_publish((void **)&pg->forces, sizeof(*f));
-
-    qatomic_set(&f->value[sfr_word(addr)], value);
-    qatomic_set(&f->mask[sfr_word(addr)], mask);
-}
-
-static uint32_t reg_apply_force(Tc4xSfrPage *pg, unsigned w, uint32_t v)
-{
-    Tc4xSfrForces *f = pg ? qatomic_load_acquire(&pg->forces) : NULL;
-    uint32_t mask = f ? qatomic_read(&f->mask[w]) : 0;
-
-    return mask ? (v & ~mask) | (qatomic_read(&f->value[w]) & mask) : v;
+    return tc4x_sfr_store_cmpxchg(s->sfr, addr, old, val);
 }
 
 static void G_GNUC_PRINTF(2, 3) sim_printf(Tc4xSoc *s, const char *fmt, ...)
@@ -1712,15 +1593,6 @@ static void tom_glb_ctrl_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
     }
 }
 
-/* SR0/SR1: plain shadow storage, copied to CM0/CM1 on a GLB_CTRL update */
-static bool tom_is_shadow(uint32_t addr)
-{
-    uint32_t off;
-
-    return tom_ch_offset(addr, &off) &&
-           (off == EGTM_TOM_SR0 || off == EGTM_TOM_SR1);
-}
-
 static bool tom_is_glb_ctrl(uint32_t addr)
 {
     uint32_t off;
@@ -1749,44 +1621,35 @@ static bool sfr_is_cpu(uint32_t addr, int *core, uint32_t *off)
     return true;
 }
 
-static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr);
-
-static uint32_t sfr_read_word(Tc4xSoc *s, uint32_t addr)
+static bool sfr_is_tmadc_modstat(uint32_t addr)
 {
-    uint32_t qn, qoff;
-
-    if (qspi_decode(addr, &qn, &qoff)) {
-        QEMU_LOCK_GUARD(&s->qspi_lock);
-        return sfr_read_word_locked(s, addr);
-    }
-    return sfr_read_word_locked(s, addr);
+    return addr >= TMADC_BASE &&
+           addr < TMADC_BASE + TMADC_COUNT * TMADC_STRIDE &&
+           (addr - TMADC_BASE) % TMADC_STRIDE == TMADC_MODSTAT;
 }
 
-static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr)
+/*
+ * A read of the word at @addr served by a model, under the BQL (and the
+ * QSPI lock for the QSPI modules); *@val holds the stored word
+ */
+static bool soc_read_word(Tc4xSoc *s, uint32_t addr, uint32_t *val)
 {
     uint32_t qn, qoff;
-    uint32_t v = reg_get(s, addr);
     uint32_t off;
     int core;
 
-    Tc4xSfrReadHook *h = g_hash_table_lookup(s->read_hooks,
-                                             GUINT_TO_POINTER(addr));
-
-    if ((h && h->fn(h->opaque, addr, &v)) ||
-        tc4x_gpio_read(s->gpio, addr, &v) || tc4x_i2c_read(s->i2c, addr, &v) ||
-        tc4x_adc_read(s->adc, addr, &v)) {
-        /* served by a board hook, a pin or bus model */
+    if (tc4x_gpio_read(s->gpio, addr, val) ||
+        tc4x_i2c_read(s->i2c, addr, val) || tc4x_adc_read(s->adc, addr, val)) {
+        /* a pin or bus model */
     } else if (addr == EGTM_TBU_CH0) {
-        v = stm_now(s) & EGTM_TBU_MASK;
+        *val = stm_now(s) & EGTM_TBU_MASK;
     } else if (sfr_is_cpu(addr, &core, &off)) {
         if (off == CPU_HRA_CORE_ID || off == CPU_HRHV_CORE_ID) {
-            v = core;
+            *val = core;
         } else if (off == CPU_HRA_BOOTCON) {
-            v = (v & ~1u) | (s->cpu[core]->env.boot_halted ? 1 : 0);
+            *val = (*val & ~1u) | (s->cpu[core]->env.boot_halted ? 1 : 0);
         }
-    } else if (addr >= TMADC_BASE &&
-               addr < TMADC_BASE + TMADC_COUNT * TMADC_STRIDE &&
-               (addr - TMADC_BASE) % TMADC_STRIDE == TMADC_MODSTAT) {
+    } else if (sfr_is_tmadc_modstat(addr)) {
         uint32_t n = (addr - TMADC_BASE) / TMADC_STRIDE;
         bool clk = reg_get(s, ADC_CLKEN_TMADC) & BIT(n);
         bool run = reg_get(s, TMADC_BASE + n * TMADC_STRIDE + TMADC_MODCFG) &
@@ -1796,16 +1659,16 @@ static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr)
          * The power-on calibration phase completes at once: MODSTAT.CALPH
          * reads 10B (calibration completed) as soon as the clock runs.
          */
-        v = (clk ? TMADC_MODSTAT_CALPH_DONE : TMADC_MODSTAT_DIS) |
-            (clk && run ? TMADC_MODSTAT_RUN : 0);
+        *val = (clk ? TMADC_MODSTAT_CALPH_DONE : TMADC_MODSTAT_DIS) |
+               (clk && run ? TMADC_MODSTAT_RUN : 0);
     } else if (tom_is_cn0(addr)) {
-        v = tom_cn0_read(s, addr);
+        *val = tom_cn0_read(s, addr);
     } else if (qspi_decode(addr, &qn, &qoff) && qoff == QSPI_STATUS) {
-        v = qspi_status(s, qn, v);
+        *val = qspi_status(s, qn, *val);
     } else if (qspi_decode(addr, &qn, &qoff) && qoff >= QSPI_RXEXIT &&
                qoff < QSPI_RXEXIT_END) {
-        v = g_queue_is_empty(s->qspi_rx[qn]) ? 0 :
-            GPOINTER_TO_UINT(g_queue_pop_head(s->qspi_rx[qn]));
+        *val = g_queue_is_empty(s->qspi_rx[qn]) ? 0 :
+               GPOINTER_TO_UINT(g_queue_pop_head(s->qspi_rx[qn]));
         qatomic_set(&s->qspi_rx_level[qn], g_queue_get_length(s->qspi_rx[qn]));
     } else if (addr == A_CLOCK_SYSPLLSTAT || addr == A_CLOCK_PERPLLSTAT) {
         uint32_t con0 = reg_get(s, addr == A_CLOCK_SYSPLLSTAT ?
@@ -1813,76 +1676,68 @@ static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr)
         uint32_t on = R_CLOCK_SYSPLLSTAT_PWRSTAT_MASK |
                       R_CLOCK_SYSPLLSTAT_PLLLOCK_MASK;
 
-        v = (v & ~on) | (FIELD_EX32(con0, CLOCK_SYSPLLCON0, PLLPWR) ? on : 0);
-    } else if (asclin_read(s, addr, &v)) {
-        /* served by the ASCLIN model */
-    } else {
-        Tc4xSfrPage *pg = sfr_page(s, addr, true);
-        unsigned long bit = BIT_MASK(sfr_word(addr));
-
-        if (!(qatomic_fetch_or(&pg->known[BIT_WORD(sfr_word(addr))], bit) &
-              bit)) {
-            qemu_log_mask(LOG_UNIMP, "tc4x-sfr: first read of 0x%08x\n", addr);
-        }
-    }
-
-    return reg_apply_force(sfr_page(s, addr, false), sfr_word(addr), v);
-}
-
-static bool sfr_write_hook(Tc4xSoc *s, uint32_t addr, uint32_t val)
-{
-    Tc4xSfrWriteHook *h = g_hash_table_lookup(s->write_hooks,
-                                              GUINT_TO_POINTER(addr));
-
-    return h && h->fn(h->opaque, addr, val);
-}
-
-/*
- * Store @val through the register's write semantics.  Returns whether the
- * register is plain storage, with the bits a write changes in @persist.
- */
-static bool sfr_store(Tc4xSoc *s, uint32_t addr, uint32_t val,
-                      uint32_t *persist)
-{
-    const Tc4xRegSemantics *m =
-        g_hash_table_lookup(s->reg_semantics, GUINT_TO_POINTER(addr));
-    uint32_t v;
-
-    if (!m) {
-        reg_set(s, addr, val);
-        return true;
-    }
-    v = (reg_get(s, addr) & ~m->persist) | (val & m->persist);
-    v &= ~(val & m->w1c);
-    v &= ~(~val & m->w0c);
-    v |= val & m->w1s;
-    reg_set(s, addr, v);
-    *persist = m->persist;
-    return !m->w1c && !m->w0c && !m->w1s;
-}
-
-/*
- * A write to a kernel reset CTRLB completes at once; false for others.
- * The iLLD resetModule() functions wait for RST_STAT.KRST to set.
- */
-static bool sfr_kernel_reset(Tc4xSoc *s, uint32_t addr, uint32_t val)
-{
-    const Tc4xKernelReset *k =
-        g_hash_table_lookup(s->kresets, GUINT_TO_POINTER(addr));
-
-    if (!k) {
+        *val = (*val & ~on) |
+               (FIELD_EX32(con0, CLOCK_SYSPLLCON0, PLLPWR) ? on : 0);
+    } else if (!asclin_read(s, addr, val)) {
         return false;
     }
-    if (val & RST_KRST) {
-        reg_set(s, k->stat, reg_get(s, k->stat) | RST_KRST);
-        reg_set(s, k->ctrla, reg_get(s, k->ctrla) & ~RST_KRST);
-        reg_set(s, addr, reg_get(s, addr) & ~RST_KRST);
-    }
-    if (val & RST_CTRLB_STATCLR) {
-        reg_set(s, k->stat, reg_get(s, k->stat) & ~RST_KRST);
-        reg_set(s, addr, reg_get(s, addr) & ~RST_CTRLB_STATCLR);
-    }
     return true;
+}
+
+static bool soc_sfr_read(void *opaque, uint32_t addr, uint32_t *val)
+{
+    Tc4xSoc *s = opaque;
+    uint32_t qn, qoff;
+
+    if (qspi_decode(addr, &qn, &qoff)) {
+        QEMU_LOCK_GUARD(&s->qspi_lock);
+        return soc_read_word(s, addr, val);
+    }
+    return soc_read_word(s, addr, val);
+}
+
+/*
+ * Reads without the BQL: values computed from atomic state only (GPIO
+ * levels, ADC results, QSPI status) and RX FIFO pops under the QSPI lock.
+ * Reads with other side effects and time-derived or CPU-specific values
+ * take the BQL.
+ */
+static Tc4xSfrPath soc_sfr_read_lockless(void *opaque, uint32_t addr,
+                                         unsigned size, uint32_t *val)
+{
+    Tc4xSoc *s = opaque;
+    uint32_t word = addr & ~3u;
+    uint32_t qn, qoff, off;
+    int core;
+
+    if (sfr_is_cpu(word, &core, &off) || tom_is_cn0(word) ||
+        (word >= ASCLIN_BASE && word < ASCLIN_END) ||
+        sfr_is_tmadc_modstat(word)) {
+        return TC4X_SFR_PATH_LOCKED;
+    }
+    if (tc4x_gpio_read(s->gpio, word, val) ||
+        tc4x_adc_read(s->adc, word, val)) {
+        return TC4X_SFR_PATH_SERVED;
+    }
+    if (tc4x_i2c_owns(word) || word == EGTM_TBU_CH0) {
+        return TC4X_SFR_PATH_LOCKED;
+    }
+    if (!qspi_decode(word, &qn, &qoff)) {
+        return TC4X_SFR_PATH_STORE;
+    }
+    if (qoff == QSPI_STATUS) {
+        *val = qspi_status(s, qn, *val);
+        return TC4X_SFR_PATH_SERVED;
+    }
+    if (qoff >= QSPI_RXEXIT && qoff < QSPI_RXEXIT_END) {
+        if (size != 4 || (addr & 3) || tc4x_sfr_store_bql_only(s->sfr, addr)) {
+            return TC4X_SFR_PATH_LOCKED;
+        }
+        QEMU_LOCK_GUARD(&s->qspi_lock);
+        soc_read_word(s, addr, val);
+        return TC4X_SFR_PATH_SERVED;
+    }
+    return TC4X_SFR_PATH_STORE;
 }
 
 /* Writes of the QSPI modules: true when the write is consumed */
@@ -1917,98 +1772,18 @@ static bool qspi_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
     return false;
 }
 
-static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
-                                  uint32_t val);
-
-static void sfr_write_word(Tc4xSoc *s, uint32_t addr, uint32_t val)
+/* A write of a QSPI module, under the QSPI lock */
+static void soc_qspi_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
 {
-    uint32_t qn, qoff;
-
-    if (qspi_decode(addr, &qn, &qoff)) {
-        QEMU_LOCK_GUARD(&s->qspi_lock);
-        sfr_write_word_locked(s, addr, val);
-        return;
+    if (!qspi_write(s, addr, val)) {
+        tc4x_sfr_store_write(s->sfr, addr, val);
     }
-    sfr_write_word_locked(s, addr, val);
 }
 
-static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
-                                  uint32_t val)
+/* Side effects of CPU SFR writes, once stored */
+static void soc_cpu_write(Tc4xSoc *s, uint32_t addr, int core, uint32_t off,
+                          uint32_t val)
 {
-    uint32_t off;
-    int core;
-    bool plain = false;
-    uint32_t persist = UINT32_MAX;
-
-    if (addr >= SRC_BASE && addr < SRC_BASE + SRC_SIZE) {
-        src_write(s, addr, val);
-        return;
-    }
-    if (asclin_write(s, addr, val)) {
-        return;
-    }
-    if (dma_write(s, addr, val) || tc4x_gpio_write(s->gpio, addr, val) ||
-        tc4x_i2c_write(s->i2c, addr, val) ||
-        tc4x_adc_write(s->adc, addr, val) || sfr_write_hook(s, addr, val)) {
-        return;
-    }
-    if (addr >= INT_GPSRG_SWC0 &&
-        addr < INT_GPSRG_SWC0 + INT_GPSRG_GROUPS * INT_GPSRG_STRIDE &&
-        (addr - INT_GPSRG_SWC0) % INT_GPSRG_STRIDE <
-        INT_GPSRG_SWC_COUNT * 4 && (val & INT_GPSRG_SWC_SETR)) {
-        /* SETR: software trigger of SRC_GPSRx_SRy */
-        uint32_t x = (addr - INT_GPSRG_SWC0) / INT_GPSRG_STRIDE;
-        uint32_t y = (addr - INT_GPSRG_SWC0) % INT_GPSRG_STRIDE / 4;
-
-        src_set_srr(s, SRC_GPSR0_SR0 + x * SRC_GPSR_STRIDE + 4 * y, true);
-        val &= ~INT_GPSRG_SWC_SETR;
-    }
-    if (tom_is_cn0(addr)) {
-        tom_cn0_write(s, addr, val);
-        return;
-    }
-    if (tom_is_glb_ctrl(addr)) {
-        tom_glb_ctrl_write(s, addr, val);       /* then stored as written */
-    }
-    if (qspi_write(s, addr, val)) {
-        return;
-    }
-    if (addr >= DMU_CMD_BASE && addr < DMU_CMD_BASE + DMU_CMD_SIZE) {
-        s->dmu_cur = &s->dmu_if[0];
-        dmu_cmd_write(s, s->dmu_cur, addr - DMU_CMD_BASE, val);
-        s->dmu_cur = NULL;
-        return;
-    }
-    if (addr >= DMU_CSCI_CMD_BASE && addr < DMU_CSCI_CMD_BASE + DMU_CMD_SIZE) {
-        s->dmu_cur = &s->dmu_if[1];
-        dmu_cmd_write(s, s->dmu_cur, addr - DMU_CSCI_CMD_BASE, val);
-        s->dmu_cur = NULL;
-        return;
-    }
-    if (addr == DMU_HCI_CLRERR || addr == DMU_CSCI_CLRERR) {
-        uint32_t err = addr == DMU_HCI_CLRERR ? DMU_HCI_ERR : DMU_CSCI_ERR;
-
-        reg_set(s, err, reg_get(s, err) & ~val);
-        return;
-    }
-
-    plain = sfr_store(s, addr, val, &persist) && tom_is_shadow(addr) &&
-            !test_bit(sfr_word(addr), sfr_page(s, addr, true)->bql_only);
-    if (sfr_kernel_reset(s, addr, val)) {
-        return;
-    }
-
-    if (!sfr_is_cpu(addr, &core, &off)) {
-        if (plain) {
-            Tc4xSfrPage *pg = sfr_page(s, addr, true);
-
-            qatomic_set(&pg->plain_persist[sfr_word(addr)], persist);
-            qatomic_store_release(&pg->plain_write[BIT_WORD(sfr_word(addr))],
-                                  pg->plain_write[BIT_WORD(sfr_word(addr))] |
-                                  BIT_MASK(sfr_word(addr)));
-        }
-        return;
-    }
     if (off == CPU_HRA_BOOTCON && !(val & 1) &&
         s->cpu[core]->env.boot_halted) {
         uint32_t pc = reg_get(s, addr - CPU_HRA_BOOTCON + CPU_HRA_PC) & ~1u;
@@ -2034,234 +1809,82 @@ static void sfr_write_word_locked(Tc4xSoc *s, uint32_t addr,
     }
 }
 
-static void sfr_count_read(Tc4xSoc *s, uint32_t addr)
+static bool soc_sfr_write(void *opaque, uint32_t addr, uint32_t *val)
 {
-    qatomic_inc(&sfr_page(s, addr, true)->reads[sfr_word(addr)]);
-}
-
-/*
- * Reads served without the BQL: stored registers and values computed from
- * atomic state only (GPIO levels, ADC results, QSPI status).  Reads with
- * side effects, time-derived or CPU-specific values and first reads take
- * the BQL path.
- */
-static bool sfr_read_lockless(Tc4xSoc *s, uint32_t addr, uint32_t *val)
-{
-    Tc4xSfrPage *pg = sfr_page(s, addr, false);
-    unsigned w = sfr_word(addr);
-    uint32_t qn, qoff, off;
+    Tc4xSoc *s = opaque;
+    uint32_t qn, off;
     int core;
 
-    if (sfr_is_cpu(addr, &core, &off) || tom_is_cn0(addr) ||
-        (pg && test_bit(w, pg->read_hooked)) ||
-        (addr >= ASCLIN_BASE && addr < ASCLIN_END) ||
-        (addr >= TMADC_BASE && addr < TMADC_BASE + TMADC_COUNT * TMADC_STRIDE &&
-         (addr - TMADC_BASE) % TMADC_STRIDE == TMADC_MODSTAT)) {
-        return false;
-    }
-    if (tc4x_gpio_read(s->gpio, addr, val) ||
-        tc4x_adc_read(s->adc, addr, val)) {
-        *val = reg_apply_force(pg, w, *val);
+    if (qspi_decode(addr, &qn, &off)) {
+        QEMU_LOCK_GUARD(&s->qspi_lock);
+        soc_qspi_write(s, addr, *val);
         return true;
     }
-    if (tc4x_i2c_owns(addr) || addr == EGTM_TBU_CH0) {
-        return false;
+    if (addr >= SRC_BASE && addr < SRC_BASE + SRC_SIZE) {
+        src_write(s, addr, *val);
+        return true;
     }
-    if (qspi_decode(addr, &qn, &qoff) && qoff >= QSPI_RXEXIT &&
-        qoff < QSPI_RXEXIT_END) {
-        return false;                       /* RX FIFO pop */
+    if (asclin_write(s, addr, *val) || dma_write(s, addr, *val) ||
+        tc4x_gpio_write(s->gpio, addr, *val) ||
+        tc4x_i2c_write(s->i2c, addr, *val) ||
+        tc4x_adc_write(s->adc, addr, *val)) {
+        return true;
     }
-    if (qspi_decode(addr, &qn, &qoff) && qoff == QSPI_STATUS) {
-        *val = qspi_status(s, qn, pg ? qatomic_read(&pg->val[w]) : 0);
-    } else if (!pg || !test_bit(w, pg->known)) {
-        return false;                       /* first read: report it */
-    } else {
-        *val = qatomic_read(&pg->val[w]);
+    if (addr >= INT_GPSRG_SWC0 &&
+        addr < INT_GPSRG_SWC0 + INT_GPSRG_GROUPS * INT_GPSRG_STRIDE &&
+        (addr - INT_GPSRG_SWC0) % INT_GPSRG_STRIDE <
+        INT_GPSRG_SWC_COUNT * 4 && (*val & INT_GPSRG_SWC_SETR)) {
+        /* SETR: software trigger of SRC_GPSRx_SRy */
+        uint32_t x = (addr - INT_GPSRG_SWC0) / INT_GPSRG_STRIDE;
+        uint32_t y = (addr - INT_GPSRG_SWC0) % INT_GPSRG_STRIDE / 4;
+
+        src_set_srr(s, SRC_GPSR0_SR0 + x * SRC_GPSR_STRIDE + 4 * y, true);
+        *val &= ~INT_GPSRG_SWC_SETR;
     }
-    *val = reg_apply_force(pg, w, *val);
-    return true;
-}
-
-static uint64_t sfr_read(void *opaque, hwaddr offset, unsigned size,
-                         uint32_t base)
-{
-    Tc4xSoc *s = opaque;
-    uint32_t addr = base + offset;
-    uint32_t shift = (addr & 3) * 8;
-    uint32_t word = sfr_read_word(s, addr & ~3u);
-
-    sfr_count_read(s, addr);
-    return extract32(word, shift, size * 8);
-}
-
-static void sfr_write(void *opaque, hwaddr offset, uint64_t val,
-                      unsigned size, uint32_t base)
-{
-    Tc4xSoc *s = opaque;
-    uint32_t addr = base + offset;
-    uint32_t aligned = addr & ~3u;
-    uint32_t shift = (addr & 3) * 8;
-    uint32_t word = val;
-
-    if (size < 4) {
-        const Tc4xRegSemantics *m =
-            g_hash_table_lookup(s->reg_semantics, GUINT_TO_POINTER(aligned));
-        uint32_t others = ~MAKE_64BIT_MASK(shift, size * 8);
-
-        word = deposit32(reg_get(s, aligned), shift, size * 8, val);
-        if (m) {
-            /* the bytes not written clear and set nothing */
-            word &= ~(others & (m->w1c | m->w1s));
-            word |= others & m->w0c;
-        }
+    if (tom_is_cn0(addr)) {
+        tom_cn0_write(s, addr, *val);
+        return true;
     }
-    if (g_hash_table_contains(s->watches, GUINT_TO_POINTER(aligned))) {
-        sim_printf(s, "ev w 0x%08x 0x%08x %u %d\n", aligned, word,
-                   size, current_cpu ? current_cpu->cpu_index : -1);
+    if (tom_is_glb_ctrl(addr)) {
+        tom_glb_ctrl_write(s, addr, *val);      /* then stored as written */
     }
-    sfr_write_word(s, aligned, word);
-}
-
-/* RX FIFO pops (RXEXIT) under the QSPI lock, without the BQL */
-static bool sfr_qspi_rx_lockless(Tc4xSoc *s, uint32_t addr,
-                                 unsigned size, uint32_t *val)
-{
-    Tc4xSfrPage *pg = sfr_page(s, addr, false);
-    uint32_t qn, qoff;
-
-    if (size != 4 || (addr & 3) || !qspi_decode(addr, &qn, &qoff) ||
-        qoff < QSPI_RXEXIT || qoff >= QSPI_RXEXIT_END ||
-        (pg && test_bit(sfr_word(addr), pg->bql_only))) {
-        return false;
+    if (addr >= DMU_CMD_BASE && addr < DMU_CMD_BASE + DMU_CMD_SIZE) {
+        s->dmu_cur = &s->dmu_if[0];
+        dmu_cmd_write(s, s->dmu_cur, addr - DMU_CMD_BASE, *val);
+        s->dmu_cur = NULL;
+        return true;
     }
-    QEMU_LOCK_GUARD(&s->qspi_lock);
-    *val = sfr_read_word_locked(s, addr);
-    return true;
-}
-
-static uint64_t sfr_region_read(void *opaque, hwaddr off, unsigned size,
-                                uint32_t base)
-{
-    uint32_t addr = base + off;
-    uint32_t word;
-
-    if (sfr_read_lockless(opaque, addr & ~3u, &word)) {
-        sfr_count_read(opaque, addr);
-        return extract32(word, (addr & 3) * 8, size * 8);
+    if (addr >= DMU_CSCI_CMD_BASE && addr < DMU_CSCI_CMD_BASE + DMU_CMD_SIZE) {
+        s->dmu_cur = &s->dmu_if[1];
+        dmu_cmd_write(s, s->dmu_cur, addr - DMU_CSCI_CMD_BASE, *val);
+        s->dmu_cur = NULL;
+        return true;
     }
-    if (sfr_qspi_rx_lockless(opaque, addr, size, &word)) {
-        return word;
+    if (addr == DMU_HCI_CLRERR || addr == DMU_CSCI_CLRERR) {
+        uint32_t err = addr == DMU_HCI_CLRERR ? DMU_HCI_ERR : DMU_CSCI_ERR;
+
+        reg_set(s, err, reg_get(s, err) & ~*val);
+        return true;
     }
-    BQL_LOCK_GUARD();
-    return sfr_read(opaque, off, size, base);
-}
-
-static void sfr_watch_clear(Tc4xSoc *s, uint32_t addr)
-{
-    Tc4xSfrPage *pg = sfr_page(s, addr, false);
-
-    if (pg && !g_hash_table_contains(s->write_hooks, GUINT_TO_POINTER(addr))) {
-        clear_bit_atomic(sfr_word(addr), pg->bql_only);
+    if (sfr_is_cpu(addr, &core, &off)) {
+        tc4x_sfr_store_write(s->sfr, addr, *val);
+        soc_cpu_write(s, addr, core, off, *val);
+        return true;
     }
-}
-
-static void sfr_plain_write_forget(Tc4xSoc *s, uint32_t addr)
-{
-    Tc4xSfrPage *pg = sfr_page(s, addr, false);
-
-    if (pg) {
-        clear_bit_atomic(sfr_word(addr), pg->plain_write);
-    }
-}
-
-static void sfr_set_bql_only(Tc4xSoc *s, uint32_t addr)
-{
-    set_bit_atomic(sfr_word(addr), sfr_page(s, addr, true)->bql_only);
-    sfr_plain_write_forget(s, addr);
-}
-
-void tc4x_sfr_add_write_hook(Tc4xSoc *s, uint32_t addr, Tc4xSfrWriteFn fn,
-                             void *opaque)
-{
-    Tc4xSfrWriteHook *h = g_new(Tc4xSfrWriteHook, 1);
-
-    /* vCPU threads look hooks up without a lock */
-    assert(!phase_check(PHASE_MACHINE_READY));
-    h->fn = fn;
-    h->opaque = opaque;
-    g_hash_table_insert(s->write_hooks, GUINT_TO_POINTER(addr), h);
-    sfr_set_bql_only(s, addr);
-}
-
-void tc4x_sfr_add_read_hook(Tc4xSoc *s, uint32_t addr, Tc4xSfrReadFn fn,
-                            void *opaque)
-{
-    Tc4xSfrReadHook *h = g_new(Tc4xSfrReadHook, 1);
-
-    /* vCPU threads look hooks up without a lock */
-    assert(!phase_check(PHASE_MACHINE_READY));
-    h->fn = fn;
-    h->opaque = opaque;
-    g_hash_table_insert(s->read_hooks, GUINT_TO_POINTER(addr), h);
-    set_bit_atomic(sfr_word(addr), sfr_page(s, addr, true)->read_hooked);
-}
-
-/*
- * TOM shadow registers without the BQL: a full-word write to an SR0/SR1
- * whose earlier write (under the BQL) took the default store path (no
- * watch, no bits that clear or set on write) is plain storage.
- */
-static bool sfr_write_lockless(Tc4xSoc *s, uint32_t addr, uint32_t val,
-                               unsigned size)
-{
-    Tc4xSfrPage *pg;
-    uint32_t w, persist, old, prev;
-
-    if (size != 4 || (addr & 3)) {
-        return false;
-    }
-    pg = sfr_page(s, addr, false);
-    w = sfr_word(addr);
-    if (!pg || !(qatomic_load_acquire(&pg->plain_write[BIT_WORD(w)]) &
-                 BIT_MASK(w))) {
-        return false;
-    }
-    persist = qatomic_read(&pg->plain_persist[w]);
-    old = qatomic_read(&pg->val[w]);
-    do {
-        prev = old;
-        old = qatomic_cmpxchg(&pg->val[w], prev,
-                              (prev & ~persist) | (val & persist));
-    } while (old != prev);
-    return true;
-}
-
-static bool sfr_gpio_write_lockless(Tc4xSoc *s, uint32_t addr, uint32_t val,
-                                    unsigned size)
-{
-    Tc4xSfrPage *pg = sfr_page(s, addr, false);
-
-    if (size != 4 || (addr & 3) ||
-        (pg && test_bit(sfr_word(addr), pg->bql_only))) {
-        return false;
-    }
-    return tc4x_gpio_write_lockless(s->gpio, addr, val);
+    return false;
 }
 
 /*
  * QSPI register writes without the BQL: an ISR may drive a slave register
  * by register (a frame per word).  Under the QSPI lock unless a
  * hardware-request DMA job would run on that module (the DMA engine needs
- * the BQL) or the register takes the BQL path.
+ * the BQL).
  */
-static bool sfr_qspi_write_lockless(Tc4xSoc *s, uint32_t addr,
-                                    uint32_t val, unsigned size)
+static bool soc_qspi_write_lockless(Tc4xSoc *s, uint32_t addr, uint32_t val)
 {
-    Tc4xSfrPage *pg = sfr_page(s, addr, false);
     uint32_t qn, qoff;
 
-    if (size != 4 || (addr & 3) || !qspi_decode(addr, &qn, &qoff) ||
-        (pg && test_bit(sfr_word(addr), pg->bql_only))) {
+    if (!qspi_decode(addr, &qn, &qoff)) {
         return false;
     }
     QEMU_LOCK_GUARD(&s->qspi_lock);
@@ -2275,57 +1898,44 @@ static bool sfr_qspi_write_lockless(Tc4xSoc *s, uint32_t addr,
             return false;
         }
     }
-    sfr_write_word_locked(s, addr, val);
+    soc_qspi_write(s, addr, val);
     return true;
 }
 
-static void sfr_region_write(void *opaque, hwaddr off, uint64_t val,
-                             unsigned size, uint32_t base)
+static bool soc_sfr_write_lockless(void *opaque, uint32_t addr, uint32_t val)
 {
-    if (sfr_write_lockless(opaque, base + off, val, size) ||
-        sfr_gpio_write_lockless(opaque, base + off, val, size) ||
-        sfr_qspi_write_lockless(opaque, base + off, val, size)) {
-        return;
-    }
-    BQL_LOCK_GUARD();
-    sfr_write(opaque, off, val, size, base);
+    Tc4xSoc *s = opaque;
+
+    return tc4x_gpio_write_lockless(s->gpio, addr, val) ||
+           soc_qspi_write_lockless(s, addr, val);
 }
 
-static uint64_t sfr_e_read(void *opaque, hwaddr off, unsigned size)
+static void soc_sfr_watched(void *opaque, uint32_t addr, uint32_t val,
+                            unsigned size)
 {
-    return sfr_region_read(opaque, off, size, 0xE0000000u);
+    sim_printf(opaque, "ev w 0x%08x 0x%08x %u %d\n", addr, val, size,
+               current_cpu ? current_cpu->cpu_index : -1);
 }
 
-static void sfr_e_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
-{
-    sfr_region_write(opaque, off, val, size, 0xE0000000u);
-}
-
-static uint64_t sfr_f_read(void *opaque, hwaddr off, unsigned size)
-{
-    return sfr_region_read(opaque, off, size, 0xF0000000u);
-}
-
-static void sfr_f_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
-{
-    sfr_region_write(opaque, off, val, size, 0xF0000000u);
-}
-
-static const MemoryRegionOps sfr_e_ops = {
-    .read = sfr_e_read,
-    .write = sfr_e_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 8 },
-    .impl = { .min_access_size = 1, .max_access_size = 4 },
+static const Tc4xSfrModelOps soc_sfr_models = {
+    .read_lockless = soc_sfr_read_lockless,
+    .write_lockless = soc_sfr_write_lockless,
+    .read = soc_sfr_read,
+    .write = soc_sfr_write,
+    .watched = soc_sfr_watched,
 };
 
-static const MemoryRegionOps sfr_f_ops = {
-    .read = sfr_f_read,
-    .write = sfr_f_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 8 },
-    .impl = { .min_access_size = 1, .max_access_size = 4 },
-};
+void tc4x_sfr_add_write_hook(Tc4xSoc *s, uint32_t addr, Tc4xSfrWriteFn fn,
+                             void *opaque)
+{
+    tc4x_sfr_store_add_write_hook(s->sfr, addr, fn, opaque);
+}
+
+void tc4x_sfr_add_read_hook(Tc4xSoc *s, uint32_t addr, Tc4xSfrReadFn fn,
+                            void *opaque)
+{
+    tc4x_sfr_store_add_read_hook(s->sfr, addr, fn, opaque);
+}
 
 /*
  * Idle cores poll CPUx_STM_ABS continuously.  Its page is a lockless_io
@@ -2355,8 +1965,9 @@ static uint64_t cpu_stm_page_read(void *opaque, hwaddr off, unsigned size)
         return extract64(stm_now(pg->soc), (off - CPU_STM_ABS) * 8,
                          size * 8);
     }
-    return sfr_region_read(pg->soc, cpu_stm_page_offset(off), size,
-                           pg->base);
+    return tc4x_sfr_store_access_read(pg->soc->sfr,
+                                      pg->base + cpu_stm_page_offset(off),
+                                      size);
 }
 
 static void cpu_stm_page_write(void *opaque, hwaddr off, uint64_t val,
@@ -2364,8 +1975,9 @@ static void cpu_stm_page_write(void *opaque, hwaddr off, uint64_t val,
 {
     Tc4xStmPage *pg = opaque;
 
-    sfr_region_write(pg->soc, cpu_stm_page_offset(off), val, size,
-                     pg->base);
+    tc4x_sfr_store_access_write(pg->soc->sfr,
+                                pg->base + cpu_stm_page_offset(off), val,
+                                size);
 }
 
 static const MemoryRegionOps cpu_stm_page_ops = {
@@ -2387,7 +1999,7 @@ static uint64_t tbu_page_read(void *opaque, hwaddr off, unsigned size)
     if (off == EGTM_TBU_CH0_BASE && size == 4) {
         return stm_now(pg->soc) & EGTM_TBU_MASK;
     }
-    return sfr_region_read(pg->soc, off, size, pg->base);
+    return tc4x_sfr_store_access_read(pg->soc->sfr, pg->base + off, size);
 }
 
 static void tbu_page_write(void *opaque, hwaddr off, uint64_t val,
@@ -2395,7 +2007,7 @@ static void tbu_page_write(void *opaque, hwaddr off, uint64_t val,
 {
     Tc4xStmPage *pg = opaque;
 
-    sfr_region_write(pg->soc, off, val, size, pg->base);
+    tc4x_sfr_store_access_write(pg->soc->sfr, pg->base + off, val, size);
 }
 
 static const MemoryRegionOps tbu_page_ops = {
@@ -2687,6 +2299,20 @@ static bool sim_needs_qspi_lock(Tc4xSoc *s, const char *name)
     return false;
 }
 
+/* Register commands act on the store only: else reply err */
+static bool sim_store_backed(Tc4xSoc *s, uint32_t addr)
+{
+    Object *owner = tc4x_sfr_store_owner(s->sfr, addr & ~3u);
+    g_autofree char *path = NULL;
+
+    if (!owner) {
+        return true;
+    }
+    path = object_get_canonical_path(owner);
+    sim_printf(s, "err 0x%08x owned by %s\n", addr, path ? path : "?");
+    return false;
+}
+
 static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
 {
     uint64_t a[4] = { 0 };
@@ -2718,26 +2344,35 @@ static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
                             MEMTXATTRS_UNSPECIFIED, &v, size);
         sim_printf(s, "ok\n");
     } else if (!strcmp(argv[0], "poke") && argc >= 3) {
-        reg_set(s, a[1] & ~3u, a[2]);
-        dma_htre_sync(s, a[1] & ~3u);
-        sim_printf(s, "ok\n");
+        if (sim_store_backed(s, a[1])) {
+            reg_set(s, a[1] & ~3u, a[2]);
+            dma_htre_sync(s, a[1] & ~3u);
+            sim_printf(s, "ok\n");
+        }
     } else if (!strcmp(argv[0], "force") && argc >= 3) {
-        reg_force(s, a[1] & ~3u, a[2], argc >= 4 ? a[3] : 0xFFFFFFFFu);
-        sim_printf(s, "ok\n");
+        if (sim_store_backed(s, a[1])) {
+            tc4x_sfr_store_force(s->sfr, a[1] & ~3u, a[2],
+                                 argc >= 4 ? a[3] : 0xFFFFFFFFu);
+            sim_printf(s, "ok\n");
+        }
     } else if (!strcmp(argv[0], "unforce") && argc >= 2) {
-        reg_force(s, a[1] & ~3u, 0, 0);
-        sim_printf(s, "ok\n");
+        if (sim_store_backed(s, a[1])) {
+            tc4x_sfr_store_force(s->sfr, a[1] & ~3u, 0, 0);
+            sim_printf(s, "ok\n");
+        }
     } else if (!strcmp(argv[0], "irq") && argc >= 2) {
         src_set_srr(s, a[1] & ~3u, true);
         sim_printf(s, "ok\n");
     } else if (!strcmp(argv[0], "watch") && argc >= 2) {
-        g_hash_table_add(s->watches, GUINT_TO_POINTER(a[1] & ~3u));
-        sfr_set_bql_only(s, a[1] & ~3u);
-        sim_printf(s, "ok\n");
+        if (sim_store_backed(s, a[1])) {
+            tc4x_sfr_store_watch(s->sfr, a[1] & ~3u, true);
+            sim_printf(s, "ok\n");
+        }
     } else if (!strcmp(argv[0], "unwatch") && argc >= 2) {
-        g_hash_table_remove(s->watches, GUINT_TO_POINTER(a[1] & ~3u));
-        sfr_watch_clear(s, a[1] & ~3u);
-        sim_printf(s, "ok\n");
+        if (sim_store_backed(s, a[1])) {
+            tc4x_sfr_store_watch(s->sfr, a[1] & ~3u, false);
+            sim_printf(s, "ok\n");
+        }
     } else if (!strcmp(argv[0], "cores")) {
         for (int c = 0; c < TC4X_NUM_CORES; c++) {
             CPUTriCoreState *env = &s->cpu[c]->env;
@@ -2752,28 +2387,10 @@ static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
         }
         sim_printf(s, "ok\n");
     } else if (!strcmp(argv[0], "hot")) {
-        uint32_t min = argc >= 2 ? a[1] : 100;
+        g_autoptr(GString) out = g_string_new(NULL);
 
-        for (uint32_t i1 = 0; i1 < SFR_L1_SIZE; i1++) {
-            Tc4xSfrPage **l2 = qatomic_load_acquire(&s->sfr_l1[i1]);
-
-            for (uint32_t i2 = 0; l2 && i2 < SFR_L2_SIZE; i2++) {
-                Tc4xSfrPage *pg = qatomic_load_acquire(&l2[i2]);
-                uint32_t page = (i1 << (SFR_PAGE_BITS + SFR_L2_BITS)) |
-                                (i2 << SFR_PAGE_BITS);
-
-                for (uint32_t w = 0; pg && w < SFR_PAGE_WORDS; w++) {
-                    uint32_t n = qatomic_xchg(&pg->reads[w], 0);
-
-                    if (n >= min) {
-                        sim_printf(s, "hot 0x%08x %u 0x%08x\n",
-                                   page + w * 4, n,
-                                   qatomic_read(&pg->val[w]));
-                    }
-                }
-            }
-        }
-        sim_printf(s, "ok\n");
+        tc4x_sfr_store_hot(s->sfr, argc >= 2 ? a[1] : 100, out);
+        sim_printf(s, "%sok\n", out->str);
     } else if (!strcmp(argv[0], "vmstop")) {
         vm_stop(RUN_STATE_PAUSED);
         sim_printf(s, "ok\n");
@@ -3058,12 +2675,35 @@ static void tc4x_soc_reset_hold(Object *obj, ResetType type)
     }
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         cpu_reset(CPU(s->cpu[c]));
+        for (int vm = 0; vm < CPU_STM_VM_COUNT; vm++) {
+            for (int cmp = 0; cmp < 2; cmp++) {
+                timer_del(s->stm[c][vm][cmp].timer);
+                s->stm[c][vm][cmp].fired = false;
+            }
+        }
     }
     WITH_QEMU_LOCK_GUARD(&s->ir_lock) {
         /* the CPU reset dropped the published priorities */
         memset(s->cpu_prio, 0, sizeof(s->cpu_prio));
+        /* the store resets the SRC registers */
+        g_hash_table_remove_all(s->pending);
+        g_array_set_size(s->acked, 0);
     }
     ir_update(s);
+    /* state that mirrors registers the store resets */
+    g_hash_table_remove_all(s->tom_cn0);
+    WITH_QEMU_LOCK_GUARD(&s->qspi_lock) {
+        for (int n = 0; n < QSPI_COUNT; n++) {
+            g_queue_clear(s->qspi_rx[n]);
+            qatomic_set(&s->qspi_rx_level[n], 0);
+            s->qspi_cs[n] = -1;
+        }
+        bitmap_zero(s->dma_htre, DMA_NUM_CH);
+    }
+    for (int i = 0; i < ARRAY_SIZE(s->dmu_if); i++) {
+        s->dmu_if[i].page_len = 0;
+        s->dmu_if[i].cmd_armed = false;
+    }
     s->boot_pc_board = 0;
     s->boot_hold = false;
 }
@@ -3114,24 +2754,19 @@ void tc4x_soc_add_semantics(Tc4xSoc *s, const Tc4xRegSemantics *sem,
                             size_t n_sem, const Tc4xKernelReset *kr,
                             size_t n_kr)
 {
-    for (size_t i = 0; i < n_sem; i++) {
-        g_hash_table_insert(s->reg_semantics, GUINT_TO_POINTER(sem[i].addr),
-                            (gpointer)&sem[i]);
-    }
-    for (size_t i = 0; i < n_kr; i++) {
-        g_hash_table_insert(s->kresets, GUINT_TO_POINTER(kr[i].ctrlb),
-                            (gpointer)&kr[i]);
-    }
+    tc4x_sfr_store_add_semantics(s->sfr, sem, n_sem, kr, n_kr);
 }
 
 static void tc4x_force_soc_status(Tc4xSoc *s)
 {
-    reg_force(s, A_CLOCK_RAMPSTAT, R_CLOCK_RAMPSTAT_ACTIVE_MASK,
-              R_CLOCK_RAMPSTAT_ACTIVE_MASK);
+    tc4x_sfr_store_force(s->sfr, A_CLOCK_RAMPSTAT,
+                         R_CLOCK_RAMPSTAT_ACTIVE_MASK,
+                         R_CLOCK_RAMPSTAT_ACTIVE_MASK);
     for (unsigned n = 0; n < VMT_COUNT; n++) {
-        reg_force(s, A_VMT0_MEMDONE + n * VMT_STRIDE, UINT32_MAX, UINT32_MAX);
-        reg_force(s, A_VMT0_MEMDONECS + n * VMT_STRIDE, UINT32_MAX,
-                  UINT32_MAX);
+        tc4x_sfr_store_force(s->sfr, A_VMT0_MEMDONE + n * VMT_STRIDE,
+                             UINT32_MAX, UINT32_MAX);
+        tc4x_sfr_store_force(s->sfr, A_VMT0_MEMDONECS + n * VMT_STRIDE,
+                             UINT32_MAX, UINT32_MAX);
     }
 }
 
@@ -3194,6 +2829,39 @@ static void tc4x_soc_init_sfr_io(Tc4xSoc *s, MemoryRegion *mr,
     memory_region_set_imprecise_io(mr, s->imprecise_io);
 }
 
+/*
+ * The SFR store under the SoC's models.  TOM shadow registers SR0/SR1,
+ * which cores rewrite often, are plain storage that GLB_CTRL copies to
+ * CM0/CM1: their writes may skip the BQL.
+ */
+static bool tc4x_soc_add_sfr_store(Tc4xSoc *s, Error **errp)
+{
+    DeviceState *dev = qdev_new(TYPE_TC4X_SFR_STORE);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    object_property_add_child(OBJECT(s), "sfr-store", OBJECT(dev));
+    qdev_prop_set_bit(dev, "imprecise-io", s->imprecise_io);
+    if (!sysbus_realize_and_unref(sbd, errp)) {
+        return false;
+    }
+    s->sfr = TC4X_SFR_STORE(dev);
+    tc4x_sfr_store_set_models(s->sfr, &soc_sfr_models, s);
+    sysbus_mmio_map_overlap(sbd, 0, TC4X_SFR_SEGMENT_E,
+                            TC4X_SFR_STORE_PRIORITY);
+    sysbus_mmio_map_overlap(sbd, 1, TC4X_SFR_SEGMENT_F,
+                            TC4X_SFR_STORE_PRIORITY);
+    for (uint32_t cls = 0; cls < EGTM_CLS_COUNT; cls++) {
+        for (uint32_t ch = 0; ch < EGTM_TOM_CH_COUNT; ch++) {
+            uint32_t base = EGTM_TOM_BASE + cls * EGTM_CLS_STRIDE +
+                            ch * EGTM_TOM_CH_STRIDE;
+
+            tc4x_sfr_store_allow_lockless_write(s->sfr, base + EGTM_TOM_SR0);
+            tc4x_sfr_store_allow_lockless_write(s->sfr, base + EGTM_TOM_SR1);
+        }
+    }
+    return true;
+}
+
 static void tc4x_soc_realize(DeviceState *dev, Error **errp)
 {
     Tc4xSoc *s = TC4X_SOC(dev);
@@ -3211,19 +2879,15 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    s->watches = g_hash_table_new(g_direct_hash, g_direct_equal);
-    s->reg_semantics = g_hash_table_new(g_direct_hash, g_direct_equal);
-    s->kresets = g_hash_table_new(g_direct_hash, g_direct_equal);
+    if (!tc4x_soc_add_sfr_store(s, errp)) {
+        return;
+    }
     s->tom_cn0 = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                        NULL, g_free);
     s->dmu_if[0] = (Tc4xDmuIf) { .status = DMU_HCI_STATUS, .err = DMU_HCI_ERR };
     s->dmu_if[1] = (Tc4xDmuIf) {
         .status = DMU_CSCI_STATUS, .err = DMU_CSCI_ERR, .csrm = true,
     };
-    s->write_hooks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                           NULL, g_free);
-    s->read_hooks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                          NULL, g_free);
     s->pending = g_hash_table_new(g_direct_hash, g_direct_equal);
     qemu_rec_mutex_init(&s->ir_lock);
     qemu_rec_mutex_init(&s->qspi_lock);
@@ -3245,9 +2909,6 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
     s->gpio = tc4x_gpio_new(s);
     s->adc = tc4x_adc_new(s);
     s->i2c = tc4x_i2c_new(s);
-    /* the SoC's own, from the iLLD SFR headers (tc4x_sfr_tables.c) */
-    tc4x_soc_add_semantics(s, tc4x_reg_semantics, tc4x_n_reg_semantics,
-                           tc4x_kernel_resets, tc4x_n_kernel_resets);
     tc4x_force_soc_status(s);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
@@ -3272,10 +2933,6 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
                              TC4X_LMU_SIZE);
     memory_region_add_subregion(sysmem, TC4X_LMU_NC_BASE, &s->lmu_alias);
 
-    tc4x_soc_init_sfr_io(s, &s->sfr_e, &sfr_e_ops, s, "sfr.e", 0x10000000u);
-    memory_region_add_subregion(sysmem, 0xE0000000u, &s->sfr_e);
-    tc4x_soc_init_sfr_io(s, &s->sfr_f, &sfr_f_ops, s, "sfr.f", 0x10000000u);
-    memory_region_add_subregion(sysmem, 0xF0000000u, &s->sfr_f);
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         g_autofree char *name = g_strdup_printf("cpu%d.stm_page", c);
         Tc4xStmPage *pg = &s->stm_page[c];
@@ -3284,15 +2941,14 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
         pg->base = CPU_SFR_BASE + c * CPU_SFR_STRIDE;
         tc4x_soc_init_sfr_io(s, &pg->mr, &cpu_stm_page_ops, pg, name,
                              CPU_STM_PAGE_SIZE);
-        memory_region_add_subregion_overlap(&s->sfr_f, pg->base - 0xF0000000u,
-                                            &pg->mr, 1);
+        memory_region_add_subregion_overlap(sysmem, pg->base, &pg->mr, 0);
     }
     s->tbu_page.soc = s;
     s->tbu_page.base = EGTM_TBU_PAGE;
     tc4x_soc_init_sfr_io(s, &s->tbu_page.mr, &tbu_page_ops, &s->tbu_page,
                          "egtm.tbu_page", CPU_STM_PAGE_SIZE);
-    memory_region_add_subregion_overlap(&s->sfr_f, EGTM_TBU_PAGE - 0xF0000000u,
-                                        &s->tbu_page.mr, 1);
+    memory_region_add_subregion_overlap(sysmem, EGTM_TBU_PAGE, &s->tbu_page.mr,
+                                        0);
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         if (!tc4x_soc_add_cpu(s, c, errp)) {

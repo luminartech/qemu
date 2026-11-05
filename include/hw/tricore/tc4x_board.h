@@ -15,6 +15,7 @@
 
 #include "qom/object.h"
 #include "hw/tricore/tc4x.h"
+#include "hw/tricore/tc4x_sfr_store.h"
 
 #define TYPE_TC4X_BOARD "tc4x-board"
 #define TC4X_BOARD_TYPE_NAME(name) (name "-" TYPE_TC4X_BOARD)
@@ -27,36 +28,6 @@ typedef struct Tc4xBoardInput {
     uint8_t pin;
     uint8_t level;
 } Tc4xBoardInput;
-
-/*
- * Software write semantics of one register: bits that store what is
- * written, bits a written 1 clears, a written 0 clears, a written 1 sets.
- * Registers without an entry store every write as it is.
- */
-typedef struct Tc4xRegSemantics {
-    uint32_t addr;
-    uint32_t persist;
-    uint32_t w1c;
-    uint32_t w0c;
-    uint32_t w1s;
-} Tc4xRegSemantics;
-
-/*
- * A module's kernel reset registers: writing CTRLB.KRST completes the reset
- * at once (STAT.KRST set, the KRST request bits of CTRLA and CTRLB clear);
- * CTRLB.STATCLR clears STAT.KRST
- */
-typedef struct Tc4xKernelReset {
-    uint32_t ctrla;
-    uint32_t ctrlb;
-    uint32_t stat;
-} Tc4xKernelReset;
-
-/* The SoC's tables, generated from the iLLD SFR headers (tc4x_sfr_tables.c) */
-extern const Tc4xRegSemantics tc4x_reg_semantics[];
-extern const size_t tc4x_n_reg_semantics;
-extern const Tc4xKernelReset tc4x_kernel_resets[];
-extern const size_t tc4x_n_kernel_resets;
 
 struct Tc4xBoard {
     Object parent_obj;

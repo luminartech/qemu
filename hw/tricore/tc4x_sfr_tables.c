@@ -33,7 +33,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/tricore/tc4x_board.h"
+#include "hw/tricore/tc4x_sfr_store.h"
 
 const Tc4xRegSemantics tc4x_reg_semantics[] = {
     { 0xe9800004, 0xfe00007, 0x0, 0x0, 0x0 },
