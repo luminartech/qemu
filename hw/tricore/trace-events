@@ -10,6 +10,9 @@ tc4x_time_barrier(int64_t barrier, bool held, bool stood) "barrier %" PRId64 " h
 tc4x_sfr_store_cold_image(unsigned pages) "%u pages"
 tc4x_sfr_store_reset(void) ""
 
+# tc4x_ir.c
+tc4x_ir_ack(uint32_t core, uint32_t prio, uint32_t src) "core %u prio %u src 0x%08x"
+
 # tc4x_i2c.c
 tc4x_i2c_transfer(unsigned bus, unsigned addr, bool read, unsigned len, bool ack) "bus %u addr 0x%02x read %d len %u ack %d"
 

@@ -43,6 +43,7 @@
 #include "hw/tricore/tc4x_pacer.h"
 #include "hw/tricore/tc4x_regs.h"
 #include "hw/tricore/tc4x_sfr_store.h"
+#include "hw/tricore/tc4x_ir.h"
 #include "tc4x_soc.h"
 
 #define TC4X_PSPR_OFFSET    (1 * MiB)
@@ -83,21 +84,10 @@
 #define INT_GPSRG_SWC_SETR  BIT(29)
 #define SRC_GPSR0_SR0       0xF4433460u
 #define SRC_GPSR_STRIDE     0x20u
-#define SRC_SIZE            0x2000u
 #define SRC_STMCPU_BASE     (SRC_BASE + 0x20u)
 #define SRC_STMCPU_STRIDE   0x40u
 #define SRC_ASCLIN_TX(n)    (SRC_BASE + 0x2B0u + (n) * 12u)
 #define SRC_ASCLIN_RX(n)    (SRC_BASE + 0x2B4u + (n) * 12u)
-#define SRC_SRPN_MASK       0xFFu
-#define SRC_TOS_SHIFT       12
-#define SRC_TOS_MASK        0xFu
-#define SRC_SRE             BIT(23)
-#define SRC_SRR             BIT(24)
-#define SRC_CLRR            BIT(25)
-#define SRC_SETR            BIT(26)
-#define SRC_IOV             BIT(27)
-#define SRC_IOVCLR          BIT(28)
-#define SRC_WRITABLE        0x0080FFFFu
 
 #define ASCLIN_BASE         0xF46C0000u
 #define ASCLIN_STRIDE       0x200u
@@ -263,7 +253,6 @@
 #define VMT_STRIDE          (A_VMT1_MEMDONE - A_VMT0_MEMDONE)
 #define VMT_COUNT           7u
 
-#define TC4X_ACK_LISTENERS_MAX  8
 #define TC4X_RETIME_MAX         16
 
 typedef struct Tc4xStmPage {
@@ -305,14 +294,6 @@ typedef struct Tc4xQspiSlave {
     const Tc4xQspiSlaveOps *ops;
     void *opaque;
 } Tc4xQspiSlave;
-
-typedef void (*Tc4xAckFn)(void *opaque, uint32_t src);
-
-typedef struct Tc4xAckListener {
-    uint32_t src;
-    Tc4xAckFn fn;
-    void *opaque;
-} Tc4xAckListener;
 
 typedef struct Tc4xRetimeNotifier {
     Tc4xRetimeFn fn;
@@ -363,20 +344,7 @@ struct Tc4xSoc {
     Tc4xSfrStore *sfr;
     GHashTable *tom_cn0;   /* TOM CN0 addr -> Tc4xTomCounter */
     DeviceState *geth;
-    /*
-     * Interrupt router.  Cores acknowledge interrupts without the BQL, so
-     * pending, cpu_prio and the SRC registers' SRR bits are under ir_lock;
-     * acknowledges of listened SRCs reach their listeners later, under the
-     * BQL (ack_bh).
-     */
-    QemuRecMutex ir_lock;
-    GHashTable *pending;   /* SRC addrs with SRR set */
-    uint32_t cpu_prio[TC4X_NUM_CORES];
-    GArray *acked;         /* SRC addrs acknowledged since the last ack_bh */
-    QEMUBH *ack_bh;
-    /* set up at machine init, before the vCPUs run */
-    Tc4xAckListener ack_listeners[TC4X_ACK_LISTENERS_MAX];
-    unsigned n_ack_listeners;
+    Tc4xIr *ir;
 
     /*
      * Guest time: the STM and eGTM run at 1/time_scale of QEMU virtual time
@@ -463,12 +431,17 @@ static void reg_set(Tc4xSoc *s, uint32_t addr, uint32_t val)
 
 uint32_t tc4x_reg_get(Tc4xSoc *s, uint32_t addr)
 {
-    return reg_get(s, addr);
+    return tc4x_ir_is_src(addr) ? tc4x_ir_src_get(s->ir, addr) :
+                                  reg_get(s, addr);
 }
 
 void tc4x_reg_set(Tc4xSoc *s, uint32_t addr, uint32_t val)
 {
-    reg_set(s, addr, val);
+    if (tc4x_ir_is_src(addr)) {
+        tc4x_ir_src_set(s->ir, addr, val);
+    } else {
+        reg_set(s, addr, val);
+    }
 }
 
 uint32_t tc4x_reg_cmpxchg(Tc4xSoc *s, uint32_t addr, uint32_t old,
@@ -491,140 +464,15 @@ static void G_GNUC_PRINTF(2, 3) sim_printf(Tc4xSoc *s, const char *fmt, ...)
     qemu_chr_fe_write_all(&s->sim, (const uint8_t *)line, strlen(line));
 }
 
-static void ir_update(Tc4xSoc *s)
+/* A hardware service request of the node at @src (any thread) */
+static void src_raise(Tc4xSoc *s, uint32_t src)
 {
-    uint32_t best[TC4X_NUM_CORES] = { 0 };
-    GHashTableIter it;
-    gpointer key;
-
-    QEMU_LOCK_GUARD(&s->ir_lock);
-    g_hash_table_iter_init(&it, s->pending);
-    while (g_hash_table_iter_next(&it, &key, NULL)) {
-        uint32_t v = reg_get(s, GPOINTER_TO_UINT(key));
-        uint32_t tos = (v >> SRC_TOS_SHIFT) & SRC_TOS_MASK;
-        uint32_t prio = v & SRC_SRPN_MASK;
-
-        if ((v & SRC_SRE) && tos < TC4X_NUM_CORES && prio > best[tos]) {
-            best[tos] = prio;
-        }
-    }
-    for (int c = 0; c < TC4X_NUM_CORES; c++) {
-        if (best[c] != s->cpu_prio[c]) {
-            qatomic_set(&s->cpu_prio[c], best[c]);
-            tricore_cpu_set_pending_irq(s->cpu[c], best[c]);
-        }
-    }
-}
-
-static void src_set_srr(Tc4xSoc *s, uint32_t addr, bool set)
-{
-    uint32_t v;
-
-    QEMU_LOCK_GUARD(&s->ir_lock);
-    v = reg_get(s, addr);
-    if (set) {
-        if (v & SRC_SRR) {
-            v |= SRC_IOV;
-        }
-        v |= SRC_SRR;
-        g_hash_table_add(s->pending, GUINT_TO_POINTER(addr));
-    } else {
-        v &= ~SRC_SRR;
-        g_hash_table_remove(s->pending, GUINT_TO_POINTER(addr));
-    }
-    reg_set(s, addr, v);
-    ir_update(s);
+    qemu_irq_raise(tc4x_ir_src(s->ir, src));
 }
 
 void tc4x_irq_raise(Tc4xSoc *s, uint32_t src)
 {
-    src_set_srr(s, src, true);
-}
-
-static bool ir_listened(Tc4xSoc *s, uint32_t src)
-{
-    for (unsigned i = 0; i < s->n_ack_listeners; i++) {
-        if (s->ack_listeners[i].src == src) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static void ir_ack_bh(void *opaque)
-{
-    Tc4xSoc *s = opaque;
-    g_autoptr(GArray) acked = g_array_new(false, false, sizeof(uint32_t));
-
-    WITH_QEMU_LOCK_GUARD(&s->ir_lock) {
-        g_array_append_vals(acked, s->acked->data, s->acked->len);
-        g_array_set_size(s->acked, 0);
-    }
-    for (guint i = 0; i < acked->len; i++) {
-        uint32_t src = g_array_index(acked, uint32_t, i);
-
-        for (unsigned k = 0; k < s->n_ack_listeners; k++) {
-            if (s->ack_listeners[k].src == src) {
-                s->ack_listeners[k].fn(s->ack_listeners[k].opaque, src);
-            }
-        }
-    }
-}
-
-/* @fn sees every acknowledge of @src, in the main loop */
-static void ir_add_ack_listener(Tc4xSoc *s, uint32_t src, Tc4xAckFn fn,
-                                void *opaque)
-{
-    QEMU_LOCK_GUARD(&s->ir_lock);
-    assert(s->n_ack_listeners < TC4X_ACK_LISTENERS_MAX);
-    s->ack_listeners[s->n_ack_listeners++] = (Tc4xAckListener) {
-        .src = src, .fn = fn, .opaque = opaque,
-    };
-}
-
-/* Called by a core taking an interrupt, without the BQL */
-static void ir_ack(void *opaque, uint32_t core, uint32_t prio)
-{
-    Tc4xSoc *s = opaque;
-    GHashTableIter it;
-    gpointer key;
-
-    QEMU_LOCK_GUARD(&s->ir_lock);
-    g_hash_table_iter_init(&it, s->pending);
-    while (g_hash_table_iter_next(&it, &key, NULL)) {
-        uint32_t src = GPOINTER_TO_UINT(key);
-        uint32_t v = reg_get(s, src);
-
-        if ((v & SRC_SRE) && (v & SRC_SRPN_MASK) == prio &&
-            ((v >> SRC_TOS_SHIFT) & SRC_TOS_MASK) == core) {
-            src_set_srr(s, src, false);
-            if (ir_listened(s, src)) {
-                g_array_append_val(s->acked, src);
-                qemu_bh_schedule(s->ack_bh);
-            }
-            return;
-        }
-    }
-}
-
-static void src_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
-{
-    uint32_t v;
-
-    QEMU_LOCK_GUARD(&s->ir_lock);
-    v = (reg_get(s, addr) & ~SRC_WRITABLE) | (val & SRC_WRITABLE);
-
-    if (val & SRC_IOVCLR) {
-        v &= ~SRC_IOV;
-    }
-    reg_set(s, addr, v);
-    if (val & SRC_SETR) {
-        src_set_srr(s, addr, true);
-    } else if (val & SRC_CLRR) {
-        src_set_srr(s, addr, false);
-    } else {
-        ir_update(s);
-    }
+    qemu_irq_pulse(tc4x_ir_src(s->ir, src));
 }
 
 /*
@@ -741,8 +589,8 @@ static void stm_fire(void *opaque)
     t->fired = true;
     t->fired_target = reg_get(s, stm_vm_reg(t->core, t->vm,
                                             t->cmp ? STM_CMP1 : STM_CMP0));
-    src_set_srr(s, SRC_STMCPU_BASE + t->core * SRC_STMCPU_STRIDE +
-                   (2 * t->vm + os) * 4, true);
+    src_raise(s, SRC_STMCPU_BASE + t->core * SRC_STMCPU_STRIDE +
+                 (2 * t->vm + os) * 4);
     stm_schedule(s, t->core, t->vm, t->cmp);
 }
 
@@ -769,7 +617,7 @@ static void uart_receive(void *opaque, const uint8_t *buf, int size)
     reg_set(s, asclin_reg(s->console, ASCLIN_FLAGS),
             reg_get(s, asclin_reg(s->console, ASCLIN_FLAGS)) |
             ASCLIN_FLAGS_RFL);
-    src_set_srr(s, SRC_ASCLIN_RX(s->console), true);
+    src_raise(s, SRC_ASCLIN_RX(s->console));
 }
 
 static uint32_t uart_rx_pop(Tc4xSoc *s)
@@ -833,7 +681,7 @@ static bool asclin_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
         if (n == s->console) {
             qemu_chr_fe_write_all(&s->uart, &ch, 1);
         }
-        src_set_srr(s, SRC_ASCLIN_TX(n), true);
+        src_raise(s, SRC_ASCLIN_TX(n));
     } else if (off == ASCLIN_FLAGSCLEAR) {
         reg_set(s, flags, reg_get(s, flags) & ~val);
     } else if (off == ASCLIN_FLAGSSET) {
@@ -1193,7 +1041,7 @@ static bool dma_transaction(Tc4xSoc *s, uint32_t ch, bool *auto_start)
     if (extract32(adicr, 26, 2) & 2) {
         reg_set(s, dma_reg(ch, DMA_CHCSR),
                 reg_get(s, dma_reg(ch, DMA_CHCSR)) | DMA_CHCSR_ICH);
-        src_set_srr(s, dma_src(ch), true);
+        src_raise(s, dma_src(ch));
     }
 
     if (extract32(adicr, 16, 4) == DMA_SHCT_LINKED) {
@@ -1367,11 +1215,11 @@ static void qspi_cpu_events(Tc4xSoc *s, uint32_t n)
 
     for (unsigned i = 0; i < ARRAY_SIZE(ev); i++) {
         uint32_t src = ev[i].src + n * SRC_QSPI_STRIDE;
-        uint32_t tos = (reg_get(s, src) >> SRC_TOS_SHIFT) & SRC_TOS_MASK;
+        uint32_t v = tc4x_ir_src_get(s->ir, src);
 
-        if ((con1 & ev[i].enable) && (reg_get(s, src) & SRC_SRE) &&
-            tos < TC4X_NUM_CORES) {
-            src_set_srr(s, src, true);
+        if ((con1 & ev[i].enable) && (v & R_SRC_SRCR_SRE_MASK) &&
+            FIELD_EX32(v, SRC_SRCR, TOS) < TC4X_NUM_CORES) {
+            src_raise(s, src);
         }
     }
 }
@@ -1462,10 +1310,10 @@ static void qspi_dma_kick(Tc4xSoc *s, uint32_t n)
         mccon = reg_get(s, base + QSPI_MCCON);
         /* Frame-based CS jobs end with IAL (move counter), others with PT2 */
         if (reg_get(s, base + QSPI_GLOBALCON1) & QSPI_GLOBALCON1_PT2EN) {
-            src_set_srr(s, SRC_QSPI0_PT + n * SRC_QSPI_STRIDE, true);
+            src_raise(s, SRC_QSPI0_PT + n * SRC_QSPI_STRIDE);
         } else if (mccon & QSPI_MCCON_IALEN) {
             reg_set(s, base + QSPI_MCCON, mccon | QSPI_MCCON_IALF);
-            src_set_srr(s, SRC_QSPI0_U + n * SRC_QSPI_STRIDE, true);
+            src_raise(s, SRC_QSPI0_U + n * SRC_QSPI_STRIDE);
         }
     }
     s->qspi_dma_busy[n] = false;
@@ -1820,10 +1668,6 @@ static bool soc_sfr_write(void *opaque, uint32_t addr, uint32_t *val)
         soc_qspi_write(s, addr, *val);
         return true;
     }
-    if (addr >= SRC_BASE && addr < SRC_BASE + SRC_SIZE) {
-        src_write(s, addr, *val);
-        return true;
-    }
     if (asclin_write(s, addr, *val) || dma_write(s, addr, *val) ||
         tc4x_gpio_write(s->gpio, addr, *val) ||
         tc4x_i2c_write(s->i2c, addr, *val) ||
@@ -1838,7 +1682,7 @@ static bool soc_sfr_write(void *opaque, uint32_t addr, uint32_t *val)
         uint32_t x = (addr - INT_GPSRG_SWC0) / INT_GPSRG_STRIDE;
         uint32_t y = (addr - INT_GPSRG_SWC0) % INT_GPSRG_STRIDE / 4;
 
-        src_set_srr(s, SRC_GPSR0_SR0 + x * SRC_GPSR_STRIDE + 4 * y, true);
+        src_raise(s, SRC_GPSR0_SR0 + x * SRC_GPSR_STRIDE + 4 * y);
         *val &= ~INT_GPSRG_SWC_SETR;
     }
     if (tom_is_cn0(addr)) {
@@ -2167,16 +2011,17 @@ static uint32_t pacer_requested_scale(void *opaque)
 static bool pacer_pending(void *opaque, uint32_t src)
 {
     Tc4xSocPacer *sp = opaque;
-    uint32_t v = reg_get(sp->soc, src);
+    uint32_t v = tc4x_ir_src_get(sp->soc->ir, src);
+    uint32_t mask = R_SRC_SRCR_SRE_MASK | R_SRC_SRCR_SRR_MASK;
 
-    return (v & (SRC_SRE | SRC_SRR)) == (SRC_SRE | SRC_SRR);
+    return (v & mask) == mask;
 }
 
 static void pacer_raise(void *opaque, uint32_t src)
 {
     Tc4xSocPacer *sp = opaque;
 
-    src_set_srr(sp->soc, src, true);
+    src_raise(sp->soc, src);
 }
 
 static uint32_t pacer_cpu_prio(void *opaque, unsigned core)
@@ -2264,10 +2109,10 @@ Tc4xPacer *tc4x_pacer_new(Tc4xSoc *s, const Tc4xPacerConfig *cfg,
         timer_new_ns(QEMU_CLOCK_VIRTUAL, pacer_hold_timer, sp);
     sp->pacer = tc4x_pacer_create(&pacer_host, sp, cfg, ops, opaque);
     for (unsigned i = 0; i < cfg->n_srcs; i++) {
-        ir_add_ack_listener(s, cfg->srcs[i], pacer_acked, sp);
+        tc4x_ir_add_ack_listener(s->ir, cfg->srcs[i], pacer_acked, sp);
     }
     if (cfg->hold_src) {
-        ir_add_ack_listener(s, cfg->hold_src, pacer_acked, sp);
+        tc4x_ir_add_ack_listener(s->ir, cfg->hold_src, pacer_acked, sp);
     }
     tc4x_time_add_retime_notifier(s, pacer_retime, sp);
     return sp->pacer;
@@ -2361,16 +2206,22 @@ static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
             sim_printf(s, "ok\n");
         }
     } else if (!strcmp(argv[0], "irq") && argc >= 2) {
-        src_set_srr(s, a[1] & ~3u, true);
-        sim_printf(s, "ok\n");
-    } else if (!strcmp(argv[0], "watch") && argc >= 2) {
-        if (sim_store_backed(s, a[1])) {
-            tc4x_sfr_store_watch(s->sfr, a[1] & ~3u, true);
+        if (tc4x_ir_is_src(a[1])) {
+            tc4x_irq_raise(s, a[1] & ~3u);
             sim_printf(s, "ok\n");
+        } else {
+            sim_printf(s, "err 0x%08x is not a service request node\n",
+                       (uint32_t)a[1]);
         }
-    } else if (!strcmp(argv[0], "unwatch") && argc >= 2) {
-        if (sim_store_backed(s, a[1])) {
-            tc4x_sfr_store_watch(s->sfr, a[1] & ~3u, false);
+    } else if ((!strcmp(argv[0], "watch") || !strcmp(argv[0], "unwatch")) &&
+               argc >= 2) {
+        bool on = !strcmp(argv[0], "watch");
+
+        if (tc4x_ir_is_src(a[1])) {
+            tc4x_ir_watch(s->ir, a[1] & ~3u, on);
+            sim_printf(s, "ok\n");
+        } else if (sim_store_backed(s, a[1])) {
+            tc4x_sfr_store_watch(s->sfr, a[1] & ~3u, on);
             sim_printf(s, "ok\n");
         }
     } else if (!strcmp(argv[0], "cores")) {
@@ -2598,7 +2449,7 @@ void tc4x_release_boot(Tc4xSoc *s)
 
 void tc4x_nmi(Tc4xSoc *s, int core)
 {
-    tricore_cpu_raise_nmi(s->cpu[core]);
+    qemu_irq_pulse(qdev_get_gpio_in_named(DEVICE(s->ir), "nmi", core));
 }
 
 int tc4x_access_core(Tc4xSoc *s)
@@ -2682,14 +2533,6 @@ static void tc4x_soc_reset_hold(Object *obj, ResetType type)
             }
         }
     }
-    WITH_QEMU_LOCK_GUARD(&s->ir_lock) {
-        /* the CPU reset dropped the published priorities */
-        memset(s->cpu_prio, 0, sizeof(s->cpu_prio));
-        /* the store resets the SRC registers */
-        g_hash_table_remove_all(s->pending);
-        g_array_set_size(s->acked, 0);
-    }
-    ir_update(s);
     /* state that mirrors registers the store resets */
     g_hash_table_remove_all(s->tom_cn0);
     WITH_QEMU_LOCK_GUARD(&s->qspi_lock) {
@@ -2722,24 +2565,15 @@ void tc4x_soc_boot(Tc4xSoc *s, uint32_t entry)
 }
 
 /* GETH0 lines 0..15 -> SRC_GETH0_DMA0..15, 16 -> SRC_GETH0_INTR */
-#define SRC_GETH0_DMA0      (SRC_BASE + 0xB90u)
-#define SRC_GETH0_INTR      (SRC_BASE + 0xBE0u)
-
-static void tc4x_geth_irq(void *opaque, int n, int level)
-{
-    if (level) {
-        src_set_srr(opaque, n == TC4X_GETH_IRQ_MAC ? SRC_GETH0_INTR :
-                    SRC_GETH0_DMA0 + 4 * n, true);
-    }
-}
-
 static void tc4x_geth_init(Tc4xSoc *s, MemoryRegion *sysmem)
 {
-    qemu_irq *lines = qemu_allocate_irqs(tc4x_geth_irq, s, TC4X_GETH_NUM_IRQ);
-
     s->geth = tc4x_geth_create(sysmem);
     for (int i = 0; i < TC4X_GETH_NUM_IRQ; i++) {
-        sysbus_connect_irq(SYS_BUS_DEVICE(s->geth), i, lines[i]);
+        uint32_t src = i == TC4X_GETH_IRQ_MAC ? A_SRC_GETH0_INTR :
+                       A_SRC_GETH0_DMA0 + 4 * i;
+
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->geth), i,
+                           tc4x_ir_src(s->ir, src));
     }
 }
 
@@ -2802,8 +2636,6 @@ static bool tc4x_soc_add_cpu(Tc4xSoc *s, int c, Error **errp)
         return false;
     }
     s->cpu[c] = TRICORE_CPU(cpuobj);
-    s->cpu[c]->irq_ack = ir_ack;
-    s->cpu[c]->irq_ack_opaque = s;
 
     for (int vm = 0; vm < CPU_STM_VM_COUNT; vm++) {
         for (int cmp = 0; cmp < 2; cmp++) {
@@ -2827,6 +2659,28 @@ static void tc4x_soc_init_sfr_io(Tc4xSoc *s, MemoryRegion *mr,
     memory_region_init_io(mr, OBJECT(s), ops, opaque, name, size);
     memory_region_enable_lockless_io(mr);
     memory_region_set_imprecise_io(mr, s->imprecise_io);
+}
+
+/* The interrupt router, over the store at the SRC registers */
+static bool tc4x_soc_add_ir(Tc4xSoc *s, Error **errp)
+{
+    DeviceState *dev = qdev_new(TYPE_TC4X_IR);
+
+    object_property_add_child(OBJECT(s), "ir", OBJECT(dev));
+    qdev_prop_set_bit(dev, "imprecise-io", s->imprecise_io);
+    for (int c = 0; c < TC4X_NUM_CORES; c++) {
+        g_autofree char *name = g_strdup_printf("cpu%d", c);
+
+        object_property_set_link(OBJECT(dev), name, OBJECT(s->cpu[c]),
+                                 &error_abort);
+    }
+    if (!sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), errp)) {
+        return false;
+    }
+    s->ir = TC4X_IR(dev);
+    tc4x_ir_set_watch_fn(s->ir, soc_sfr_watched, s);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, TC4X_IR_SRC_BASE);
+    return true;
 }
 
 /*
@@ -2888,11 +2742,7 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
     s->dmu_if[1] = (Tc4xDmuIf) {
         .status = DMU_CSCI_STATUS, .err = DMU_CSCI_ERR, .csrm = true,
     };
-    s->pending = g_hash_table_new(g_direct_hash, g_direct_equal);
-    qemu_rec_mutex_init(&s->ir_lock);
     qemu_rec_mutex_init(&s->qspi_lock);
-    s->acked = g_array_new(false, false, sizeof(uint32_t));
-    s->ack_bh = qemu_bh_new(ir_ack_bh, s);
     s->qspi_kick_bh = qemu_bh_new(qspi_kick_bh, s);
     s->sim_line = g_string_new(NULL);
     s->sim_commands = g_array_new(false, false, sizeof(Tc4xSimCommand));
@@ -2954,6 +2804,9 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
         if (!tc4x_soc_add_cpu(s, c, errp)) {
             return;
         }
+    }
+    if (!tc4x_soc_add_ir(s, errp)) {
+        return;
     }
     tc4x_geth_init(s, sysmem);
 
