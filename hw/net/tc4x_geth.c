@@ -4,7 +4,8 @@
  * TC4x GETH0 is based on the Synopsys DWC Ethernet QoS core and has two MAC
  * ports.  Board code links a PHY (TYPE_TC4X_GETH_PHY) to each port that has
  * one; MDIO reads of a port without one return all ones.  The PHY learns
- * the link state of the port's network connection.
+ * the link state of the port's network connection: a NIC with its netdev,
+ * or a device that stands in for it (TYPE_TC4X_GETH_PORT_BACKEND).
  * The PTP system time stamps frames in TX status and RX context descriptors.
  * The on-chip HSPHY reports its calibration and DLL-lock status as done.
  * The bridge forwards between the ports: in two-port mode with TxQ/RxC
@@ -297,6 +298,7 @@ typedef struct Tc4xGethPort {
     int index;
     NICConf conf;
     NICState *nic;
+    Tc4xGethPortBackend *backend;   /* in place of the NIC */
     Tc4xGethPhy *phy;           /* NULL: nothing answers on MDIO */
     uint8_t phy_addr;
     int64_t ptp_offset_ns;
@@ -603,7 +605,8 @@ static void port_send(Tc4xGethState *s, int p, const uint8_t *buf,
 {
     Tc4xGethPort *port = &s->port[p];
 
-    if (!port->nic || !(preg(s, p, MAC_TX_CONFIGURATION) & MAC_TE)) {
+    if ((!port->nic && !port->backend) ||
+        !(preg(s, p, MAC_TX_CONFIGURATION) & MAC_TE)) {
         return;
     }
     mmc_inc(s, p, MMC_TX_PACKETS_GB, 1);
@@ -619,7 +622,12 @@ static void port_send(Tc4xGethState *s, int p, const uint8_t *buf,
     } else {
         mmc_inc(s, p, MMC_TX_UNICAST_GB, 1);
     }
-    qemu_send_packet(qemu_get_queue(port->nic), buf, len);
+    if (port->backend) {
+        TC4X_GETH_PORT_BACKEND_GET_CLASS(port->backend)->transmit(
+            port->backend, buf, len);
+    } else {
+        qemu_send_packet(qemu_get_queue(port->nic), buf, len);
+    }
 }
 
 static void tx_checksum(uint8_t *buf, unsigned len, uint32_t cic)
@@ -885,12 +893,10 @@ static bool geth_can_receive(NetClientState *nc)
     return true;
 }
 
-static ssize_t geth_receive(NetClientState *nc, const uint8_t *data,
+/* A frame that arrives at port @p: 0 while it waits for a descriptor */
+static ssize_t port_receive(Tc4xGethState *s, int p, const uint8_t *data,
                             size_t size)
 {
-    Tc4xGethPort *port = qemu_get_nic_opaque(nc);
-    Tc4xGethState *s = port->s;
-    int p = port->index;
     uint8_t buf[MAX_FRAME];
     unsigned len = size;
     int q, fwd;
@@ -924,11 +930,37 @@ static ssize_t geth_receive(NetClientState *nc, const uint8_t *data,
     return size;
 }
 
+static ssize_t geth_receive(NetClientState *nc, const uint8_t *data,
+                            size_t size)
+{
+    Tc4xGethPort *port = qemu_get_nic_opaque(nc);
+
+    return port_receive(port->s, port->index, data, size);
+}
+
+bool tc4x_geth_port_receive(DeviceState *dev, unsigned port,
+                            const uint8_t *buf, size_t len)
+{
+    Tc4xGethState *s = TC4X_GETH(dev);
+
+    assert(port < TC4X_GETH_NUM_PORTS && s->port[port].backend);
+    return port_receive(s, port, buf, len) != 0;
+}
+
 static void rx_kick(Tc4xGethState *s)
 {
     for (int p = 0; p < TC4X_GETH_NUM_PORTS; p++) {
-        if (s->port[p].nic) {
-            qemu_flush_queued_packets(qemu_get_queue(s->port[p].nic));
+        Tc4xGethPort *port = &s->port[p];
+
+        if (port->nic) {
+            qemu_flush_queued_packets(qemu_get_queue(port->nic));
+        } else if (port->backend) {
+            Tc4xGethPortBackendClass *bc =
+                TC4X_GETH_PORT_BACKEND_GET_CLASS(port->backend);
+
+            if (bc->rx_ready) {
+                bc->rx_ready(port->backend);
+            }
         }
     }
 }
@@ -936,7 +968,8 @@ static void rx_kick(Tc4xGethState *s)
 /* The port has a network connection with its link up */
 static bool port_link_up(Tc4xGethPort *port)
 {
-    return port->nic && !qemu_get_queue(port->nic)->link_down;
+    return port->backend ||
+           (port->nic && !qemu_get_queue(port->nic)->link_down);
 }
 
 static void port_link_changed(Tc4xGethPort *port)
@@ -1389,6 +1422,14 @@ static void geth_realize(DeviceState *dev, Error **errp)
 
         port->s = s;
         port->index = p;
+        if (port->backend) {
+            if (port->conf.peers.ncs[0]) {
+                error_setg(errp, "port %d has both a netdev and a backend",
+                           p);
+                return;
+            }
+            continue;
+        }
         if (p > 0 && !port->conf.peers.ncs[0]) {
             continue;                   /* unused extra port: no NIC */
         }
@@ -1412,6 +1453,10 @@ static const Property geth_properties[] = {
                      Tc4xGethPhy *),
     DEFINE_PROP_LINK("phy1", Tc4xGethState, port[1].phy, TYPE_TC4X_GETH_PHY,
                      Tc4xGethPhy *),
+    DEFINE_PROP_LINK("port0-backend", Tc4xGethState, port[0].backend,
+                     TYPE_TC4X_GETH_PORT_BACKEND, Tc4xGethPortBackend *),
+    DEFINE_PROP_LINK("port1-backend", Tc4xGethState, port[1].backend,
+                     TYPE_TC4X_GETH_PORT_BACKEND, Tc4xGethPortBackend *),
     DEFINE_PROP_UINT8("phy0-addr", Tc4xGethState, port[0].phy_addr, 0),
     DEFINE_PROP_UINT8("phy1-addr", Tc4xGethState, port[1].phy_addr, 0),
 };
@@ -1448,6 +1493,10 @@ static const TypeInfo geth_types[] = {
         .name = TYPE_TC4X_GETH_PHY,
         .parent = TYPE_INTERFACE,
         .class_size = sizeof(Tc4xGethPhyClass),
+    }, {
+        .name = TYPE_TC4X_GETH_PORT_BACKEND,
+        .parent = TYPE_INTERFACE,
+        .class_size = sizeof(Tc4xGethPortBackendClass),
     }, {
         .name = TYPE_TC4X_GETH_PHY_LEGACY,
         .parent = TYPE_OBJECT,

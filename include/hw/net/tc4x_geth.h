@@ -49,6 +49,36 @@ struct Tc4xGethPhyClass {
 };
 
 /*
+ * A device that stands in for the network connection of one GETH port:
+ * the object that link "port0-backend" or "port1-backend" of the
+ * controller names.  The port then has no NIC, and a netdev for it is an
+ * error.  The port's link is up.  Called with the BQL held.
+ */
+#define TYPE_TC4X_GETH_PORT_BACKEND "tc4x-geth-port-backend"
+
+typedef struct Tc4xGethPortBackendClass Tc4xGethPortBackendClass;
+DECLARE_CLASS_CHECKERS(Tc4xGethPortBackendClass, TC4X_GETH_PORT_BACKEND,
+                       TYPE_TC4X_GETH_PORT_BACKEND)
+#define TC4X_GETH_PORT_BACKEND(obj) \
+    INTERFACE_CHECK(Tc4xGethPortBackend, (obj), TYPE_TC4X_GETH_PORT_BACKEND)
+
+typedef struct Tc4xGethPortBackend Tc4xGethPortBackend;
+
+struct Tc4xGethPortBackendClass {
+    InterfaceClass parent_class;
+
+    /* The port's MAC sent the frame @buf of @len bytes */
+    void (*transmit)(Tc4xGethPortBackend *be, const uint8_t *buf,
+                     size_t len);
+    /*
+     * The guest gave the port's receive DMA new descriptors: a frame that
+     * tc4x_geth_port_receive() did not take may be offered again (may be
+     * NULL)
+     */
+    void (*rx_ready)(Tc4xGethPortBackend *be);
+};
+
+/*
  * Legacy PHY attach: operations with an opaque pointer.  Clause 22 frames
  * reach read22 and write22, Clause 45 frames read45 and write45 with their
  * MMD; reset (may be NULL) runs with the controller's reset.  Called with
@@ -89,6 +119,15 @@ typedef struct Tc4xGethPhyOps {
  * (port 0) and "tc4x-geth-port1" (port 1)
  */
 void tc4x_geth_configure_nics(DeviceState *dev);
+
+/*
+ * The frame @buf of @len bytes arrives at @port, which has a backend.
+ * Returns false when the frame waits for a receive descriptor and was not
+ * taken (see rx_ready); true when it was taken: received, forwarded by the
+ * bridge, or dropped (receiver off, address filter).
+ */
+bool tc4x_geth_port_receive(DeviceState *dev, unsigned port,
+                            const uint8_t *buf, size_t len);
 
 /*
  * Attach @ops as the PHY at MDIO address @addr of @port after the
