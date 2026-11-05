@@ -41,6 +41,7 @@
 #include "hw/core/irq.h"
 #include "hw/net/tc4x_geth.h"
 #include "hw/tricore/tc4x_board.h"
+#include "hw/tricore/tc4x_flash.h"
 #include "hw/tricore/tc4x_pacer.h"
 #include "hw/tricore/tc4x_regs.h"
 #include "hw/tricore/tc4x_sfr_store.h"
@@ -53,8 +54,6 @@
 #define TC4X_CORE_RAM_BASE(c) (0x70000000u - (c) * 0x10000000u)
 #define TC4X_LMU_BASE       0x90000000u
 #define TC4X_LMU_NC_BASE    0xB0000000u
-#define TC4X_PFLASH_SIZE    (80 * MiB)
-#define TC4X_DFLASH_SIZE    (32 * MiB)
 #define TC4X_LOCAL_DSPR     0xD0000000u
 #define TC4X_LOCAL_PSPR     0xC0000000u
 
@@ -96,39 +95,6 @@
 #define ASCLIN_FLAGS_TFL    BIT(31)
 #define ASCLIN_FLAGS_RFL    BIT(28)
 #define ASCLIN_RXFIFO_DEPTH 16
-
-/* DMU flash commands: the command sequences of the iLLD IfxFlash.h */
-#define DMU_HCI_STATUS      0xF8040004u
-#define DMU_HCI_ERR         0xF8040010u
-#define DMU_HCI_CLRERR      0xF8040014u
-#define DMU_CSCI_STATUS     0xF8040084u
-#define DMU_CSCI_ERR        0xF8040090u
-#define DMU_CSCI_CLRERR     0xF8040094u
-#define DMU_CMD_BASE        0xF8080000u     /* host command interface */
-#define DMU_CSCI_CMD_BASE   0xF80C0000u     /* CSRM command interface */
-#define DMU_CMD_SIZE        0x10000u
-#define DMU_CMD_5554        0x5554u
-#define DMU_CMD_55F0        0x55F0u
-#define DMU_CMD_55F4        0x55F4u
-#define DMU_CMD_AA50        0xAA50u
-#define DMU_CMD_AA58        0xAA58u
-#define DMU_CMD_AAA8        0xAAA8u
-#define DMU_STATUS_DFPAGE   BIT(24)
-#define DMU_STATUS_PFPAGE   BIT(25)
-#define DMU_STATUS_REQDONE  BIT(31)
-#define DMU_ERR_SQER        BIT(1)
-#define DMU_ERR_PVER        BIT(6)
-#define DMU_ERR_EVER        BIT(7)
-#define DMU_DFLASH_BASE     0xAE000000u
-#define PFLASH_BASE_C       0x80000000u   /* cached read window */
-#define PFLASH_BASE_NC      0xA0000000u   /* non-cached read window */
-#define DMU_DF_SECTOR       (2 * KiB)
-#define DMU_PF_SECTOR       (16 * KiB)
-#define DMU_DF_PAGE         8u
-#define DMU_PF_PAGE         32u
-#define DMU_DF_WORDLINE     512u
-#define DMU_PF_WORDLINE     1024u
-#define DMU_PAGE_BUF_SIZE   512     /* IFXFLASH_PFLASH_BURST_LENGTH */
 
 /*
  * DMA0/DMA1 move engines.  Channels are numbered 0..127 on DMA0 and
@@ -201,19 +167,6 @@ typedef struct Tc4xTomCounter {
     int64_t t0_ns;      /* guest time of that write */
 } Tc4xTomCounter;
 
-/* A DMU command interface: the host's (HCI) or the CSRM's (CSCI) */
-typedef struct Tc4xDmuIf {
-    uint32_t status;    /* its STATUS and ERR registers */
-    uint32_t err;
-    bool csrm;
-    uint8_t page_buf[DMU_PAGE_BUF_SIZE];
-    unsigned page_len;
-    uint32_t cmd_addr;
-    uint32_t cmd_count;
-    bool cmd_armed;     /* AAA8 <- 0xA0 / 0x80 seen, waiting for the opcode */
-    uint32_t cmd_class;
-} Tc4xDmuIf;
-
 typedef struct Tc4xSimCommand {
     const char *prefix;
     Tc4xSimCommandFn fn;
@@ -238,15 +191,7 @@ struct Tc4xSoc {
     MemoryRegion own_lmu;
     HostMemoryBackend *core_memdev[TC4X_NUM_CORES];
     HostMemoryBackend *lmu_memdev;
-    MemoryRegion pflash, dflash;
-    AddressSpace pflash_as, dflash_as;
-    MemoryRegion pflash_win[2], pflash_linear[2], dflash_win;
-    MemoryRegion *pflash_maps[2][TC4X_PFLASH_MAPS_MAX];
-    unsigned n_pflash_maps;
-    Tc4xFlashLocateFn flash_locate;
-    void *flash_locate_opaque;
-    Tc4xDmuHookFn dmu_hook;
-    void *dmu_hook_opaque;
+    Tc4xFlashState flash;
     MemoryRegion lmu_alias;
 
     Tc4xSfrStore *sfr;
@@ -277,15 +222,8 @@ struct Tc4xSoc {
     Tc4xI2c *i2c[TC4X_I2C_COUNT];
     Tc4xQspi *qspi[TC4X_QSPI_COUNT];
 
-    Tc4xDmuIf dmu_if[2];        /* host, CSRM */
-    Tc4xDmuIf *dmu_cur;         /* the interface running a command */
-
     uint32_t boot_pc_board;     /* this reset's start address from the board */
     bool boot_hold;             /* this reset leaves core 0 halted */
-    char *flash_dir;
-    bool keep_flash;            /* flash files that exist keep their contents */
-    bool flash_kept;
-    uint8_t *kept_pflash, *kept_dflash;
     bool imprecise_io;      /* SFR accesses skip the TCG I/O rewind */
     uint32_t num_port_straps;
     uint32_t *port_straps;  /* TC4X_PORTS_STRAP() entries */
@@ -478,252 +416,6 @@ static bool asclin_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
         return false;
     }
     return true;
-}
-
-static void dmu_status(Tc4xSoc *s, Tc4xDmuIf *d, uint32_t set, uint32_t clr)
-{
-    reg_set(s, d->status, (reg_get(s, d->status) & ~clr) | set);
-}
-
-static void dmu_error(Tc4xSoc *s, Tc4xDmuIf *d, uint32_t err)
-{
-    reg_set(s, d->err, reg_get(s, d->err) | err);
-}
-
-static AddressSpace *flash_as(Tc4xSoc *s, Tc4xFlash flash)
-{
-    return flash == TC4X_PFLASH ? &s->pflash_as : &s->dflash_as;
-}
-
-/* Without a board's locate function: PFLASH and DFLASH linear */
-static bool flash_locate_linear(void *opaque, uint32_t addr, uint64_t len,
-                                Tc4xFlash *flash, uint64_t *off)
-{
-    Tc4xSoc *s = opaque;
-    static const struct {
-        uint32_t base;
-        Tc4xFlash flash;
-    } windows[] = {
-        { PFLASH_BASE_C, TC4X_PFLASH },
-        { PFLASH_BASE_NC, TC4X_PFLASH },
-        { DMU_DFLASH_BASE, TC4X_DFLASH },
-    };
-
-    for (size_t i = 0; i < ARRAY_SIZE(windows); i++) {
-        MemoryRegion *mr = windows[i].flash == TC4X_PFLASH ? &s->pflash :
-                           &s->dflash;
-
-        if (addr >= windows[i].base &&
-            (uint64_t)addr + len <= windows[i].base + memory_region_size(mr)) {
-            *flash = windows[i].flash;
-            *off = addr - windows[i].base;
-            return true;
-        }
-    }
-    return false;
-}
-
-/* The flash storage of a command's range, or NULL: the command fails (SQER) */
-static AddressSpace *dmu_locate(Tc4xSoc *s, uint32_t addr, uint64_t len,
-                                uint64_t *off)
-{
-    Tc4xFlash flash;
-
-    return s->flash_locate(s->flash_locate_opaque, addr, len, &flash, off) ?
-           flash_as(s, flash) : NULL;
-}
-
-static bool dmu_range_is(AddressSpace *as, uint64_t off, uint64_t len,
-                         uint8_t value)
-{
-    uint8_t buf[256];
-
-    while (len) {
-        uint32_t n = MIN(len, sizeof(buf));
-
-        address_space_read(as, off, MEMTXATTRS_UNSPECIFIED, buf, n);
-        for (uint32_t i = 0; i < n; i++) {
-            if (buf[i] != value) {
-                return false;
-            }
-        }
-        off += n;
-        len -= n;
-    }
-    return true;
-}
-
-static uint32_t dmu_sector_size(uint32_t addr)
-{
-    return (addr & 0x0F000000u) == (DMU_DFLASH_BASE & 0x0F000000u) ?
-           DMU_DF_SECTOR : DMU_PF_SECTOR;
-}
-
-/* True when the board's hook executed or refused the command itself */
-static bool dmu_hooked(Tc4xSoc *s, Tc4xDmuIf *d, Tc4xDmuOp op, uint32_t addr,
-                       uint32_t code, uint64_t len, const uint8_t *data)
-{
-    Tc4xDmuCommand cmd = {
-        .op = op, .addr = addr, .code = code, .len = len, .data = data,
-        .csrm = d->csrm,
-    };
-
-    if (!s->dmu_hook) {
-        return false;
-    }
-    if (op == TC4X_DMU_PROGRAM || op == TC4X_DMU_ERASE ||
-        op == TC4X_DMU_VERIFY) {
-        cmd.located = s->flash_locate(s->flash_locate_opaque, addr, len,
-                                      &cmd.flash, &cmd.off);
-    }
-    return s->dmu_hook(s->dmu_hook_opaque, &cmd);
-}
-
-static uint64_t dmu_verify_len(uint32_t addr, uint32_t opcode, uint32_t count)
-{
-    bool df = dmu_sector_size(addr) == DMU_DF_SECTOR;
-
-    return opcode == 0x56 ? (df ? DMU_DF_PAGE : DMU_PF_PAGE) :
-           opcode == 0x58 ? (df ? DMU_DF_WORDLINE : DMU_PF_WORDLINE) :
-           (uint64_t)count * dmu_sector_size(addr);
-}
-
-static void dmu_execute(Tc4xSoc *s, Tc4xDmuIf *d, uint32_t class,
-                        uint32_t opcode)
-{
-    uint32_t addr = d->cmd_addr;
-    bool program = class == 0xA0 && (opcode == 0xAA || opcode == 0xA6);
-    bool erase = class == 0x80 && opcode == 0x50;
-    bool verify = class == 0x80 &&
-                  (opcode == 0x56 || opcode == 0x58 || opcode == 0x5F);
-
-    if (program && dmu_hooked(s, d, TC4X_DMU_PROGRAM, addr, 0, d->page_len,
-                              d->page_buf)) {
-        d->page_len = 0;
-        dmu_status(s, d, DMU_STATUS_REQDONE,
-                   DMU_STATUS_DFPAGE | DMU_STATUS_PFPAGE);
-        return;
-    }
-    if ((erase && dmu_hooked(s, d, TC4X_DMU_ERASE, addr, 0,
-                             (uint64_t)d->cmd_count * dmu_sector_size(addr),
-                             NULL)) ||
-        (verify && dmu_hooked(s, d, TC4X_DMU_VERIFY, addr, 0,
-                              dmu_verify_len(addr, opcode, d->cmd_count),
-                              NULL)) ||
-        (!program && !erase && !verify &&
-         dmu_hooked(s, d, TC4X_DMU_OTHER, addr, class << 8 | opcode, 0,
-                    NULL))) {
-        dmu_status(s, d, DMU_STATUS_REQDONE, 0);
-        return;
-    }
-
-    if (class == 0xA0 && (opcode == 0xAA || opcode == 0xA6)) {
-        /* Write page / write burst: program the loaded page buffer */
-        uint64_t off;
-        AddressSpace *as = dmu_locate(s, addr, d->page_len, &off);
-
-        if (!as) {
-            dmu_error(s, d, DMU_ERR_SQER);
-        } else {
-            if (!dmu_range_is(as, off, d->page_len, 0)) {
-                dmu_error(s, d, DMU_ERR_PVER);
-            }
-            address_space_write(as, off, MEMTXATTRS_UNSPECIFIED, d->page_buf,
-                                d->page_len);
-        }
-        d->page_len = 0;
-        dmu_status(s, d, DMU_STATUS_REQDONE,
-                   DMU_STATUS_DFPAGE | DMU_STATUS_PFPAGE);
-    } else if (class == 0x80 && opcode == 0x50) {
-        /* Erase logical sector range: erased flash reads as zero */
-        uint64_t len = (uint64_t)d->cmd_count * dmu_sector_size(addr);
-        uint64_t off;
-        AddressSpace *as = dmu_locate(s, addr, len, &off);
-
-        if (as) {
-            address_space_set(as, off, 0, len, MEMTXATTRS_UNSPECIFIED);
-        } else {
-            dmu_error(s, d, DMU_ERR_SQER);
-        }
-        dmu_status(s, d, DMU_STATUS_REQDONE, 0);
-    } else if (class == 0x80 &&
-               (opcode == 0x56 || opcode == 0x58 || opcode == 0x5F)) {
-        /*
-         * Verify erased page (0x56) / wordline (0x58) / logical sector
-         * range (0x5F); the page form takes count 0
-         */
-        uint64_t len = dmu_verify_len(addr, opcode, d->cmd_count);
-        uint64_t off;
-        AddressSpace *as = dmu_locate(s, addr, len, &off);
-
-        if (!as) {
-            dmu_error(s, d, DMU_ERR_SQER);
-        } else if (!dmu_range_is(as, off, len, 0)) {
-            dmu_error(s, d, DMU_ERR_EVER);
-        }
-        dmu_status(s, d, DMU_STATUS_REQDONE, 0);
-    } else {
-        qemu_log_mask(LOG_UNIMP, "tc4x-dmu: command 0x%02x/0x%02x at 0x%08x "
-                      "completes without effect\n", class, opcode, addr);
-        dmu_status(s, d, DMU_STATUS_REQDONE, 0);
-    }
-}
-
-static void dmu_cmd_write(Tc4xSoc *s, Tc4xDmuIf *d, uint32_t off,
-                          uint32_t val)
-{
-    switch (off) {
-    case DMU_CMD_5554:
-        if (dmu_hooked(s, d,
-                       val == 0xF0 ? TC4X_DMU_RESET_TO_READ : TC4X_DMU_OTHER,
-                       0, val, 0, NULL)) {
-            break;
-        }
-        if (val == 0xF0) {              /* reset to read */
-            d->page_len = 0;
-            d->cmd_armed = false;
-            dmu_status(s, d, 0, DMU_STATUS_DFPAGE | DMU_STATUS_PFPAGE);
-        } else if (val == 0xFA) {       /* clear status (F5: resume protection) */
-            dmu_status(s, d, 0, DMU_STATUS_REQDONE);
-            reg_set(s, d->err, 0);
-        } else if (val == 0x5D || val == 0x50) {  /* enter page mode */
-            d->page_len = 0;
-            dmu_status(s, d,
-                       val == 0x5D ? DMU_STATUS_DFPAGE : DMU_STATUS_PFPAGE,
-                       DMU_STATUS_REQDONE);
-        }
-        break;
-    case DMU_CMD_55F0:
-    case DMU_CMD_55F4:                  /* load page, 64-bit as two words */
-        if (d->page_len + 4 <= DMU_PAGE_BUF_SIZE) {
-            stl_le_p(&d->page_buf[d->page_len], val);
-            d->page_len += 4;
-        } else {
-            dmu_error(s, d, DMU_ERR_SQER);
-        }
-        break;
-    case DMU_CMD_AA50:
-        d->cmd_addr = val;
-        d->cmd_armed = false;
-        break;
-    case DMU_CMD_AA58:
-        d->cmd_count = val;
-        break;
-    case DMU_CMD_AAA8:
-        if (!d->cmd_armed) {
-            d->cmd_class = val;
-            d->cmd_armed = true;
-        } else {
-            d->cmd_armed = false;
-            dmu_status(s, d, 0, DMU_STATUS_REQDONE);
-            dmu_execute(s, d, d->cmd_class, val);
-        }
-        break;
-    default:
-        qemu_log_mask(LOG_UNIMP, "tc4x-dmu: command cycle +0x%04x <- 0x%08x\n",
-                      off, val);
-        break;
-    }
 }
 
 static uint32_t dma_base(uint32_t ch)
@@ -1221,22 +913,7 @@ static bool soc_sfr_write(void *opaque, uint32_t addr, uint32_t *val)
     if (tom_is_glb_ctrl(addr)) {
         tom_glb_ctrl_write(s, addr, *val);      /* then stored as written */
     }
-    if (addr >= DMU_CMD_BASE && addr < DMU_CMD_BASE + DMU_CMD_SIZE) {
-        s->dmu_cur = &s->dmu_if[0];
-        dmu_cmd_write(s, s->dmu_cur, addr - DMU_CMD_BASE, *val);
-        s->dmu_cur = NULL;
-        return true;
-    }
-    if (addr >= DMU_CSCI_CMD_BASE && addr < DMU_CSCI_CMD_BASE + DMU_CMD_SIZE) {
-        s->dmu_cur = &s->dmu_if[1];
-        dmu_cmd_write(s, s->dmu_cur, addr - DMU_CSCI_CMD_BASE, *val);
-        s->dmu_cur = NULL;
-        return true;
-    }
-    if (addr == DMU_HCI_CLRERR || addr == DMU_CSCI_CLRERR) {
-        uint32_t err = addr == DMU_HCI_CLRERR ? DMU_HCI_ERR : DMU_CSCI_ERR;
-
-        reg_set(s, err, reg_get(s, err) & ~*val);
+    if (tc4x_flash_dmu_write(&s->flash, addr, *val)) {
         return true;
     }
     if (sfr_is_cpu(addr, &core, &off)) {
@@ -1351,8 +1028,11 @@ static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
             sim_printf(s, "err size must be 1, 2 or 4\n");
             return;
         }
-        address_space_write(&address_space_memory, a[1],
-                            MEMTXATTRS_UNSPECIFIED, &v, size);
+        /* as a debugger: it patches flash, which refuses guest stores */
+        if (!tc4x_flash_patch(&s->flash, a[1], &v, size)) {
+            address_space_write(&address_space_memory, a[1],
+                                MEMTXATTRS_UNSPECIFIED, &v, size);
+        }
         sim_printf(s, "ok\n");
     } else if (!strcmp(argv[0], "poke") && argc >= 3) {
         if (sim_store_backed(s, a[1])) {
@@ -1471,32 +1151,6 @@ static void sim_receive(void *opaque, const uint8_t *buf, int size)
 }
 
 /*
- * With a directory, a flash is a shared file "<dir>/<name>" that external
- * processes can map; *@existed tells whether that file already existed at
- * this size.
- */
-static bool init_flash(Tc4xSoc *s, MemoryRegion *mr, const char *name,
-                       uint64_t size, bool *existed, Error **errp)
-{
-    *existed = false;
-    if (!s->flash_dir) {
-        return memory_region_init_ram(mr, OBJECT(s), name, size, errp);
-    } else {
-        g_autofree char *path = g_build_filename(s->flash_dir, name, NULL);
-        struct stat st;
-
-        *existed = stat(path, &st) == 0 && (uint64_t)st.st_size == size;
-        g_mkdir_with_parents(s->flash_dir, 0700);
-        if (!memory_region_init_ram_from_file(mr, OBJECT(s), name, size, 0,
-                                              RAM_SHARED, path, 0, errp)) {
-            return false;
-        }
-        vmstate_register_ram_global(mr);
-        return true;
-    }
-}
-
-/*
  * A RAM of the SoC at @base: the memory of the backend @memdev when it is
  * set, else @own as a plain RAM
  */
@@ -1530,68 +1184,37 @@ static MemoryRegion *add_ram(Tc4xSoc *s, MemoryRegion *own,
     return mr;
 }
 
-/*
- * The flashes live in flash-dir when it is set; with keep-flash, flash
- * files that already existed keep their contents over the image.
- */
-static bool add_flashes(Tc4xSoc *s, Error **errp)
+Tc4xFlashState *tc4x_soc_flash(Tc4xSoc *s)
 {
-    static const hwaddr win_base[2] = { PFLASH_BASE_C, PFLASH_BASE_NC };
-    static const char *const win_name[2] = { "pflash.win", "pflash.win.nc" };
-    bool pflash_existed, dflash_existed;
-
-    if (!init_flash(s, &s->pflash, "pflash", TC4X_PFLASH_SIZE,
-                    &pflash_existed, errp) ||
-        !init_flash(s, &s->dflash, "dflash", TC4X_DFLASH_SIZE,
-                    &dflash_existed, errp)) {
-        return false;
-    }
-    s->flash_kept = s->keep_flash && pflash_existed && dflash_existed;
-    address_space_init(&s->pflash_as, &s->pflash, "pflash.storage");
-    address_space_init(&s->dflash_as, &s->dflash, "dflash.storage");
-    for (int w = 0; w < 2; w++) {
-        uint64_t size = memory_region_size(&s->pflash);
-
-        memory_region_init(&s->pflash_win[w], OBJECT(s), win_name[w], size);
-        memory_region_init_alias(&s->pflash_linear[w], OBJECT(s),
-                                 "pflash.linear", &s->pflash, 0, size);
-        memory_region_add_subregion(&s->pflash_win[w], 0,
-                                    &s->pflash_linear[w]);
-        memory_region_add_subregion(get_system_memory(), win_base[w],
-                                    &s->pflash_win[w]);
-    }
-    memory_region_init_alias(&s->dflash_win, OBJECT(s), "dflash.win",
-                             &s->dflash, 0, memory_region_size(&s->dflash));
-    memory_region_add_subregion(get_system_memory(), DMU_DFLASH_BASE,
-                                &s->dflash_win);
-    s->flash_locate = flash_locate_linear;
-    s->flash_locate_opaque = s;
-    return true;
+    return &s->flash;
 }
 
 bool tc4x_flash_kept(Tc4xSoc *s)
 {
-    return s->flash_kept;
+    return tc4x_flash_is_kept(&s->flash);
 }
 
 void tc4x_flash_read(Tc4xSoc *s, Tc4xFlash flash, uint64_t off, void *buf,
                      uint64_t len)
 {
-    address_space_read(flash_as(s, flash), off, MEMTXATTRS_UNSPECIFIED, buf,
-                       len);
+    tc4x_flash_storage_read(&s->flash, flash, off, buf, len);
 }
 
 void tc4x_flash_write(Tc4xSoc *s, Tc4xFlash flash, uint64_t off,
                       const void *buf, uint64_t len)
 {
-    address_space_write(flash_as(s, flash), off, MEMTXATTRS_UNSPECIFIED, buf,
-                        len);
+    tc4x_flash_storage_write(&s->flash, flash, off, buf, len);
+}
+
+void tc4x_flash_fill(Tc4xSoc *s, Tc4xFlash flash, uint64_t off,
+                     uint8_t value, uint64_t len)
+{
+    tc4x_flash_storage_fill(&s->flash, flash, off, value, len);
 }
 
 void tc4x_flash_set_locate(Tc4xSoc *s, Tc4xFlashLocateFn fn, void *opaque)
 {
-    s->flash_locate = fn ? fn : flash_locate_linear;
-    s->flash_locate_opaque = fn ? opaque : s;
+    tc4x_flash_set_locate_fn(&s->flash, fn, opaque);
 }
 
 void tc4x_set_boot_pc(Tc4xSoc *s, uint32_t pc)
@@ -1631,76 +1254,29 @@ int tc4x_access_core(Tc4xSoc *s)
 
 void tc4x_dmu_set_hook(Tc4xSoc *s, Tc4xDmuHookFn fn, void *opaque)
 {
-    s->dmu_hook = fn;
-    s->dmu_hook_opaque = opaque;
+    tc4x_flash_set_hook_fn(&s->flash, fn, opaque);
 }
 
 void tc4x_dmu_error(Tc4xSoc *s, uint32_t err)
 {
-    dmu_error(s, s->dmu_cur ? s->dmu_cur : &s->dmu_if[0], err);
+    tc4x_flash_dmu_error_running(&s->flash, err);
 }
 
 void tc4x_pflash_set_maps(Tc4xSoc *s, const Tc4xPflashMap *maps, unsigned n)
 {
-    assert(n <= TC4X_PFLASH_MAPS_MAX);
-    memory_region_transaction_begin();
-    for (int w = 0; w < 2; w++) {
-        for (unsigned i = 0; i < s->n_pflash_maps; i++) {
-            memory_region_del_subregion(&s->pflash_win[w],
-                                        s->pflash_maps[w][i]);
-            object_unparent(OBJECT(s->pflash_maps[w][i]));
-        }
-        for (unsigned i = 0; i < n; i++) {
-            MemoryRegion *mr = g_new0(MemoryRegion, 1);
-
-            assert(maps[i].win + maps[i].size <=
-                   memory_region_size(&s->pflash) &&
-                   maps[i].storage + maps[i].size <=
-                   memory_region_size(&s->pflash));
-            memory_region_init_alias(mr, OBJECT(s), "pflash.map", &s->pflash,
-                                     maps[i].storage, maps[i].size);
-            memory_region_add_subregion_overlap(&s->pflash_win[w], maps[i].win,
-                                                mr, 1);
-            s->pflash_maps[w][i] = mr;
-        }
-    }
-    s->n_pflash_maps = n;
-    memory_region_transaction_commit();
-}
-
-void tc4x_soc_keep_flash(Tc4xSoc *s)
-{
-    if (s->flash_kept) {
-        s->kept_pflash = g_memdup2(memory_region_get_ram_ptr(&s->pflash),
-                                   memory_region_size(&s->pflash));
-        s->kept_dflash = g_memdup2(memory_region_get_ram_ptr(&s->dflash),
-                                   memory_region_size(&s->dflash));
-    }
+    tc4x_flash_set_maps(&s->flash, maps, n);
 }
 
 static void tc4x_soc_reset_hold(Object *obj, ResetType type)
 {
     Tc4xSoc *s = TC4X_SOC(obj);
 
-    if (s->kept_pflash) {
-        /* the kept flash contents, which the image only seeded the RAMs over */
-        memcpy(memory_region_get_ram_ptr(&s->pflash), s->kept_pflash,
-               memory_region_size(&s->pflash));
-        memcpy(memory_region_get_ram_ptr(&s->dflash), s->kept_dflash,
-               memory_region_size(&s->dflash));
-        g_clear_pointer(&s->kept_pflash, g_free);
-        g_clear_pointer(&s->kept_dflash, g_free);
-    }
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         cpu_reset(CPU(s->cpu[c]));
     }
     /* state that mirrors registers the store resets */
     g_hash_table_remove_all(s->tom_cn0);
     bitmap_zero(s->dma_htre, DMA_NUM_CH);
-    for (int i = 0; i < ARRAY_SIZE(s->dmu_if); i++) {
-        s->dmu_if[i].page_len = 0;
-        s->dmu_if[i].cmd_armed = false;
-    }
     s->boot_pc_board = 0;
     s->boot_hold = false;
 }
@@ -2018,10 +1594,6 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
     }
     s->tom_cn0 = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                        NULL, g_free);
-    s->dmu_if[0] = (Tc4xDmuIf) { .status = DMU_HCI_STATUS, .err = DMU_HCI_ERR };
-    s->dmu_if[1] = (Tc4xDmuIf) {
-        .status = DMU_CSCI_STATUS, .err = DMU_CSCI_ERR, .csrm = true,
-    };
     s->sim_line = g_string_new(NULL);
     s->sim_commands = g_array_new(false, false, sizeof(Tc4xSimCommand));
 
@@ -2035,9 +1607,14 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
             return;
         }
     }
-    if (!add_flashes(s, errp)) {
+    object_property_set_link(OBJECT(&s->flash), "sfr-store", OBJECT(s->sfr),
+                             &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->flash), errp)) {
         return;
     }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->flash), 0, TC4X_PFLASH_BASE_C);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->flash), 1, TC4X_PFLASH_BASE_NC);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->flash), 2, TC4X_DFLASH_BASE);
     s->lmu = add_ram(s, &s->own_lmu, s->lmu_memdev, "lmu", TC4X_LMU_BASE,
                      TC4X_LMU_SIZE, errp);
     if (!s->lmu) {
@@ -2073,8 +1650,6 @@ static const Property tc4x_soc_properties[] = {
     DEFINE_PROP_CHR("console-chardev", Tc4xSoc, uart),
     DEFINE_PROP_CHR("sim-chardev", Tc4xSoc, sim),
     DEFINE_PROP_BOOL("imprecise-io", Tc4xSoc, imprecise_io, false),
-    DEFINE_PROP_STRING("flash-dir", Tc4xSoc, flash_dir),
-    DEFINE_PROP_BOOL("keep-flash", Tc4xSoc, keep_flash, false),
     DEFINE_PROP_ARRAY("port-straps", Tc4xSoc, num_port_straps, port_straps,
                       qdev_prop_uint32, uint32_t),
     DEFINE_PROP_LINK("lmu-memdev", Tc4xSoc, lmu_memdev, TYPE_MEMORY_BACKEND,
@@ -2095,6 +1670,15 @@ static const Property tc4x_soc_properties[] = {
                      TYPE_MEMORY_BACKEND, HostMemoryBackend *),
 };
 
+static void tc4x_soc_init(Object *obj)
+{
+    Tc4xSoc *s = TC4X_SOC(obj);
+
+    object_initialize_child(obj, "flash", &s->flash, TYPE_TC4X_FLASH);
+    object_property_add_alias(obj, "pflash", OBJECT(&s->flash), "pflash");
+    object_property_add_alias(obj, "dflash", OBJECT(&s->flash), "dflash");
+}
+
 static void tc4x_soc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -2113,6 +1697,7 @@ static const TypeInfo tc4x_soc_types[] = {
         .name = TYPE_TC4X_SOC,
         .parent = TYPE_DEVICE,
         .instance_size = sizeof(Tc4xSoc),
+        .instance_init = tc4x_soc_init,
         .class_init = tc4x_soc_class_init,
     },
 };

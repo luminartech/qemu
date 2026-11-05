@@ -66,7 +66,8 @@ Supported devices
 * ASCLIN0..27: transmit at once and raise their service requests.  One
   instance is the console on the first serial port: ASCLIN0 unless the
   board names another.
-* DMU flash command interface, eGTM TOM counters and TBU, TMADC conversions
+* PFLASH and DFLASH (see `Flash`_), DMU flash command interface, eGTM
+  TOM counters and TBU, TMADC conversions
   of pin voltages, I2C0..2 with slaves attached by board code, GPIO ports
 * Start-up status that completes at once: the TMADC power-on calibration
   phase (``MODSTAT.CALPH``), the clock ramp oscillator and the VMT memory
@@ -106,10 +107,9 @@ Machine properties:
   named after the RAMs.
 
 ``flash-dir=DIR``
-  Keep the program and data flash in files ``DIR/pflash`` and
-  ``DIR/dflash`` across runs: files that exist keep their contents and
-  the image only seeds them, so a restart after a guest reset finds what
-  the firmware programmed.
+  Keep the program and data flash in the raw files ``DIR/pflash`` and
+  ``DIR/dflash`` across runs, as their drives (see `Flash`_).  Missing
+  files are created erased.
 
 ``imprecise-io=on``
   SFR accesses take effect at the next TB instead of the next instruction
@@ -141,7 +141,8 @@ starting with ``ok`` or ``err``:
 
 =============================  ==============================================
 ``r ADDR [SIZE]``              read through the bus, ``ok VALUE``
-``w ADDR VAL [SIZE]``          write through the bus (side effects run)
+``w ADDR VAL [SIZE]``          write through the bus (side effects run);
+                               as a debugger, it patches flash
 ``poke ADDR VAL``              set an SFR's stored value, no side effects
 ``force ADDR VAL [MASK]``      SFR reads return VAL on MASK until ``unforce``
 ``irq SRC``                    hardware-set SRR of a service request node
@@ -157,6 +158,25 @@ starting with ``ok`` or ``err``:
 
 Asynchronous events: ``ev w ...`` for watched writes.  Board code adds its
 own commands with ``tc4x_sim_add_command()``.
+
+Flash
+-----
+
+The PFLASH (80 MiB, read windows at 0x80000000 and 0xA0000000) and the
+DFLASH (32 MiB at 0xAE000000) are the device ``tc4x-flash``, the SoC's
+child ``flash``.  Guest loads and instruction fetches read them at RAM
+speed; a guest store into them is a guest error with a bus error
+response, since only the DMU programs flash.  DMU commands, the sim
+bridge ``w`` and board code change the contents, and translated code of
+the changed bytes is discarded.
+
+The SoC properties ``pflash`` and ``dflash`` take drives that hold the
+contents across runs, written through on every change: ``-drive
+if=pflash,index=0,format=raw,file=pflash.bin`` (80 MiB) and ``index=1``
+(32 MiB), or ``flash-dir``.  When a drive holds anything but erased
+cells (zeros), the flashes are kept and ``-kernel`` images seed only the
+RAMs; otherwise the images seed the flashes at the first reset.  A
+machine reset leaves the flash contents as they are.
 
 Guest time
 ----------

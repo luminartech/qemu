@@ -23,6 +23,10 @@ tc4x_qspi_frame(unsigned n, unsigned cs, uint32_t bacon) "qspi%u cs %u bacon 0x%
 tc4x_qspi_frame_end(unsigned n, int cs, bool pt) "qspi%u cs %d pt %d"
 tc4x_qspi_dma_job(unsigned n, bool ran) "qspi%u ran %d"
 
+# tc4x_flash.c
+tc4x_flash_write(const char *flash, uint64_t off, uint64_t len) "%s offset 0x%" PRIx64 " len 0x%" PRIx64
+tc4x_flash_seeded(void) ""
+
 # tc4x_ports.c
 tc4x_ports_out(unsigned n, uint32_t old, uint32_t out) "p%02u 0x%04x -> 0x%04x"
 

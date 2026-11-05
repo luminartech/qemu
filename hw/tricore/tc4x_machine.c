@@ -19,6 +19,8 @@
 #include "system/reset.h"
 #include "system/address-spaces.h"
 #include "system/hostmem.h"
+#include "system/blockdev.h"
+#include "system/block-backend.h"
 #include "elf.h"
 #include "cpu.h"
 #include "hw/tricore/tc4x_machine.h"
@@ -121,6 +123,63 @@ static void tc4x_add_shm_ram(Tc4xMachineState *m, const char *name,
     object_unref(obj);
 }
 
+/*
+ * flash-dir: the drive of flash @index is the file DIR/@name, created
+ * erased when it does not exist
+ */
+static DriveInfo *tc4x_flash_dir_drive(Tc4xMachineState *m, int index,
+                                       const char *name, uint64_t size)
+{
+    g_autofree char *path = g_build_filename(m->flash_dir, name, NULL);
+    struct stat st;
+    int fd;
+
+    if (drive_get(IF_PFLASH, 0, index)) {
+        error_report("tc4x: flash-dir and -drive if=pflash,index=%d both "
+                     "give the %s", index, name);
+        exit(1);
+    }
+    if (g_mkdir_with_parents(m->flash_dir, 0700) < 0) {
+        error_report("tc4x: cannot create flash-dir '%s': %s", m->flash_dir,
+                     strerror(errno));
+        exit(1);
+    }
+    fd = qemu_create(path, O_RDWR, 0600, &error_fatal);
+    if (fstat(fd, &st) < 0 || (!st.st_size && ftruncate(fd, size) < 0)) {
+        error_report("tc4x: cannot create '%s': %s", path, strerror(errno));
+        exit(1);
+    }
+    qemu_close(fd);
+    return drive_new(drive_add(IF_PFLASH, index, path, "format=raw"),
+                     IF_PFLASH, &error_fatal);
+}
+
+/*
+ * The drives of the flashes: -drive if=pflash with index 0 (PFLASH) and
+ * index 1 (DFLASH), or the files of flash-dir
+ */
+static void tc4x_set_flash_drives(Tc4xMachineState *m, DeviceState *soc)
+{
+    static const struct {
+        const char *name;
+        uint64_t size;
+    } flashes[] = {
+        { "pflash", TC4X_PFLASH_SIZE },
+        { "dflash", TC4X_DFLASH_SIZE },
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(flashes); i++) {
+        DriveInfo *dinfo = m->flash_dir ?
+            tc4x_flash_dir_drive(m, i, flashes[i].name, flashes[i].size) :
+            drive_get(IF_PFLASH, 0, i);
+
+        if (dinfo) {
+            qdev_prop_set_drive_err(soc, flashes[i].name,
+                                    blk_by_legacy_dinfo(dinfo), &error_fatal);
+        }
+    }
+}
+
 static void tc4x_init(MachineState *ms)
 {
     Tc4xMachineState *m = TC4X_MACHINE(ms);
@@ -151,11 +210,7 @@ static void tc4x_init(MachineState *ms)
                                                   in->level));
     }
     qdev_prop_set_array(dev, "port-straps", straps);
-    if (m->flash_dir || m->shm_dir) {
-        qdev_prop_set_string(dev, "flash-dir",
-                             m->flash_dir ? m->flash_dir : m->shm_dir);
-    }
-    qdev_prop_set_bit(dev, "keep-flash", m->flash_dir != NULL);
+    tc4x_set_flash_drives(m, dev);
     if (m->shm_dir) {
         if (g_mkdir_with_parents(m->shm_dir, 0700) < 0) {
             error_report("tc4x: cannot create shm-dir '%s': %s", m->shm_dir,
@@ -195,7 +250,6 @@ static void tc4x_init(MachineState *ms)
     if (ms->kernel_filename) {
         g_auto(GStrv) files = g_strsplit(ms->kernel_filename, ",", -1);
 
-        tc4x_soc_keep_flash(m->soc);
         for (int i = 0; files[i]; i++) {
             tc4x_load_image(m, files[i]);
         }
@@ -276,8 +330,9 @@ static void tc4x_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "flash-dir", tc4x_get_flash_dir,
                                   tc4x_set_flash_dir);
     object_class_property_set_description(oc, "flash-dir",
-        "Directory for the PFLASH and DFLASH files: kept files keep their "
-        "contents, the image seeding only the RAMs");
+        "Directory for the PFLASH and DFLASH drives (raw files pflash and "
+        "dflash): files with contents keep them, the images seeding only "
+        "the RAMs");
 
     object_class_property_add_str(oc, "sfr-script", tc4x_get_sfr_script,
                                   tc4x_set_sfr_script);

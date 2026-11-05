@@ -40,11 +40,18 @@ void tc4x_soc_add_semantics(Tc4xSoc *soc, const Tc4xRegSemantics *sem,
                             size_t n_sem, const Tc4xKernelReset *kr,
                             size_t n_kr);
 
+Tc4xFlashState *tc4x_soc_flash(Tc4xSoc *soc);
+
 /*
- * Before images are loaded into kept flashes: the reset that follows
- * restores the flash contents, so that the images seed only the RAMs
+ * The flash's side of the board API in tc4x.h: tc4x_flash_set_locate(),
+ * tc4x_dmu_set_hook() and tc4x_dmu_error() (on the interface running the
+ * current command, else the host's)
  */
-void tc4x_soc_keep_flash(Tc4xSoc *soc);
+void tc4x_flash_set_locate_fn(Tc4xFlashState *s, Tc4xFlashLocateFn fn,
+                              void *opaque);
+void tc4x_flash_set_hook_fn(Tc4xFlashState *s, Tc4xDmuHookFn fn,
+                            void *opaque);
+void tc4x_flash_dmu_error_running(Tc4xFlashState *s, uint32_t err);
 
 /*
  * After the reset: core 0 starts at the address a board set, else at

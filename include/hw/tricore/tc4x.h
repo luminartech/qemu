@@ -16,6 +16,7 @@
 
 #include "qom/object.h"
 #include "hw/net/tc4x_geth.h"
+#include "hw/tricore/tc4x_flash.h"
 #include "hw/tricore/tc4x_sfr_store.h"
 #include "hw/tricore/tc4x_timebase.h"
 
@@ -140,20 +141,22 @@ typedef struct Tc4xI2cSlaveOps {
 void tc4x_i2c_attach(Tc4xSoc *soc, unsigned bus, uint8_t addr,
                      const Tc4xI2cSlaveOps *ops, void *opaque);
 
-/* The program and data flash, as storage */
-typedef enum Tc4xFlash {
-    TC4X_PFLASH,
-    TC4X_DFLASH,
-} Tc4xFlash;
-
-/* The flashes came from flash-dir files of an earlier run (board init on) */
+/*
+ * The flashes came from drives that hold contents of an earlier run
+ * (board init on; see tc4x_flash.h)
+ */
 bool tc4x_flash_kept(Tc4xSoc *soc);
 
-/* Read or write flash storage directly, without the DMU */
+/*
+ * Read, write or fill flash storage directly, without the DMU (see
+ * tc4x_flash_storage_read() and the others)
+ */
 void tc4x_flash_read(Tc4xSoc *soc, Tc4xFlash flash, uint64_t off, void *buf,
                      uint64_t len);
 void tc4x_flash_write(Tc4xSoc *soc, Tc4xFlash flash, uint64_t off,
                       const void *buf, uint64_t len);
+void tc4x_flash_fill(Tc4xSoc *soc, Tc4xFlash flash, uint64_t off,
+                     uint8_t value, uint64_t len);
 
 /*
  * Where DMU commands find their addresses: @fn places [@addr, @addr+@len)
@@ -171,41 +174,15 @@ void tc4x_flash_set_locate(Tc4xSoc *soc, Tc4xFlashLocateFn fn, void *opaque);
  * @storage at window offset @win instead.  A call replaces the maps of
  * the previous one; n = 0 makes the windows linear again.
  */
-#define TC4X_PFLASH_MAPS_MAX 16
-typedef struct Tc4xPflashMap {
-    uint64_t win;
-    uint64_t size;
-    uint64_t storage;
-} Tc4xPflashMap;
 void tc4x_pflash_set_maps(Tc4xSoc *soc, const Tc4xPflashMap *maps,
                           unsigned n);
 
-/* A DMU command as the board's hook sees it, before it runs */
-typedef enum Tc4xDmuOp {
-    TC4X_DMU_PROGRAM,       /* write page or burst: @len bytes of @data */
-    TC4X_DMU_ERASE,         /* erase logical sectors: @len bytes */
-    TC4X_DMU_VERIFY,        /* verify erased: @len bytes */
-    TC4X_DMU_RESET_TO_READ,
-    TC4X_DMU_OTHER,         /* @code: the 5554 value, or class << 8 | opcode */
-} Tc4xDmuOp;
-
-typedef struct Tc4xDmuCommand {
-    Tc4xDmuOp op;
-    uint32_t addr;          /* command address */
-    uint32_t code;
-    bool csrm;              /* from the CSRM command interface, else host */
-    bool located;           /* @flash and @off hold @addr (program..verify) */
-    Tc4xFlash flash;
-    uint64_t off;
-    uint64_t len;
-    const uint8_t *data;
-} Tc4xDmuCommand;
-
 /*
- * @fn sees every DMU command before it runs and returns true when it
- * executed or refused the command itself, raising error flags with
- * tc4x_dmu_error(); false lets the SoC run it.  Either way the SoC
- * updates the request status.
+ * @fn sees every DMU command (Tc4xDmuCommand, tc4x_flash.h) before it
+ * runs and returns true when it executed or refused the command itself,
+ * raising error flags with tc4x_dmu_error(); false lets the flash run it.
+ * Either way the flash updates the request status.  It and the locate
+ * function act as the flash's policy (TYPE_TC4X_FLASH_POLICY).
  */
 typedef bool (*Tc4xDmuHookFn)(void *opaque, const Tc4xDmuCommand *cmd);
 void tc4x_dmu_set_hook(Tc4xSoc *soc, Tc4xDmuHookFn fn, void *opaque);
