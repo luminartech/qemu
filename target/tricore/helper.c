@@ -48,7 +48,9 @@ static int get_physical_address(CPUTriCoreState *env, hwaddr *physical,
     return ret;
 }
 
-hwaddr tricore_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr)
+/* A debugger's access: the bus attributes of the core's own accesses */
+bool tricore_cpu_translate_for_debug(CPUState *cs, vaddr addr,
+                                     TranslateForDebugResult *result)
 {
     TriCoreCPU *cpu = TRICORE_CPU(cs);
     hwaddr phys_addr;
@@ -57,9 +59,15 @@ hwaddr tricore_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr)
 
     if (get_physical_address(&cpu->env, &phys_addr, &prot, addr,
                              MMU_DATA_LOAD, mmu_idx)) {
-        return -1;
+        return false;
     }
-    return phys_addr;
+    result->physaddr = phys_addr;
+    result->attrs = cpu->mem_attrs[tricore_mmu_idx_safe(mmu_idx)];
+    if (!result->attrs.unspecified) {
+        result->attrs.debug = 1;
+    }
+    result->lg_page_size = TARGET_PAGE_BITS;
+    return true;
 }
 
 /* TODO: Add exception support */
@@ -86,7 +94,8 @@ static void raise_mmu_exception(CPUTriCoreState *env, vaddr address,
 static bool mpu_enabled(CPUTriCoreState *env, int mmu_idx)
 {
     return tricore_has_feature(env, TRICORE_FEATURE_18) &&
-           (env->SYSCON & MASK_SYSCON_PRO_TEN) && mmu_idx < TRICORE_PRS_COUNT;
+           (env->SYSCON & MASK_SYSCON_PRO_TEN) &&
+           tricore_mmu_idx_set(mmu_idx) < TRICORE_PRS_COUNT;
 }
 
 static uint32_t csfr(CPUTriCoreState *env, uint32_t offset)
@@ -145,14 +154,17 @@ bool tricore_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                           bool probe, uintptr_t retaddr)
 {
     CPUTriCoreState *env = cpu_env(cs);
+    TriCoreCPU *cpu = env_archcpu(env);
+    MemTxAttrs attrs = cpu->mem_attrs[tricore_mmu_idx_safe(mmu_idx)];
     hwaddr physical;
     int prot;
     int ret = 0;
 
     if (mpu_enabled(env, mmu_idx)) {
+        unsigned prs = tricore_mmu_idx_set(mmu_idx);
         vaddr page = address & TARGET_PAGE_MASK;
 
-        prot = mpu_page_prot(env, mmu_idx, page);
+        prot = mpu_page_prot(env, prs, page);
         if (!(prot & BIT(rw))) {
             if (probe) {
                 return false;
@@ -161,7 +173,7 @@ bool tricore_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                           "%s of 0x%08" VADDR_PRIx " in set %d\n",
                           env->CORE_ID, rw == MMU_INST_FETCH ? "fetch" :
                           rw == MMU_DATA_LOAD ? "load" : "store", address,
-                          mmu_idx);
+                          prs);
             if (rw != MMU_INST_FETCH) {
                 env->csfr_generic[CSFR_DEADD / 4] = address;
             }
@@ -170,7 +182,8 @@ bool tricore_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                                rw == MMU_DATA_LOAD ? TIN1_MPR : TIN1_MPW,
                                retaddr);
         }
-        tlb_set_page(cs, page, page, prot, mmu_idx, TARGET_PAGE_SIZE);
+        tlb_set_page_with_attrs(cs, page, page, attrs, prot, mmu_idx,
+                                TARGET_PAGE_SIZE);
         return true;
     }
 
@@ -183,9 +196,9 @@ bool tricore_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                   __func__, address, ret, physical, prot);
 
     if (ret == TLBRET_MATCH) {
-        tlb_set_page(cs, address & TARGET_PAGE_MASK,
-                     physical & TARGET_PAGE_MASK, prot | PAGE_EXEC,
-                     mmu_idx, TARGET_PAGE_SIZE);
+        tlb_set_page_with_attrs(cs, address & TARGET_PAGE_MASK,
+                                physical & TARGET_PAGE_MASK, attrs,
+                                prot | PAGE_EXEC, mmu_idx, TARGET_PAGE_SIZE);
         return true;
     } else {
         assert(ret < 0);

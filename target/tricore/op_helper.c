@@ -40,6 +40,11 @@ void tricore_cpu_enter_trap(CPUTriCoreState *env, uint32_t class, int tin,
     /* Tin is loaded into d[15] */
     env->gpr_d[15] = tin;
 
+    /*
+     * The upper context is saved first, so its CSA stores carry the
+     * interrupted task's PSW.S; PSW.S takes SYSCON.TS below (TriCore TC1.8
+     * architecture manual, vol. 1, 6.2.5 "Entering a trap handler").
+     */
     if (class == TRAPC_CTX_MNG && tin == TIN3_FCU) {
         /* upper context cannot be saved, if the context list is empty */
     } else {
@@ -73,6 +78,12 @@ void tricore_cpu_enter_trap(CPUTriCoreState *env, uint32_t class, int tin,
     /* Write permission to global registers A[0], A[1], A[8], A[9] is
        disabled: PSW.GW = 0. */
     env->PSW &= ~MASK_PSW_GW;
+
+    /* The handler's safe task identifier: PSW.S = SYSCON.TS */
+    if (tricore_has_feature(env, TRICORE_FEATURE_162)) {
+        env->PSW = deposit32(env->PSW, 14, 1,
+                             !!(env->SYSCON & MASK_SYSCON_TS));
+    }
 
     /*The interrupt system is globally disabled: ICR.IE = 0. The ‘old’
       ICR.IE and ICR.CCPN are saved */
@@ -134,6 +145,11 @@ void tricore_cpu_do_interrupt(CPUTriCoreState *env, uint32_t pipn)
                   "0x%08x icr 0x%08x fcx 0x%08x\n", env->CORE_ID, pipn, env->PC,
                   env->PCXI, env->ICR, env->FCX);
 
+    /*
+     * As for traps, the upper context's CSA stores carry the interrupted
+     * task's PSW.S; PSW.S takes SYSCON.IS below (TriCore TC1.8 architecture
+     * manual, vol. 1, 5.2 "Entering an interrupt service routine").
+     */
     helper_svucx(env);
     env->gpr_a[11] = env->PC;
     if ((env->PSW & MASK_PSW_IS) == 0) {
@@ -145,6 +161,11 @@ void tricore_cpu_do_interrupt(CPUTriCoreState *env, uint32_t pipn)
     env->PSW &= ~MASK_PSW_CDC;
     env->PSW |= MASK_PSW_CDE;
     env->PSW &= ~MASK_PSW_GW;
+    /* PSW.S = SYSCON.IS */
+    if (tricore_has_feature(env, TRICORE_FEATURE_162)) {
+        env->PSW = deposit32(env->PSW, 14, 1,
+                             !!(env->SYSCON & MASK_SYSCON_IS));
+    }
 
     /* helper_svucx already stored ICR.IE/CCPN into PCXI.PIE/PCPN */
     icr_set_ie(env, 0);
@@ -2591,7 +2612,8 @@ static uint8_t *csa_probe(CPUTriCoreState *env, uint32_t ea,
  */
 static int csa_mmu_idx(CPUTriCoreState *env, const uint32_t *link)
 {
-    return link ? TRICORE_MMU_IDX_CSA : cpu_mmu_index(env_cpu(env), false);
+    return link ? tricore_mmu_idx(TRICORE_MMU_IDX_CSA, tricore_psw_s(env)) :
+                  cpu_mmu_index(env_cpu(env), false);
 }
 
 /*
@@ -2607,7 +2629,7 @@ static uint8_t *csa_host(CPUTriCoreState *env, target_ulong ea, int mmu_idx)
     target_ulong page = ea & TARGET_PAGE_MASK;
     unsigned slot = (page >> TARGET_PAGE_BITS) & 1;
     bool cache = env_archcpu(env)->csa_cache &&
-                 mmu_idx == TRICORE_MMU_IDX_CSA;
+                 tricore_mmu_idx_set(mmu_idx) == TRICORE_MMU_IDX_CSA;
     void *host;
     int flags;
 

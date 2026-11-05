@@ -58,6 +58,7 @@ static TCGTBCPUState tricore_get_tb_cpu_state(CPUState *cs)
     uint32_t flags = FIELD_DP32(0, TB_FLAGS, PRIV, extract32(env->PSW, 10, 2));
 
     flags = FIELD_DP32(flags, TB_FLAGS, PRS, tricore_psw_prs(env));
+    flags = FIELD_DP32(flags, TB_FLAGS, S, tricore_psw_s(env));
     return (TCGTBCPUState){
         .pc = env->PC,
         .flags = flags,
@@ -167,7 +168,9 @@ void tricore_cpu_release_boot_halt(TriCoreCPU *cpu, uint32_t pc)
 
 static int tricore_cpu_mmu_index(CPUState *cs, bool ifetch)
 {
-    return tricore_psw_prs(cpu_env(cs));
+    CPUTriCoreState *env = cpu_env(cs);
+
+    return tricore_mmu_idx(tricore_psw_prs(env), tricore_psw_s(env));
 }
 
 static void tricore_cpu_realizefn(DeviceState *dev, Error **errp)
@@ -177,6 +180,19 @@ static void tricore_cpu_realizefn(DeviceState *dev, Error **errp)
     TriCoreCPUClass *tcc = TRICORE_CPU_GET_CLASS(dev);
     CPUTriCoreState *env = &cpu->env;
     Error *local_err = NULL;
+
+    for (int safe = 0; safe < 2; safe++) {
+        uint32_t id = cpu->requester_id[safe];
+
+        if ((id == UINT32_MAX) != (cpu->requester_id[!safe] == UINT32_MAX) ||
+            (id != UINT32_MAX && id > UINT16_MAX)) {
+            error_setg(errp, "requester-id and requester-id-safe must both "
+                       "be set to 16-bit values, or neither");
+            return;
+        }
+        cpu->mem_attrs[safe] = id == UINT32_MAX ? MEMTXATTRS_UNSPECIFIED :
+                               (MemTxAttrs) { .requester_id = id };
+    }
 
     cpu_exec_realizefn(cs, &local_err);
     if (local_err != NULL) {
@@ -258,6 +274,10 @@ static void tc4x_initfn(Object *obj)
 
 static const Property tricore_cpu_properties[] = {
     DEFINE_PROP_UINT32("core-id", TriCoreCPU, core_id, 0),
+    DEFINE_PROP_UINT32("requester-id", TriCoreCPU, requester_id[0],
+                       UINT32_MAX),
+    DEFINE_PROP_UINT32("requester-id-safe", TriCoreCPU, requester_id[1],
+                       UINT32_MAX),
     DEFINE_PROP_BOOL("start-halted", TriCoreCPU, start_halted, false),
     DEFINE_PROP_BOOL("csa-cache", TriCoreCPU, csa_cache, false),
 };
@@ -303,7 +323,7 @@ static bool tricore_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 
 static const struct SysemuCPUOps tricore_sysemu_ops = {
     .has_work = tricore_cpu_has_work,
-    .get_phys_addr_debug = tricore_cpu_get_phys_addr_debug,
+    .translate_for_debug = tricore_cpu_translate_for_debug,
 };
 
 static const TCGCPUOps tricore_tcg_ops = {

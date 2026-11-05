@@ -23,6 +23,7 @@
 #include "cpu-qom.h"
 #include "hw/core/registerfields.h"
 #include "exec/cpu-common.h"
+#include "exec/memattrs.h"
 #include "qemu/cpu-float.h"
 #include "tricore-defs.h"
 
@@ -91,6 +92,13 @@ struct ArchCPU {
     CPUTriCoreState env;
 
     uint32_t core_id;
+    /*
+     * MemTxAttrs.requester_id of the core's accesses with PSW.S clear and
+     * set (properties "requester-id", "requester-id-safe"; UINT32_MAX:
+     * unspecified attributes), and the attributes made of them
+     */
+    uint32_t requester_id[2];
+    MemTxAttrs mem_attrs[2];
     bool start_halted;
     /* remember context save area pages across TBs (op_helper.c csa_host) */
     bool csa_cache;
@@ -127,7 +135,8 @@ struct TriCoreCPUClass {
     ResettablePhases parent_phases;
 };
 
-hwaddr tricore_cpu_get_phys_addr_debug(CPUState *cpu, vaddr addr);
+bool tricore_cpu_translate_for_debug(CPUState *cpu, vaddr addr,
+                                     TranslateForDebugResult *result);
 void tricore_cpu_dump_state(CPUState *cpu, FILE *f, int flags);
 
 FIELD(PCXI, PCPN_13, 24, 8)
@@ -152,6 +161,7 @@ FIELD(ICR, CCPN, 0, 8)
 #define MASK_USB_SAV 0x08000000
 #define MASK_PSW_PRS 0x00003000
 #define MASK_PSW_PRS2 0x00008000    /* TC1.8: PSW.PRS[2] */
+#define MASK_PSW_S   0x00004000     /* TC1.6.2: safe task identifier */
 #define MASK_PSW_IO  0x00000c00
 #define MASK_PSW_IS  0x00000200
 #define MASK_PSW_GW  0x00000100
@@ -161,6 +171,8 @@ FIELD(ICR, CCPN, 0, 8)
 
 #define MASK_SYSCON_PRO_TEN 0x2
 #define MASK_SYSCON_FCD_SF  0x1
+#define MASK_SYSCON_IS      0x8     /* PSW.S at interrupt entry */
+#define MASK_SYSCON_TS      0x10    /* PSW.S at trap entry */
 
 #define MASK_CPUID_MOD     0xffff0000
 #define MASK_CPUID_MOD_32B 0x0000ff00
@@ -361,15 +373,36 @@ FIELD_SETTER(icr_set_ccpn, ICR, CCPN)
 
 /*
  * MMU indexes: the protection register set the range-based memory
- * protection checks an access against (PSW.PRS, TC1.8: 0..7), and the
+ * protection checks an access against (PSW.PRS, TC1.8: 0..7), or the
  * context save areas of calls, returns, traps and interrupts, which it
- * does not check
+ * does not check; each for PSW.S clear and set, since PSW.S is part of
+ * the bus attributes of every access (MemTxAttrs.requester_id)
  */
 #define TRICORE_PRS_COUNT   8
 #define TRICORE_MMU_IDX_CSA TRICORE_PRS_COUNT
+#define TRICORE_MMU_SETS    (TRICORE_PRS_COUNT + 1)
+
+/* MMU index of protection set (or TRICORE_MMU_IDX_CSA) @set under @safe */
+static inline int tricore_mmu_idx(unsigned set, bool safe)
+{
+    return set + (safe ? TRICORE_MMU_SETS : 0);
+}
+
+/* The protection set (or TRICORE_MMU_IDX_CSA) of MMU index @idx */
+static inline unsigned tricore_mmu_idx_set(int idx)
+{
+    return idx % TRICORE_MMU_SETS;
+}
+
+/* PSW.S of MMU index @idx */
+static inline bool tricore_mmu_idx_safe(int idx)
+{
+    return idx >= TRICORE_MMU_SETS;
+}
 
 FIELD(TB_FLAGS, PRIV, 0, 2)
 FIELD(TB_FLAGS, PRS, 2, 3)
+FIELD(TB_FLAGS, S, 5, 1)
 
 /* PSW.PRS: bits 13:12, TC1.8 adds bit 2 of the set number at bit 15 */
 static inline unsigned tricore_psw_prs(CPUTriCoreState *env)
@@ -380,6 +413,13 @@ static inline unsigned tricore_psw_prs(CPUTriCoreState *env)
         prs |= extract32(env->PSW, 15, 1) << 2;
     }
     return prs;
+}
+
+/* PSW.S (TC1.6.2) */
+static inline bool tricore_psw_s(CPUTriCoreState *env)
+{
+    return tricore_has_feature(env, TRICORE_FEATURE_162) &&
+           (env->PSW & MASK_PSW_S);
 }
 
 /* TC1.8 memory protection CSFRs: DPRn_L/U, CPRn_L/U, CPXE/DPRE/DPWE_x */
