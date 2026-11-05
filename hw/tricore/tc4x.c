@@ -41,6 +41,7 @@
 #include "hw/net/tc4x_geth.h"
 #include "hw/tricore/tc4x_board.h"
 #include "hw/tricore/tc4x_pacer.h"
+#include "hw/tricore/tc4x_regs.h"
 #include "tc4x_soc.h"
 
 #define TC4X_PSPR_OFFSET    (1 * MiB)
@@ -254,26 +255,12 @@
 
 /*
  * Start-up status reported as done: CLOCK_RAMPSTAT.ACTIVE (IfxClock.c),
- * VMTn_MEMDONE(CS) (the memory test sequence of IfxVmt.h)
- */
-#define CLOCK_RAMPSTAT      0xF006420Cu
-/*
+ * VMTn_MEMDONE(CS) (the memory test sequence of IfxVmt.h).
  * PLLs: STAT.PWRSTAT and STAT.PLLLOCK follow CON0.PLLPWR (lock at once);
- * IfxClock.c waits for both while it powers the PLLs up
+ * IfxClock.c waits for both while it powers the PLLs up.
  */
-#define CLOCK_SYSPLLCON0    0xF0064300u
-#define CLOCK_SYSPLLSTAT    0xF006430Cu
-#define CLOCK_PERPLLCON0    0xF0064380u
-#define CLOCK_PERPLLSTAT    0xF006438Cu
-#define CLOCK_PLLCON0_PLLPWR BIT(0)
-#define CLOCK_PLLSTAT_PWRSTAT BIT(0)
-#define CLOCK_PLLSTAT_PLLLOCK BIT(1)
-#define CLOCK_RAMPSTAT_ACTIVE BIT(23)
-#define VMT_BASE            0xF0400000u
-#define VMT_STRIDE          0x20000u
+#define VMT_STRIDE          (A_VMT1_MEMDONE - A_VMT0_MEMDONE)
 #define VMT_COUNT           7u
-#define VMT_MEMDONE         0x8Cu
-#define VMT_MEMDONECS       0xC0u
 
 #define TC4X_ACK_LISTENERS_MAX  8
 #define TC4X_RETIME_MAX         16
@@ -1820,12 +1807,13 @@ static uint32_t sfr_read_word_locked(Tc4xSoc *s, uint32_t addr)
         v = g_queue_is_empty(s->qspi_rx[qn]) ? 0 :
             GPOINTER_TO_UINT(g_queue_pop_head(s->qspi_rx[qn]));
         qatomic_set(&s->qspi_rx_level[qn], g_queue_get_length(s->qspi_rx[qn]));
-    } else if (addr == CLOCK_SYSPLLSTAT || addr == CLOCK_PERPLLSTAT) {
-        uint32_t con0 = reg_get(s, addr == CLOCK_SYSPLLSTAT ?
-                                CLOCK_SYSPLLCON0 : CLOCK_PERPLLCON0);
-        uint32_t on = CLOCK_PLLSTAT_PWRSTAT | CLOCK_PLLSTAT_PLLLOCK;
+    } else if (addr == A_CLOCK_SYSPLLSTAT || addr == A_CLOCK_PERPLLSTAT) {
+        uint32_t con0 = reg_get(s, addr == A_CLOCK_SYSPLLSTAT ?
+                                A_CLOCK_SYSPLLCON0 : A_CLOCK_PERPLLCON0);
+        uint32_t on = R_CLOCK_SYSPLLSTAT_PWRSTAT_MASK |
+                      R_CLOCK_SYSPLLSTAT_PLLLOCK_MASK;
 
-        v = (v & ~on) | ((con0 & CLOCK_PLLCON0_PLLPWR) ? on : 0);
+        v = (v & ~on) | (FIELD_EX32(con0, CLOCK_SYSPLLCON0, PLLPWR) ? on : 0);
     } else if (asclin_read(s, addr, &v)) {
         /* served by the ASCLIN model */
     } else {
@@ -3138,12 +3126,11 @@ void tc4x_soc_add_semantics(Tc4xSoc *s, const Tc4xRegSemantics *sem,
 
 static void tc4x_force_soc_status(Tc4xSoc *s)
 {
-    reg_force(s, CLOCK_RAMPSTAT, CLOCK_RAMPSTAT_ACTIVE,
-              CLOCK_RAMPSTAT_ACTIVE);
+    reg_force(s, A_CLOCK_RAMPSTAT, R_CLOCK_RAMPSTAT_ACTIVE_MASK,
+              R_CLOCK_RAMPSTAT_ACTIVE_MASK);
     for (unsigned n = 0; n < VMT_COUNT; n++) {
-        reg_force(s, VMT_BASE + n * VMT_STRIDE + VMT_MEMDONE, UINT32_MAX,
-                  UINT32_MAX);
-        reg_force(s, VMT_BASE + n * VMT_STRIDE + VMT_MEMDONECS, UINT32_MAX,
+        reg_force(s, A_VMT0_MEMDONE + n * VMT_STRIDE, UINT32_MAX, UINT32_MAX);
+        reg_force(s, A_VMT0_MEMDONECS + n * VMT_STRIDE, UINT32_MAX,
                   UINT32_MAX);
     }
 }
