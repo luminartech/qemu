@@ -519,7 +519,8 @@ void tc4x_sfr_store_access_write(Tc4xSfrStore *st, uint32_t addr, uint64_t val,
 
         if (!(pg && test_bit(w, pg->bql_only)) &&
             ((pg && sfr_write_plain(pg, w, val)) ||
-             st->models->write_lockless(st->models_opaque, addr, val))) {
+             (st->models->write_lockless &&
+              st->models->write_lockless(st->models_opaque, addr, val)))) {
             return;
         }
     }
@@ -622,11 +623,6 @@ static Tc4xSfrPath sfr_no_read_lockless(void *opaque, uint32_t addr,
     return TC4X_SFR_PATH_STORE;
 }
 
-static bool sfr_no_write_lockless(void *opaque, uint32_t addr, uint32_t val)
-{
-    return false;
-}
-
 static bool sfr_no_read(void *opaque, uint32_t addr, uint32_t *val)
 {
     return false;
@@ -644,7 +640,6 @@ static void sfr_no_watched(void *opaque, uint32_t addr, uint32_t val,
 
 static const Tc4xSfrModelOps tc4x_sfr_plain_models = {
     .read_lockless = sfr_no_read_lockless,
-    .write_lockless = sfr_no_write_lockless,
     .read = sfr_no_read,
     .write = sfr_no_write,
     .watched = sfr_no_watched,

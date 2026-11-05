@@ -9,6 +9,7 @@
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "qobject/qlist.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
@@ -93,11 +94,6 @@ static Tc4xBoard *tc4x_board_create(const char *name)
 
 static void tc4x_apply_board(Tc4xSoc *soc, const Tc4xBoardClass *bc)
 {
-    for (unsigned i = 0; i < bc->n_inputs; i++) {
-        const Tc4xBoardInput *in = &bc->inputs[i];
-
-        tc4x_gpio_set_input(soc, in->port, in->pin, in->level);
-    }
     tc4x_soc_add_semantics(soc, bc->reg_semantics, bc->n_reg_semantics,
                            bc->kernel_resets, bc->n_kernel_resets);
 }
@@ -131,6 +127,7 @@ static void tc4x_init(MachineState *ms)
     Tc4xMachineClass *tmc = TC4X_MACHINE_GET_CLASS(m);
     Tc4xBoardClass *bc;
     DeviceState *dev;
+    QList *straps;
 
     assert(m->board_name || tmc->board);
     m->board = tc4x_board_create(m->board_name ? m->board_name : tmc->board);
@@ -146,6 +143,14 @@ static void tc4x_init(MachineState *ms)
     qdev_prop_set_chr(dev, "console-chardev", serial_hd(0));
     qdev_prop_set_chr(dev, "sim-chardev", serial_hd(1));
     qdev_prop_set_bit(dev, "imprecise-io", m->imprecise_io);
+    straps = qlist_new();
+    for (unsigned i = 0; i < bc->n_inputs; i++) {
+        const Tc4xBoardInput *in = &bc->inputs[i];
+
+        qlist_append_int(straps, TC4X_PORTS_STRAP(in->port, in->pin,
+                                                  in->level));
+    }
+    qdev_prop_set_array(dev, "port-straps", straps);
     if (m->flash_dir || m->shm_dir) {
         qdev_prop_set_string(dev, "flash-dir",
                              m->flash_dir ? m->flash_dir : m->shm_dir);

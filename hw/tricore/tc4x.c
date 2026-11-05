@@ -26,6 +26,7 @@
 #include "qemu/lockable.h"
 #include "qemu/main-loop.h"
 #include "qapi/error.h"
+#include "qobject/qlist.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "chardev/char-fe.h"
@@ -280,7 +281,7 @@ struct Tc4xSoc {
      */
     unsigned long dma_htre[BITS_TO_LONGS(DMA_NUM_CH)];
 
-    Tc4xGpio *gpio;
+    Tc4xPorts *ports;
     Tc4xAdc *adc;
     Tc4xI2c *i2c[TC4X_I2C_COUNT];
     Tc4xQspi *qspi[TC4X_QSPI_COUNT];
@@ -295,11 +296,13 @@ struct Tc4xSoc {
     bool flash_kept;
     uint8_t *kept_pflash, *kept_dflash;
     bool imprecise_io;      /* SFR accesses skip the TCG I/O rewind */
+    uint32_t num_port_straps;
+    uint32_t *port_straps;  /* TC4X_PORTS_STRAP() entries */
 };
 
-Tc4xGpio *tc4x_soc_gpio(Tc4xSoc *s)
+Tc4xPorts *tc4x_soc_ports(Tc4xSoc *s)
 {
-    return s->gpio;
+    return s->ports;
 }
 
 Tc4xTimebase *tc4x_soc_timebase(Tc4xSoc *s)
@@ -1148,9 +1151,8 @@ static bool soc_read_word(Tc4xSoc *s, uint32_t addr, uint32_t *val)
     uint32_t off;
     int core;
 
-    if (tc4x_gpio_read(s->gpio, addr, val) ||
-        tc4x_adc_read(s->adc, addr, val)) {
-        /* a pin or bus model */
+    if (tc4x_adc_read(s->adc, addr, val)) {
+        /* the ADC results */
     } else if (sfr_is_cpu(addr, &core, &off)) {
         if (off == CPU_HRA_CORE_ID || off == CPU_HRHV_CORE_ID) {
             *val = core;
@@ -1191,8 +1193,8 @@ static bool soc_sfr_read(void *opaque, uint32_t addr, uint32_t *val)
 }
 
 /*
- * Reads without the BQL: values computed from atomic state only (GPIO
- * levels, ADC results).  Reads with side effects and time-derived or
+ * Reads without the BQL: values computed from atomic state only (ADC
+ * results).  Reads with side effects and time-derived or
  * CPU-specific values take the BQL.
  */
 static Tc4xSfrPath soc_sfr_read_lockless(void *opaque, uint32_t addr,
@@ -1208,8 +1210,7 @@ static Tc4xSfrPath soc_sfr_read_lockless(void *opaque, uint32_t addr,
         sfr_is_tmadc_modstat(word)) {
         return TC4X_SFR_PATH_LOCKED;
     }
-    if (tc4x_gpio_read(s->gpio, word, val) ||
-        tc4x_adc_read(s->adc, word, val)) {
+    if (tc4x_adc_read(s->adc, word, val)) {
         return TC4X_SFR_PATH_SERVED;
     }
     return TC4X_SFR_PATH_STORE;
@@ -1236,7 +1237,6 @@ static bool soc_sfr_write(void *opaque, uint32_t addr, uint32_t *val)
     int core;
 
     if (asclin_write(s, addr, *val) || dma_write(s, addr, *val) ||
-        tc4x_gpio_write(s->gpio, addr, *val) ||
         tc4x_adc_write(s->adc, addr, *val)) {
         return true;
     }
@@ -1284,13 +1284,6 @@ static bool soc_sfr_write(void *opaque, uint32_t addr, uint32_t *val)
     return false;
 }
 
-static bool soc_sfr_write_lockless(void *opaque, uint32_t addr, uint32_t val)
-{
-    Tc4xSoc *s = opaque;
-
-    return tc4x_gpio_write_lockless(s->gpio, addr, val);
-}
-
 static void soc_sfr_watched(void *opaque, uint32_t addr, uint32_t val,
                             unsigned size)
 {
@@ -1300,7 +1293,6 @@ static void soc_sfr_watched(void *opaque, uint32_t addr, uint32_t val,
 
 static const Tc4xSfrModelOps soc_sfr_models = {
     .read_lockless = soc_sfr_read_lockless,
-    .write_lockless = soc_sfr_write_lockless,
     .read = soc_sfr_read,
     .write = soc_sfr_write,
     .watched = soc_sfr_watched,
@@ -1953,6 +1945,29 @@ static bool tc4x_soc_add_qspi(Tc4xSoc *s, Error **errp)
     return true;
 }
 
+/* The GPIO ports over the store, held at the board's straps */
+static bool tc4x_soc_add_ports(Tc4xSoc *s, Error **errp)
+{
+    DeviceState *dev = qdev_new(TYPE_TC4X_PORTS);
+    QList *straps = qlist_new();
+
+    object_property_add_child(OBJECT(s), "ports", OBJECT(dev));
+    qdev_prop_set_bit(dev, "imprecise-io", s->imprecise_io);
+    object_property_set_link(OBJECT(dev), "sfr-store", OBJECT(s->sfr),
+                             &error_abort);
+    for (uint32_t i = 0; i < s->num_port_straps; i++) {
+        qlist_append_int(straps, s->port_straps[i]);
+    }
+    qdev_prop_set_array(dev, "straps", straps);
+    if (!sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), errp)) {
+        return false;
+    }
+    s->ports = TC4X_PORTS(dev);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, tc4x_ports_base(), 0);
+    tc4x_sim_add_command(s, "gpio", tc4x_ports_command, s->ports, false);
+    return true;
+}
+
 /*
  * The SFR store under the SoC's models.  TOM shadow registers SR0/SR1,
  * which cores rewrite often, are plain storage that GLB_CTRL copies to
@@ -2043,11 +2058,11 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
         }
     }
     if (!tc4x_soc_add_ir(s, errp) || !tc4x_soc_add_timebase(s, errp) ||
-        !tc4x_soc_add_i2c(s, errp) || !tc4x_soc_add_qspi(s, errp)) {
+        !tc4x_soc_add_i2c(s, errp) || !tc4x_soc_add_qspi(s, errp) ||
+        !tc4x_soc_add_ports(s, errp)) {
         return;
     }
     s->bridge_time_request = tc4x_timebase_new_request(s->timebase);
-    s->gpio = tc4x_gpio_new(s);
     s->adc = tc4x_adc_new(s);
     tc4x_force_soc_status(s);
     tc4x_geth_init(s, sysmem);
@@ -2066,6 +2081,8 @@ static const Property tc4x_soc_properties[] = {
     DEFINE_PROP_BOOL("imprecise-io", Tc4xSoc, imprecise_io, false),
     DEFINE_PROP_STRING("flash-dir", Tc4xSoc, flash_dir),
     DEFINE_PROP_BOOL("keep-flash", Tc4xSoc, keep_flash, false),
+    DEFINE_PROP_ARRAY("port-straps", Tc4xSoc, num_port_straps, port_straps,
+                      qdev_prop_uint32, uint32_t),
     DEFINE_PROP_LINK("lmu-memdev", Tc4xSoc, lmu_memdev, TYPE_MEMORY_BACKEND,
                      HostMemoryBackend *),
     DEFINE_PROP_LINK("core0-memdev", Tc4xSoc, core_memdev[0],

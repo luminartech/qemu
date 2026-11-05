@@ -154,7 +154,7 @@ typedef struct Tc4xSfrModelOps {
     /* @addr as accessed; *@val holds the stored word */
     Tc4xSfrPath (*read_lockless)(void *opaque, uint32_t addr, unsigned size,
                                  uint32_t *val);
-    /* a full aligned word: true when the model took the write */
+    /* a full aligned word: true when the model took the write (optional) */
     bool (*write_lockless)(void *opaque, uint32_t addr, uint32_t val);
     /* a word: *@val holds the stored word; true when the model served it */
     bool (*read)(void *opaque, uint32_t addr, uint32_t *val);
