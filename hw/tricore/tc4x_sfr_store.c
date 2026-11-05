@@ -27,6 +27,7 @@
 #include "system/memory.h"
 #include "system/system.h"
 #include "hw/core/boards.h"
+#include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_sfr_store.h"
 #include "trace.h"
 
@@ -92,6 +93,8 @@ struct Tc4xSfrStore {
 
     const Tc4xSfrModelOps *models;
     void *models_opaque;
+    /* the attributes of the access whose hooks and models run (BQL) */
+    MemTxAttrs hook_attrs;
 
     Notifier machine_done;
 };
@@ -298,6 +301,12 @@ void tc4x_sfr_store_allow_lockless_write(Tc4xSfrStore *st, uint32_t addr)
     set_bit_atomic(sfr_word(addr), sfr_page(st, addr, true)->lockless_write);
 }
 
+MemTxAttrs tc4x_sfr_store_hook_attrs(Tc4xSfrStore *st)
+{
+    /* hooks run under the BQL: a thread without it runs none */
+    return bql_locked() ? st->hook_attrs : MEMTXATTRS_UNSPECIFIED;
+}
+
 bool tc4x_sfr_store_bql_only(Tc4xSfrStore *st, uint32_t addr)
 {
     Tc4xSfrPage *pg = sfr_page(st, addr, false);
@@ -444,7 +453,7 @@ static uint32_t sfr_read_locked(Tc4xSfrStore *st, uint32_t addr)
 }
 
 uint64_t tc4x_sfr_store_access_read(Tc4xSfrStore *st, uint32_t addr,
-                                    unsigned size)
+                                    unsigned size, MemTxAttrs attrs)
 {
     uint32_t word = addr & ~3u;
     Tc4xSfrPage *pg = sfr_page(st, word, false);
@@ -466,7 +475,11 @@ uint64_t tc4x_sfr_store_access_read(Tc4xSfrStore *st, uint32_t addr,
     }
     if (!served) {
         BQL_LOCK_GUARD();
+        MemTxAttrs outer = st->hook_attrs;
+
+        st->hook_attrs = attrs;
         v = sfr_read_locked(st, word);
+        st->hook_attrs = outer;
         pg = sfr_page(st, word, false);
     }
     if (pg) {
@@ -507,11 +520,12 @@ static void sfr_write_locked(Tc4xSfrStore *st, uint32_t addr, uint32_t val)
 }
 
 void tc4x_sfr_store_access_write(Tc4xSfrStore *st, uint32_t addr, uint64_t val,
-                                 unsigned size)
+                                 unsigned size, MemTxAttrs attrs)
 {
     uint32_t word_addr = addr & ~3u;
     uint32_t shift = (addr & 3) * 8;
     uint32_t word = val;
+    MemTxAttrs outer;
 
     if (size == 4 && !(addr & 3)) {
         Tc4xSfrPage *pg = sfr_page(st, addr, false);
@@ -542,39 +556,66 @@ void tc4x_sfr_store_access_write(Tc4xSfrStore *st, uint32_t addr, uint64_t val,
     if (g_hash_table_contains(st->watches, GUINT_TO_POINTER(word_addr))) {
         st->models->watched(st->models_opaque, word_addr, word, size);
     }
+    outer = st->hook_attrs;
+    st->hook_attrs = attrs;
     sfr_write_locked(st, word_addr, word);
+    st->hook_attrs = outer;
 }
 
-static uint64_t sfr_e_read(void *opaque, hwaddr off, unsigned size)
+static MemTxResult sfr_read(Tc4xSfrStore *st, uint32_t addr, uint64_t *data,
+                            unsigned size, MemTxAttrs attrs)
 {
-    return tc4x_sfr_store_access_read(opaque, TC4X_SFR_SEGMENT_E + off, size);
+    if (tc4x_master_refused(attrs, "tc4x-sfr", addr, false)) {
+        return MEMTX_ERROR;
+    }
+    *data = tc4x_sfr_store_access_read(st, addr, size, attrs);
+    return MEMTX_OK;
 }
 
-static void sfr_e_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+static MemTxResult sfr_write(Tc4xSfrStore *st, uint32_t addr, uint64_t val,
+                             unsigned size, MemTxAttrs attrs)
 {
-    tc4x_sfr_store_access_write(opaque, TC4X_SFR_SEGMENT_E + off, val, size);
+    if (tc4x_master_refused(attrs, "tc4x-sfr", addr, true)) {
+        return MEMTX_ERROR;
+    }
+    tc4x_sfr_store_access_write(st, addr, val, size, attrs);
+    return MEMTX_OK;
 }
 
-static uint64_t sfr_f_read(void *opaque, hwaddr off, unsigned size)
+static MemTxResult sfr_e_read(void *opaque, hwaddr off, uint64_t *data,
+                              unsigned size, MemTxAttrs attrs)
 {
-    return tc4x_sfr_store_access_read(opaque, TC4X_SFR_SEGMENT_F + off, size);
+    return sfr_read(opaque, TC4X_SFR_SEGMENT_E + off, data, size, attrs);
 }
 
-static void sfr_f_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+static MemTxResult sfr_e_write(void *opaque, hwaddr off, uint64_t val,
+                               unsigned size, MemTxAttrs attrs)
 {
-    tc4x_sfr_store_access_write(opaque, TC4X_SFR_SEGMENT_F + off, val, size);
+    return sfr_write(opaque, TC4X_SFR_SEGMENT_E + off, val, size, attrs);
+}
+
+static MemTxResult sfr_f_read(void *opaque, hwaddr off, uint64_t *data,
+                              unsigned size, MemTxAttrs attrs)
+{
+    return sfr_read(opaque, TC4X_SFR_SEGMENT_F + off, data, size, attrs);
+}
+
+static MemTxResult sfr_f_write(void *opaque, hwaddr off, uint64_t val,
+                               unsigned size, MemTxAttrs attrs)
+{
+    return sfr_write(opaque, TC4X_SFR_SEGMENT_F + off, val, size, attrs);
 }
 
 static const MemoryRegionOps sfr_seg_ops[2] = {
     {
-        .read = sfr_e_read,
-        .write = sfr_e_write,
+        .read_with_attrs = sfr_e_read,
+        .write_with_attrs = sfr_e_write,
         .endianness = DEVICE_LITTLE_ENDIAN,
         .valid = { .min_access_size = 1, .max_access_size = 8 },
         .impl = { .min_access_size = 1, .max_access_size = 4 },
     }, {
-        .read = sfr_f_read,
-        .write = sfr_f_write,
+        .read_with_attrs = sfr_f_read,
+        .write_with_attrs = sfr_f_write,
         .endianness = DEVICE_LITTLE_ENDIAN,
         .valid = { .min_access_size = 1, .max_access_size = 8 },
         .impl = { .min_access_size = 1, .max_access_size = 4 },
@@ -655,6 +696,7 @@ static void tc4x_sfr_store_init(Object *obj)
                               TC4X_SFR_SEGMENT_SIZE);
         sysbus_init_mmio(SYS_BUS_DEVICE(obj), &st->seg[i]);
     }
+    st->hook_attrs = MEMTXATTRS_UNSPECIFIED;
     st->semantics = g_hash_table_new(g_direct_hash, g_direct_equal);
     st->passthrough = g_ptr_array_new();
     st->kresets = g_hash_table_new(g_direct_hash, g_direct_equal);

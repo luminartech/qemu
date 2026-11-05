@@ -36,10 +36,15 @@ void tc4x_sfr_add_read_hook(Tc4xSoc *soc, uint32_t addr, Tc4xSfrReadFn fn,
                             void *opaque);
 
 /*
- * From a read or write hook: the core whose load or store is being
- * served, or -1 when no core makes the access (the sim bridge, a timer).
- * An access a core's store starts on its way, such as a DMA transfer it
- * triggers, counts as that core's.
+ * From a read or write hook or the DMU hook: the core whose load or store
+ * is being served, from the bus master in the attributes the SFR store
+ * passes on (tc4x_master.h), or -1 when no core makes it (a DMA channel,
+ * also one a core's store starts, the sim bridge as the debug master).
+ * The sim bridge acting as a core ("master cpu N") counts as that core.
+ * Outside a hook: the core of the current vCPU, or -1 (a timer).  A board
+ * region's own callbacks take the master from their attrs argument
+ * (tc4x_master_core()) instead, which also tells DMA and the sim bridge
+ * apart from the core whose store started them.
  */
 int tc4x_access_core(Tc4xSoc *soc);
 

@@ -37,6 +37,7 @@
 #include "migration/vmstate.h"
 #include "hw/tricore/tc4x.h"
 #include "hw/tricore/tc4x_ir.h"
+#include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_qspi.h"
 #include "hw/tricore/tc4x_regs.h"
 #include "hw/tricore/tc4x_sfr_store.h"
@@ -348,22 +349,29 @@ static void qspi_write_word(Tc4xQspi *q, hwaddr off, uint32_t val)
     tc4x_sfr_store_write(q->sfr, tc4x_qspi_base(q->index) + off, val);
 }
 
-static uint64_t tc4x_qspi_read(void *opaque, hwaddr off, unsigned size)
+static MemTxResult tc4x_qspi_read(void *opaque, hwaddr off, uint64_t *data,
+                                  unsigned size, MemTxAttrs attrs)
 {
     Tc4xQspi *q = opaque;
     hwaddr word = off & ~3u;
     uint32_t val;
 
+    if (tc4x_master_refused(attrs, "tc4x-qspi", tc4x_qspi_base(q->index) + off,
+                            false)) {
+        return MEMTX_ERROR;
+    }
     if (word == QSPI_REG(STATUS)) {
         val = qspi_status(q);
     } else if (word >= QSPI_REG(RXEXIT0) && word < QSPI_REG(RXEXITD)) {
         val = qspi_rx_pop(q);
     } else {
-        return tc4x_sfr_store_access_read(q->sfr,
-                                          tc4x_qspi_base(q->index) + off,
-                                          size);
+        *data = tc4x_sfr_store_access_read(q->sfr,
+                                           tc4x_qspi_base(q->index) + off,
+                                           size, attrs);
+        return MEMTX_OK;
     }
-    return extract32(val, (off & 3) * 8, size * 8);
+    *data = extract32(val, (off & 3) * 8, size * 8);
+    return MEMTX_OK;
 }
 
 /*
@@ -372,32 +380,35 @@ static uint64_t tc4x_qspi_read(void *opaque, hwaddr off, unsigned size)
  * when a hardware-request DMA job may run on the module (the DMA needs
  * it), and leave registers the store watches or hooks to the store.
  */
-static void tc4x_qspi_write(void *opaque, hwaddr off, uint64_t val,
-                            unsigned size)
+static MemTxResult tc4x_qspi_write(void *opaque, hwaddr off, uint64_t val,
+                                   unsigned size, MemTxAttrs attrs)
 {
     Tc4xQspi *q = opaque;
     uint32_t addr = tc4x_qspi_base(q->index) + off;
     bool served = qspi_serves_write(off & ~3u);
 
+    if (tc4x_master_refused(attrs, "tc4x-qspi", addr, true)) {
+        return MEMTX_ERROR;
+    }
     if (size != 4 || (off & 3)) {
         if (served) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "tc4x-qspi%u: %u-byte write at 0x%" HWADDR_PRIx
                           " ignored\n", q->index, size, off);
         } else {
-            tc4x_sfr_store_access_write(q->sfr, addr, val, size);
+            tc4x_sfr_store_access_write(q->sfr, addr, val, size, attrs);
         }
-        return;
+        return MEMTX_OK;
     }
     if (!served && tc4x_sfr_store_bql_only(q->sfr, addr)) {
-        tc4x_sfr_store_access_write(q->sfr, addr, val, size);
-        return;
+        tc4x_sfr_store_access_write(q->sfr, addr, val, size, attrs);
+        return MEMTX_OK;
     }
     if (!bql_locked()) {
         WITH_QEMU_LOCK_GUARD(&q->lock) {
             if (!q->dma_busy && !qspi_dma_armed(q)) {
                 qspi_write_word(q, off, val);
-                return;
+                return MEMTX_OK;
             }
         }
         bql_lock();
@@ -405,15 +416,16 @@ static void tc4x_qspi_write(void *opaque, hwaddr off, uint64_t val,
             qspi_write_word(q, off, val);
         }
         bql_unlock();
-        return;
+        return MEMTX_OK;
     }
     QEMU_LOCK_GUARD(&q->lock);
     qspi_write_word(q, off, val);
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps tc4x_qspi_ops = {
-    .read = tc4x_qspi_read,
-    .write = tc4x_qspi_write,
+    .read_with_attrs = tc4x_qspi_read,
+    .write_with_attrs = tc4x_qspi_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },

@@ -118,12 +118,19 @@ bool tc4x_sfr_store_bql_only(Tc4xSfrStore *st, uint32_t addr);
 
 /*
  * The store's MMIO access path for regions that forward to it (any
- * thread; takes the BQL where the access needs it)
+ * thread; takes the BQL where the access needs it), with the attributes
+ * of the access for the hooks and models it calls
  */
 uint64_t tc4x_sfr_store_access_read(Tc4xSfrStore *st, uint32_t addr,
-                                    unsigned size);
+                                    unsigned size, MemTxAttrs attrs);
 void tc4x_sfr_store_access_write(Tc4xSfrStore *st, uint32_t addr, uint64_t val,
-                                 unsigned size);
+                                 unsigned size, MemTxAttrs attrs);
+
+/*
+ * From a hook or a model callback: the attributes of the guest access that
+ * runs it; MEMTXATTRS_UNSPECIFIED outside one (any thread)
+ */
+MemTxAttrs tc4x_sfr_store_hook_attrs(Tc4xSfrStore *st);
 
 /*
  * Hooks of board code that has no device of its own yet: guest writes of

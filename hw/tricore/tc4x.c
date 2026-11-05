@@ -24,6 +24,7 @@
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
 #include "qemu/lockable.h"
+#include "qemu/cutils.h"
 #include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "qobject/qlist.h"
@@ -41,11 +42,13 @@
 #include "hw/core/irq.h"
 #include "hw/net/tc4x_geth.h"
 #include "hw/tricore/tc4x_board.h"
+#include "hw/tricore/tc4x_dma.h"
 #include "hw/tricore/tc4x_flash.h"
 #include "hw/tricore/tc4x_pacer.h"
 #include "hw/tricore/tc4x_regs.h"
 #include "hw/tricore/tc4x_sfr_store.h"
 #include "hw/tricore/tc4x_ir.h"
+#include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_timebase.h"
 #include "tc4x_soc.h"
 
@@ -133,6 +136,21 @@
 #define DMA_TSR_HLTCLR      BIT(24)
 #define DMA_SHCT_LINKED     0xCu
 #define DMA_MAX_CHAIN       4096u
+/*
+ * Resource partitions (iLLD IfxDma_regdef.h, Ifx_DMA_RP): HRRc.HRP assigns
+ * channel c to one; its ERRSR reports bus errors (LEC: the channel), CLRE
+ * clears them, EER enables the partition's error service request
+ * SRC_DMAx_ERRn (IfxDma_getErrPointer())
+ */
+#define DMA_RP_OFF          0x1000u
+#define DMA_RP_STRIDE       0x80u
+#define DMA_RP_EER          0x44u
+#define DMA_RP_ERRSR        0x48u
+#define DMA_RP_CLRE         0x4Cu
+#define DMA_HRR_OFF         0x1800u
+#define DMA_ERR_CLEARABLE   0xFF0F0000u
+#define SRC_DMA0_ERR_BASE   (SRC_BASE + 0x6E0u)
+#define SRC_DMA1_ERR_BASE   (SRC_BASE + 0x930u)
 
 /* eGTM TOM channels: CN0 counts up at the CMU clock and wraps at CM0 */
 #define EGTM_TOM_BASE       0xF9081000u
@@ -198,9 +216,11 @@ struct Tc4xSoc {
     GHashTable *tom_cn0;   /* TOM CN0 addr -> Tc4xTomCounter */
     DeviceState *geth;
     Tc4xIr *ir;
+    Object *dma_policy;     /* TYPE_TC4X_DMA_POLICY */
 
     Tc4xTimebase *timebase;
     Tc4xTimeRequest *bridge_time_request;
+    MemTxAttrs bridge_attrs;    /* the bus master of bridge r and w */
 
     uint32_t console;       /* ASCLIN instance of the console chardev */
     CharFrontend uart;
@@ -484,9 +504,89 @@ static uint32_t dma_next_addr(uint32_t addr, uint32_t width, bool inc,
     return next;
 }
 
+static const unsigned dma_rp_count[DMA_NUM_INST] = { 16, 8 };
+
+static uint32_t dma_rp_reg(uint32_t ch, unsigned rp, uint32_t off)
+{
+    return dma_base(ch) + DMA_RP_OFF + rp * DMA_RP_STRIDE + off;
+}
+
+/*
+ * Bus errors @err (TC4X_DMA_ERR_*) of channel @ch, the first at @addr: the
+ * error flags and the channel in the ERRSR of the channel's resource
+ * partition, and the partition's error service request when EER enables
+ * one of them
+ */
+static void dma_bus_error(Tc4xSoc *s, uint32_t ch, uint32_t err,
+                          uint32_t addr)
+{
+    unsigned inst = ch / DMA_CH_PER_INST;
+    unsigned rp = extract32(reg_get(s, dma_base(ch) + DMA_HRR_OFF +
+                                    (ch % DMA_CH_PER_INST) * 4), 0, 4);
+    uint32_t errsr;
+
+    qemu_log_mask(LOG_GUEST_ERROR, "tc4x-dma: ch %u %s bus error at "
+                  "0x%08x\n", ch,
+                  err & TC4X_DMA_ERR_SER ? "source" :
+                  err & TC4X_DMA_ERR_DER ? "destination" : "linked list load",
+                  addr);
+    if (rp >= dma_rp_count[inst]) {
+        qemu_log_mask(LOG_GUEST_ERROR, "tc4x-dma: ch %u is in resource "
+                      "partition %u, which DMA%u does not have\n", ch, rp,
+                      inst);
+        return;
+    }
+    errsr = reg_get(s, dma_rp_reg(ch, rp, DMA_RP_ERRSR)) | err;
+    reg_set(s, dma_rp_reg(ch, rp, DMA_RP_ERRSR),
+            deposit32(errsr, 0, 7, ch % DMA_CH_PER_INST));
+    if (reg_get(s, dma_rp_reg(ch, rp, DMA_RP_EER)) & err) {
+        src_raise(s, (inst ? SRC_DMA1_ERR_BASE : SRC_DMA0_ERR_BASE) + rp * 4);
+    }
+}
+
+/*
+ * The policy's verdict on the failed access of channel @ch at @addr: true
+ * to drop what it delivers
+ */
+static bool dma_policy_drops(Tc4xSoc *s, uint32_t ch, uint32_t err,
+                             uint32_t addr)
+{
+    Tc4xDmaPolicyClass *pc;
+
+    if (!s->dma_policy) {
+        return false;
+    }
+    pc = TC4X_DMA_POLICY_GET_CLASS(s->dma_policy);
+    return pc->bus_error &&
+           pc->bus_error(TC4X_DMA_POLICY(s->dma_policy), ch, err, addr);
+}
+
+/* CLRE of a resource partition: clear the ERRSR flags written as 1 */
+static bool dma_clre_write(Tc4xSoc *s, uint32_t addr, uint32_t val)
+{
+    uint32_t inst, rel;
+
+    if (addr < DMA0_BASE ||
+        addr >= DMA0_BASE + DMA_NUM_INST * DMA_INST_STRIDE) {
+        return false;
+    }
+    inst = (addr - DMA0_BASE) / DMA_INST_STRIDE;
+    rel = (addr - DMA0_BASE) % DMA_INST_STRIDE;
+    if (rel < DMA_RP_OFF ||
+        rel >= DMA_RP_OFF + dma_rp_count[inst] * DMA_RP_STRIDE ||
+        (rel - DMA_RP_OFF) % DMA_RP_STRIDE != DMA_RP_CLRE) {
+        return false;
+    }
+    addr += DMA_RP_ERRSR - DMA_RP_CLRE;
+    reg_set(s, addr, reg_get(s, addr) & ~(val & DMA_ERR_CLEARABLE));
+    return true;
+}
+
 /*
  * Execute one transaction of channel ch.  Returns true if the channel reloaded
  * a linked TCS from SHADR; *auto_start reports that the loaded TCS has SCH set.
+ * A bus error is reported (dma_bus_error()); beyond that the channel does
+ * what the board's policy says (dma_policy_drops()).
  */
 static bool dma_transaction(Tc4xSoc *s, uint32_t ch, bool *auto_start)
 {
@@ -498,14 +598,26 @@ static bool dma_transaction(Tc4xSoc *s, uint32_t ch, bool *auto_start)
     uint32_t trel = extract32(cfg, 0, 14);
     uint32_t moves = (trel ? trel : 1) * blkm_moves[extract32(cfg, 16, 3)];
     uint32_t width = 1u << extract32(cfg, 21, 3);
+    MemTxAttrs attrs = tc4x_master_attrs(TC4X_MASTER_DMA(ch), false);
     uint8_t buf[1u << 7];   /* CHDW 6 and 7 are reserved but encodable */
+    uint32_t err = 0, err_addr = 0;
 
     *auto_start = false;
     for (uint32_t i = 0; i < moves; i++) {
-        address_space_read(&address_space_memory, sadr, MEMTXATTRS_UNSPECIFIED,
-                           buf, width);
-        address_space_write(&address_space_memory, dadr, MEMTXATTRS_UNSPECIFIED,
-                            buf, width);
+        bool write = true;
+
+        if (address_space_read(&address_space_memory, sadr, attrs, buf,
+                               width) != MEMTX_OK) {
+            err_addr = err ? err_addr : sadr;
+            err |= TC4X_DMA_ERR_SER;
+            write = !dma_policy_drops(s, ch, TC4X_DMA_ERR_SER, sadr);
+        }
+        if (write && address_space_write(&address_space_memory, dadr, attrs,
+                                         buf, width) != MEMTX_OK) {
+            err_addr = err ? err_addr : dadr;
+            err |= TC4X_DMA_ERR_DER;
+            dma_policy_drops(s, ch, TC4X_DMA_ERR_DER, dadr);
+        }
         sadr = dma_next_addr(sadr, width, extract32(adicr, 3, 1),
                              extract32(adicr, 0, 3), extract32(adicr, 20, 1),
                              extract32(adicr, 8, 4));
@@ -517,6 +629,9 @@ static bool dma_transaction(Tc4xSoc *s, uint32_t ch, bool *auto_start)
     reg_set(s, dma_reg(ch, DMA_DADR), dadr);
     reg_set(s, dma_reg(ch, DMA_CHCSR),
             reg_get(s, dma_reg(ch, DMA_CHCSR)) & ~(DMA_CHCSR_SCH | 0x3FFFu));
+    if (err) {
+        dma_bus_error(s, ch, err, err_addr);
+    }
 
     if (extract32(adicr, 26, 2) & 2) {
         reg_set(s, dma_reg(ch, DMA_CHCSR),
@@ -525,11 +640,16 @@ static bool dma_transaction(Tc4xSoc *s, uint32_t ch, bool *auto_start)
     }
 
     if (extract32(adicr, 16, 4) == DMA_SHCT_LINKED) {
+        uint32_t shadr = reg_get(s, dma_reg(ch, DMA_SHADR));
         uint32_t tcs[8];
 
-        address_space_read(&address_space_memory,
-                           reg_get(s, dma_reg(ch, DMA_SHADR)),
-                           MEMTXATTRS_UNSPECIFIED, tcs, sizeof(tcs));
+        if (address_space_read(&address_space_memory, shadr, attrs, tcs,
+                               sizeof(tcs)) != MEMTX_OK) {
+            dma_bus_error(s, ch, TC4X_DMA_ERR_DLLER, shadr);
+            if (dma_policy_drops(s, ch, TC4X_DMA_ERR_DLLER, shadr)) {
+                return false;
+            }
+        }
         for (int w = 0; w < 8; w++) {
             reg_set(s, dma_reg(ch, w * 4), le32_to_cpu(tcs[w]));
         }
@@ -892,7 +1012,8 @@ static bool soc_sfr_write(void *opaque, uint32_t addr, uint32_t *val)
     uint32_t off;
     int core;
 
-    if (asclin_write(s, addr, *val) || dma_write(s, addr, *val)) {
+    if (asclin_write(s, addr, *val) || dma_write(s, addr, *val) ||
+        dma_clre_write(s, addr, *val)) {
         return true;
     }
     if (addr >= INT_GPSRG_SWC0 &&
@@ -1001,6 +1122,38 @@ static bool sim_store_backed(Tc4xSoc *s, uint32_t addr)
     return false;
 }
 
+/* master [debug | cpu N [safe] | dma CH]: the bus master of r and w */
+static void sim_master(Tc4xSoc *s, int argc, char **argv)
+{
+    bool safe = argc == 4 && !strcmp(argv[3], "safe");
+    unsigned n, m;
+    int core;
+
+    if (argc == 2 && !strcmp(argv[1], "debug")) {
+        s->bridge_attrs = tc4x_master_attrs(TC4X_MASTER_DEBUG, false);
+    } else if ((argc == 3 || safe) && !strcmp(argv[1], "cpu") &&
+               !qemu_strtoui(argv[2], NULL, 0, &n) && n < TC4X_NUM_CORES) {
+        s->bridge_attrs = tc4x_master_attrs(TC4X_MASTER_CPU(n), safe);
+    } else if (argc == 3 && !strcmp(argv[1], "dma") &&
+               !qemu_strtoui(argv[2], NULL, 0, &n) && n < DMA_NUM_CH) {
+        s->bridge_attrs = tc4x_master_attrs(TC4X_MASTER_DMA(n), false);
+    } else if (argc != 1) {
+        sim_printf(s, "err usage: master [debug | cpu N [safe] | dma CH]\n");
+        return;
+    }
+    m = TC4X_REQUESTER_MASTER(s->bridge_attrs.requester_id);
+    core = tc4x_master_core(s->bridge_attrs);
+    if (m == TC4X_MASTER_DEBUG) {
+        sim_printf(s, "ok debug\n");
+    } else if (core >= 0) {
+        sim_printf(s, "ok cpu %d%s\n", core,
+                   TC4X_REQUESTER_SAFE(s->bridge_attrs.requester_id) ?
+                   " safe" : "");
+    } else {
+        sim_printf(s, "ok dma %u\n", m - TC4X_MASTER_DMA(0));
+    }
+}
+
 static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
 {
     uint64_t a[4] = { 0 };
@@ -1017,8 +1170,8 @@ static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
             sim_printf(s, "err size must be 1, 2 or 4\n");
             return;
         }
-        address_space_read(&address_space_memory, a[1],
-                           MEMTXATTRS_UNSPECIFIED, &v, size);
+        address_space_read(&address_space_memory, a[1], s->bridge_attrs, &v,
+                           size);
         sim_printf(s, "ok 0x%08x\n", le32_to_cpu(v));
     } else if (!strcmp(argv[0], "w") && argc >= 3) {
         uint32_t size = argc >= 4 ? a[3] : 4;
@@ -1030,8 +1183,8 @@ static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
         }
         /* as a debugger: it patches flash, which refuses guest stores */
         if (!tc4x_flash_patch(&s->flash, a[1], &v, size)) {
-            address_space_write(&address_space_memory, a[1],
-                                MEMTXATTRS_UNSPECIFIED, &v, size);
+            address_space_write(&address_space_memory, a[1], s->bridge_attrs,
+                                &v, size);
         }
         sim_printf(s, "ok\n");
     } else if (!strcmp(argv[0], "poke") && argc >= 3) {
@@ -1094,6 +1247,8 @@ static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
     } else if (!strcmp(argv[0], "vmcont")) {
         vm_start();
         sim_printf(s, "ok\n");
+    } else if (!strcmp(argv[0], "master")) {
+        sim_master(s, argc, argv);
     } else if (!strcmp(argv[0], "timescale") && argc >= 2) {
         tc4x_timebase_request(s->timebase, s->bridge_time_request, a[1]);
         sim_printf(s, "ok %u\n", tc4x_timebase_scale(s->timebase));
@@ -1244,6 +1399,11 @@ void tc4x_nmi(Tc4xSoc *s, int core)
 
 int tc4x_access_core(Tc4xSoc *s)
 {
+    MemTxAttrs attrs = tc4x_sfr_store_hook_attrs(s->sfr);
+
+    if (!attrs.unspecified) {
+        return tc4x_master_core(attrs);
+    }
     for (int c = 0; current_cpu && c < TC4X_NUM_CORES; c++) {
         if (current_cpu == CPU(s->cpu[c])) {
             return c;
@@ -1359,6 +1519,12 @@ static bool tc4x_soc_add_cpu(Tc4xSoc *s, int c, Error **errp)
                                         &s->cpu_local_pspr[c], 1);
 
     if (!object_property_set_uint(cpuobj, "core-id", c, errp) ||
+        !object_property_set_uint(cpuobj, "requester-id",
+                                  TC4X_REQUESTER_ID(TC4X_MASTER_CPU(c), false),
+                                  errp) ||
+        !object_property_set_uint(cpuobj, "requester-id-safe",
+                                  TC4X_REQUESTER_ID(TC4X_MASTER_CPU(c), true),
+                                  errp) ||
         !object_property_set_bool(cpuobj, "start-halted", c != 0, errp) ||
         !object_property_set_link(cpuobj, "memory", OBJECT(&s->cpu_root[c]),
                                   errp) ||
@@ -1635,6 +1801,7 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     s->bridge_time_request = tc4x_timebase_new_request(s->timebase);
+    s->bridge_attrs = tc4x_master_attrs(TC4X_MASTER_DEBUG, false);
     tc4x_force_soc_status(s);
     tc4x_geth_init(s, sysmem);
 
@@ -1677,6 +1844,10 @@ static void tc4x_soc_init(Object *obj)
     object_initialize_child(obj, "flash", &s->flash, TYPE_TC4X_FLASH);
     object_property_add_alias(obj, "pflash", OBJECT(&s->flash), "pflash");
     object_property_add_alias(obj, "dflash", OBJECT(&s->flash), "dflash");
+    /* set by board code after the SoC is realized */
+    object_property_add_link(obj, "dma-policy", TYPE_TC4X_DMA_POLICY,
+                             &s->dma_policy, object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static void tc4x_soc_class_init(ObjectClass *oc, const void *data)
@@ -1694,6 +1865,10 @@ static void tc4x_soc_class_init(ObjectClass *oc, const void *data)
 
 static const TypeInfo tc4x_soc_types[] = {
     {
+        .name = TYPE_TC4X_DMA_POLICY,
+        .parent = TYPE_INTERFACE,
+        .class_size = sizeof(Tc4xDmaPolicyClass),
+    }, {
         .name = TYPE_TC4X_SOC,
         .parent = TYPE_DEVICE,
         .instance_size = sizeof(Tc4xSoc),

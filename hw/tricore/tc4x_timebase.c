@@ -27,6 +27,7 @@
 #include "cpu.h"
 #include "exec/target_page.h"
 #include "hw/tricore/tc4x_ir.h"
+#include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_regs.h"
 #include "hw/tricore/tc4x_sfr_store.h"
 #include "hw/tricore/tc4x_timebase.h"
@@ -429,29 +430,40 @@ static hwaddr stm_page_offset(hwaddr off)
     return off;
 }
 
-static uint64_t stm_page_read(void *opaque, hwaddr off, unsigned size)
+static MemTxResult stm_page_read(void *opaque, hwaddr off, uint64_t *data,
+                                 unsigned size, MemTxAttrs attrs)
 {
     Tc4xTimebasePage *pg = opaque;
 
-    if (off >= STM_ABS && off + size <= STM_ABS + 8) {
-        return extract64(stm_now(pg->tb), (off - STM_ABS) * 8, size * 8);
+    if (tc4x_master_refused(attrs, "tc4x-timebase", pg->base + off, false)) {
+        return MEMTX_ERROR;
     }
-    return tc4x_sfr_store_access_read(pg->tb->sfr,
-                                      pg->base + stm_page_offset(off), size);
+    if (off >= STM_ABS && off + size <= STM_ABS + 8) {
+        *data = extract64(stm_now(pg->tb), (off - STM_ABS) * 8, size * 8);
+    } else {
+        *data = tc4x_sfr_store_access_read(pg->tb->sfr,
+                                           pg->base + stm_page_offset(off),
+                                           size, attrs);
+    }
+    return MEMTX_OK;
 }
 
-static void stm_page_write(void *opaque, hwaddr off, uint64_t val,
-                           unsigned size)
+static MemTxResult stm_page_write(void *opaque, hwaddr off, uint64_t val,
+                                  unsigned size, MemTxAttrs attrs)
 {
     Tc4xTimebasePage *pg = opaque;
 
+    if (tc4x_master_refused(attrs, "tc4x-timebase", pg->base + off, true)) {
+        return MEMTX_ERROR;
+    }
     tc4x_sfr_store_access_write(pg->tb->sfr, pg->base + stm_page_offset(off),
-                                val, size);
+                                val, size, attrs);
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps stm_page_ops = {
-    .read = stm_page_read,
-    .write = stm_page_write,
+    .read_with_attrs = stm_page_read,
+    .write_with_attrs = stm_page_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 8 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
@@ -461,30 +473,42 @@ static const MemoryRegionOps stm_page_ops = {
  * Served without the BQL like the STM, so that back-to-back STM and TBU
  * reads see the same delay.
  */
-static uint64_t tbu_page_read(void *opaque, hwaddr off, unsigned size)
+static MemTxResult tbu_page_read(void *opaque, hwaddr off, uint64_t *data,
+                                 unsigned size, MemTxAttrs attrs)
 {
     Tc4xTimebasePage *pg = opaque;
     hwaddr ch0 = TBU_CH0 - TBU_PAGE;
 
+    if (tc4x_master_refused(attrs, "tc4x-timebase", pg->base + off, false)) {
+        return MEMTX_ERROR;
+    }
     if (off >= ch0 && off + size <= ch0 + 4) {
         uint32_t base = stm_now(pg->tb) & R_EGTM_CLS_TBU_CH0_BASE_BASE_MASK;
 
-        return extract32(base, (off - ch0) * 8, size * 8);
+        *data = extract32(base, (off - ch0) * 8, size * 8);
+    } else {
+        *data = tc4x_sfr_store_access_read(pg->tb->sfr, pg->base + off, size,
+                                           attrs);
     }
-    return tc4x_sfr_store_access_read(pg->tb->sfr, pg->base + off, size);
+    return MEMTX_OK;
 }
 
-static void tbu_page_write(void *opaque, hwaddr off, uint64_t val,
-                           unsigned size)
+static MemTxResult tbu_page_write(void *opaque, hwaddr off, uint64_t val,
+                                  unsigned size, MemTxAttrs attrs)
 {
     Tc4xTimebasePage *pg = opaque;
 
-    tc4x_sfr_store_access_write(pg->tb->sfr, pg->base + off, val, size);
+    if (tc4x_master_refused(attrs, "tc4x-timebase", pg->base + off, true)) {
+        return MEMTX_ERROR;
+    }
+    tc4x_sfr_store_access_write(pg->tb->sfr, pg->base + off, val, size,
+                                attrs);
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps tbu_page_ops = {
-    .read = tbu_page_read,
-    .write = tbu_page_write,
+    .read_with_attrs = tbu_page_read,
+    .write_with_attrs = tbu_page_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 8 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },

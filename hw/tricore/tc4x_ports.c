@@ -24,6 +24,7 @@
 #include "hw/core/resettable.h"
 #include "migration/vmstate.h"
 #include "hw/tricore/tc4x.h"
+#include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_ports.h"
 #include "hw/tricore/tc4x_regs.h"
 #include "hw/tricore/tc4x_sfr_store.h"
@@ -308,18 +309,24 @@ static void port_changed(Tc4xPorts *p, unsigned n, uint32_t old)
     }
 }
 
-static uint64_t tc4x_ports_read(void *opaque, hwaddr off, unsigned size)
+static MemTxResult tc4x_ports_read(void *opaque, hwaddr off, uint64_t *data,
+                                   unsigned size, MemTxAttrs attrs)
 {
     Tc4xPorts *p = opaque;
     unsigned n = off / PORT_STRIDE;
     hwaddr reg = off % PORT_STRIDE;
     uint32_t addr = PORTS_BASE + off;
 
-    if (!ports_serves(reg & ~3u)) {
-        return tc4x_sfr_store_access_read(p->sfr, addr, size);
+    if (tc4x_master_refused(attrs, "tc4x-ports", addr, false)) {
+        return MEMTX_ERROR;
     }
-    return extract32(port_read_word(p, n, reg & ~3u, addr & ~3u),
-                     (off & 3) * 8, size * 8);
+    if (!ports_serves(reg & ~3u)) {
+        *data = tc4x_sfr_store_access_read(p->sfr, addr, size, attrs);
+    } else {
+        *data = extract32(port_read_word(p, n, reg & ~3u, addr & ~3u),
+                          (off & 3) * 8, size * 8);
+    }
+    return MEMTX_OK;
 }
 
 /*
@@ -328,8 +335,8 @@ static uint64_t tc4x_ports_read(void *opaque, hwaddr off, unsigned size)
  * changes only its bytes (port_write_part); into the write-only registers
  * it merges into 0.
  */
-static void tc4x_ports_write(void *opaque, hwaddr off, uint64_t val,
-                             unsigned size)
+static MemTxResult tc4x_ports_write(void *opaque, hwaddr off, uint64_t val,
+                                    unsigned size, MemTxAttrs attrs)
 {
     Tc4xPorts *p = opaque;
     unsigned n = off / PORT_STRIDE;
@@ -338,23 +345,27 @@ static void tc4x_ports_write(void *opaque, hwaddr off, uint64_t val,
     unsigned shift = (off & 3) * 8;
     uint32_t old;
 
+    if (tc4x_master_refused(attrs, "tc4x-ports", PORTS_BASE + off, true)) {
+        return MEMTX_ERROR;
+    }
     if (!ports_serves(reg)) {
         tc4x_sfr_store_access_write(p->sfr, PORTS_BASE + off, val,
-                                    size);
-        return;
+                                    size, attrs);
+        return MEMTX_OK;
     }
     if (!port_needs_bql(p, n)) {
         port_write_part(p, n, reg, addr, shift, size, val);
-        return;
+        return MEMTX_OK;
     }
     BQL_LOCK_GUARD();
     old = port_write_part(p, n, reg, addr, shift, size, val);
     port_changed(p, n, old);
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps tc4x_ports_ops = {
-    .read = tc4x_ports_read,
-    .write = tc4x_ports_write,
+    .read_with_attrs = tc4x_ports_read,
+    .write_with_attrs = tc4x_ports_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },

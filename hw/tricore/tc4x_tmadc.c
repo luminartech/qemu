@@ -26,6 +26,7 @@
 #include "hw/core/resettable.h"
 #include "migration/vmstate.h"
 #include "hw/tricore/tc4x.h"
+#include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_regs.h"
 #include "hw/tricore/tc4x_sfr_store.h"
 #include "hw/tricore/tc4x_timebase.h"
@@ -268,42 +269,55 @@ static void tmadc_start(Tc4xTmadc *adc, unsigned k)
     }
 }
 
-static uint64_t tc4x_tmadc_read(void *opaque, hwaddr off, unsigned size)
+static MemTxResult tc4x_tmadc_read(void *opaque, hwaddr off, uint64_t *data,
+                                   unsigned size, MemTxAttrs attrs)
 {
     Tc4xTmadc *adc = opaque;
     unsigned k = off / TMADC_STRIDE;
     hwaddr reg = off % TMADC_STRIDE & ~3u;
     uint32_t val;
 
+    if (tc4x_master_refused(attrs, "tc4x-tmadc", tc4x_tmadc_base() + off,
+                            false)) {
+        return MEMTX_ERROR;
+    }
     if (reg >= TMADC_RES(0) && reg < TMADC_RES_END) {
         val = tmadc_result(adc, k, (reg - TMADC_RES(0)) / TMADC_RES_STRIDE);
     } else if (reg == TMADC_MODSTAT) {
         val = tmadc_modstat(adc, k);
     } else {
-        return tc4x_sfr_store_access_read(adc->sfr, tc4x_tmadc_base() + off,
-                                          size);
+        *data = tc4x_sfr_store_access_read(adc->sfr, tc4x_tmadc_base() + off,
+                                           size, attrs);
+        return MEMTX_OK;
     }
-    return extract32(val, (off & 3) * 8, size * 8);
+    *data = extract32(val, (off & 3) * 8, size * 8);
+    return MEMTX_OK;
 }
 
 /* The store keeps every write; MODCFG.RUN starts the rounds */
-static void tc4x_tmadc_write(void *opaque, hwaddr off, uint64_t val,
-                             unsigned size)
+static MemTxResult tc4x_tmadc_write(void *opaque, hwaddr off, uint64_t val,
+                                    unsigned size, MemTxAttrs attrs)
 {
     Tc4xTmadc *adc = opaque;
     unsigned k = off / TMADC_STRIDE;
 
-    tc4x_sfr_store_access_write(adc->sfr, tc4x_tmadc_base() + off, val, size);
+    if (tc4x_master_refused(attrs, "tc4x-tmadc", tc4x_tmadc_base() + off,
+                            true)) {
+        return MEMTX_ERROR;
+    }
+    tc4x_sfr_store_access_write(adc->sfr, tc4x_tmadc_base() + off, val, size,
+                                attrs);
     if ((off % TMADC_STRIDE & ~3u) == TMADC_MODCFG &&
         FIELD_EX32(kreg_get(adc, k, TMADC_MODCFG), ADC_TMADC_MODCFG, RUN)) {
         BQL_LOCK_GUARD();
         tmadc_start(adc, k);
     }
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps tc4x_tmadc_ops = {
-    .read = tc4x_tmadc_read,
-    .write = tc4x_tmadc_write,
+    .read_with_attrs = tc4x_tmadc_read,
+    .write_with_attrs = tc4x_tmadc_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },

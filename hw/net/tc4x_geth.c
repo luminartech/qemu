@@ -40,6 +40,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/net/tc4x_geth.h"
+#include "hw/tricore/tc4x_master.h"
 #include "net/net.h"
 #include "net/eth.h"
 #include "net/checksum.h"
@@ -174,10 +175,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(Tc4xGethState, TC4X_GETH)
 #define ST_TBU                BIT(2)
 #define ST_RI                 BIT(6)
 #define ST_RBU                BIT(7)
+#define ST_FBE                BIT(12)
 #define ST_AIS                BIT(14)
 #define ST_NIS                BIT(15)
 #define ST_TX_MASK            (ST_TI | ST_TBU)
 #define ST_RX_MASK            (ST_RI | ST_RBU)
+#define ST_ABNORMAL           (ST_TBU | ST_RBU | ST_FBE)
 #define IE_AIE                BIT(14)
 #define IE_NIE                BIT(15)
 
@@ -335,7 +338,7 @@ static void ch_status(Tc4xGethState *s, int ch, uint32_t bits)
     if (st & (ST_TI | ST_RI)) {
         st |= ST_NIS;
     }
-    if (st & (ST_TBU | ST_RBU)) {
+    if (st & ST_ABNORMAL) {
         st |= ST_AIS;
     }
     chset(s, ch, CH_STATUS, st);
@@ -445,40 +448,51 @@ static void mdio_command(Tc4xGethState *s, int p, uint32_t ctrl)
     sreg(s, PORT_BASE(p) + MDIO_DATA, ctrl);
 }
 
-static void dma_rd(uint32_t addr, void *buf, unsigned len)
+/*
+ * The DMA's bus accesses.  A bus error sets DMA_CH_STATUS.FBE (fatal bus
+ * error); the model goes on with the data the bus returned.
+ */
+static void dma_rd(Tc4xGethState *s, int ch, uint32_t addr, void *buf,
+                   unsigned len)
 {
-    if (address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+    if (address_space_read(&address_space_memory, addr,
+                           tc4x_master_attrs(TC4X_MASTER_GETH, false),
                            buf, len) != MEMTX_OK) {
-        qemu_log_mask(LOG_GUEST_ERROR, "tc4x-geth: DMA read fault 0x%08x\n",
-                      addr);
+        qemu_log_mask(LOG_GUEST_ERROR, "tc4x-geth: DMA ch %d read bus "
+                      "error at 0x%08x\n", ch, addr);
+        ch_status(s, ch, ST_FBE);
     }
 }
 
-static void dma_wr(uint32_t addr, const void *buf, unsigned len)
+static void dma_wr(Tc4xGethState *s, int ch, uint32_t addr, const void *buf,
+                   unsigned len)
 {
     if (address_space_write(&address_space_memory, addr,
-                            MEMTXATTRS_UNSPECIFIED, buf, len) != MEMTX_OK) {
-        qemu_log_mask(LOG_GUEST_ERROR, "tc4x-geth: DMA write fault 0x%08x\n",
-                      addr);
+                            tc4x_master_attrs(TC4X_MASTER_GETH, false),
+                            buf, len) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR, "tc4x-geth: DMA ch %d write bus "
+                      "error at 0x%08x\n", ch, addr);
+        ch_status(s, ch, ST_FBE);
     }
 }
 
-static void desc_load(uint32_t addr, uint32_t d[4])
+static void desc_load(Tc4xGethState *s, int ch, uint32_t addr, uint32_t d[4])
 {
-    dma_rd(addr, d, DESC_SIZE);
+    dma_rd(s, ch, addr, d, DESC_SIZE);
     for (int i = 0; i < 4; i++) {
         d[i] = le32_to_cpu(d[i]);
     }
 }
 
-static void desc_store(uint32_t addr, const uint32_t d[4])
+static void desc_store(Tc4xGethState *s, int ch, uint32_t addr,
+                       const uint32_t d[4])
 {
     uint32_t le[4];
 
     for (int i = 0; i < 4; i++) {
         le[i] = cpu_to_le32(d[i]);
     }
-    dma_wr(addr, le, DESC_SIZE);
+    dma_wr(s, ch, addr, le, DESC_SIZE);
 }
 
 static uint32_t desc_next(Tc4xGethState *s, int ch, uint32_t cur, bool tx)
@@ -582,7 +596,7 @@ static void tx_process(Tc4xGethState *s, int ch)
     for (uint32_t n = 0; n < ring && dma->tx_cur != tail; n++) {
         uint32_t d[4];
 
-        desc_load(dma->tx_cur, d);
+        desc_load(s, ch, dma->tx_cur, d);
         if (!(d[3] & DES3_OWN)) {
             status |= ST_TBU;
             break;
@@ -591,7 +605,7 @@ static void tx_process(Tc4xGethState *s, int ch)
             dma->tx_pktid_valid = d[3] & TDES3_PIDV;
             dma->tx_pktid = d[0] & 0x3FF;
             d[3] = DES3_CTXT;
-            desc_store(dma->tx_cur, d);
+            desc_store(s, ch, dma->tx_cur, d);
         } else {
             uint32_t l1 = extract32(d[2], 0, 14);
             uint32_t l2 = extract32(d[2], 16, 14);
@@ -601,10 +615,10 @@ static void tx_process(Tc4xGethState *s, int ch)
                 cic = TDES3_CIC(d[3]);
             }
             l1 = MIN(l1, MAX_FRAME - dma->txlen);
-            dma_rd(d[0], dma->txbuf + dma->txlen, l1);
+            dma_rd(s, ch, d[0], dma->txbuf + dma->txlen, l1);
             dma->txlen += l1;
             l2 = MIN(l2, MAX_FRAME - dma->txlen);
-            dma_rd(d[1], dma->txbuf + dma->txlen, l2);
+            dma_rd(s, ch, d[1], dma->txbuf + dma->txlen, l2);
             dma->txlen += l2;
             chset(s, ch, CH_CUR_TXBUF, d[0]);
 
@@ -633,7 +647,7 @@ static void tx_process(Tc4xGethState *s, int ch)
                 status |= ST_TI;
             }
             d[3] &= ~DES3_OWN;
-            desc_store(dma->tx_cur, d);
+            desc_store(s, ch, dma->tx_cur, d);
         }
         dma->tx_cur = desc_next(s, ch, dma->tx_cur, true);
     }
@@ -745,7 +759,7 @@ static bool rx_deliver(Tc4xGethState *s, int p, int ch, const uint8_t *buf,
     need = DIV_ROUND_UP(len, bufsz) + (ts ? 1 : 0);
     cur = dma->rx_cur;
     for (unsigned i = 0; i < need; i++) {
-        desc_load(cur, d);
+        desc_load(s, ch, cur, d);
         if (!(d[3] & DES3_OWN)) {
             ch_status(s, ch, ST_RBU);
             return false;
@@ -757,8 +771,8 @@ static bool rx_deliver(Tc4xGethState *s, int p, int ch, const uint8_t *buf,
         unsigned chunk = MIN(bufsz, len - off);
         uint32_t wb3;
 
-        desc_load(dma->rx_cur, d);
-        dma_wr(d[0], buf + off, chunk);
+        desc_load(s, ch, dma->rx_cur, d);
+        dma_wr(s, ch, d[0], buf + off, chunk);
         chset(s, ch, CH_CUR_RXBUF, d[0]);
         if (d[3] & RDES3_IOC) {
             status |= ST_RI;
@@ -777,7 +791,7 @@ static bool rx_deliver(Tc4xGethState *s, int p, int ch, const uint8_t *buf,
         d[1] = (off == len && ts) ? RDES1_TSA : 0;
         d[2] = 0;
         d[3] = wb3;
-        desc_store(dma->rx_cur, d);
+        desc_store(s, ch, dma->rx_cur, d);
         dma->rx_cur = desc_next(s, ch, dma->rx_cur, false);
     }
     if (ts) {
@@ -788,7 +802,7 @@ static bool rx_deliver(Tc4xGethState *s, int p, int ch, const uint8_t *buf,
         d[1] = sec;
         d[2] = 0;
         d[3] = DES3_CTXT | RDES3_CTX_TSA;
-        desc_store(dma->rx_cur, d);
+        desc_store(s, ch, dma->rx_cur, d);
         dma->rx_cur = desc_next(s, ch, dma->rx_cur, false);
     }
     chset(s, ch, CH_CUR_RXDESC, dma->rx_cur);
@@ -948,7 +962,7 @@ static void geth_dma_ch_write(Tc4xGethState *s, int ch, uint32_t r,
         if (!(val & (ST_TI | ST_RI))) {
             val &= ~ST_NIS;
         }
-        if (!(val & (ST_TBU | ST_RBU))) {
+        if (!(val & ST_ABNORMAL)) {
             val &= ~ST_AIS;
         }
         chset(s, ch, r, val);
@@ -983,7 +997,7 @@ static void geth_dma_ch_write(Tc4xGethState *s, int ch, uint32_t r,
          */
         val = chreg(s, ch, CH_STATUS) & ~ST_RBU;
         chset(s, ch, CH_STATUS,
-              (val & (ST_TBU | ST_RBU)) ? val : (val & ~ST_AIS));
+              (val & ST_ABNORMAL) ? val : (val & ~ST_AIS));
         geth_update_irq(s);
         rx_kick(s);
         break;
@@ -1093,13 +1107,18 @@ static bool geth_read_is_ts_status(uint32_t off, int *p)
     return true;
 }
 
-static uint64_t geth_read(void *opaque, hwaddr addr, unsigned size)
+static MemTxResult geth_read(void *opaque, hwaddr addr, uint64_t *data,
+                             unsigned size, MemTxAttrs attrs)
 {
     Tc4xGethState *s = opaque;
     uint32_t off = addr & ~3u;
     uint32_t word;
     int p;
 
+    if (tc4x_master_refused(attrs, "tc4x-geth", TC4X_GETH_BASE + addr,
+                            false)) {
+        return MEMTX_ERROR;
+    }
     if (geth_read_is_plain(off)) {
         word = greg(s, off);
     } else if (geth_read_is_ts_status(off, &p)) {
@@ -1108,15 +1127,20 @@ static uint64_t geth_read(void *opaque, hwaddr addr, unsigned size)
         BQL_LOCK_GUARD();
         word = geth_read_word(s, off);
     }
-    return extract32(word, (addr & 3) * 8, size * 8);
+    *data = extract32(word, (addr & 3) * 8, size * 8);
+    return MEMTX_OK;
 }
 
-static void geth_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+static MemTxResult geth_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size, MemTxAttrs attrs)
 {
     Tc4xGethState *s = opaque;
     uint32_t off = addr & ~3u;
     uint32_t word = val;
 
+    if (tc4x_master_refused(attrs, "tc4x-geth", TC4X_GETH_BASE + addr, true)) {
+        return MEMTX_ERROR;
+    }
     BQL_LOCK_GUARD();
     if (size < 4) {
         /* the bytes not written clear no channel status bits */
@@ -1127,11 +1151,12 @@ static void geth_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                          val);
     }
     geth_write_word(s, off, word);
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps geth_ops = {
-    .read = geth_read,
-    .write = geth_write,
+    .read_with_attrs = geth_read,
+    .write_with_attrs = geth_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 8 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
@@ -1197,29 +1222,39 @@ static void hsphy_write_word(Tc4xGethState *s, uint32_t off, uint32_t val)
     hs_set(s, off, val);
 }
 
-static uint64_t hsphy_read(void *opaque, hwaddr addr, unsigned size)
+static MemTxResult hsphy_read(void *opaque, hwaddr addr, uint64_t *data,
+                              unsigned size, MemTxAttrs attrs)
 {
-    uint32_t word = hsphy_read_word(opaque, addr & ~3u);
-
-    return extract32(word, (addr & 3) * 8, size * 8);
+    if (tc4x_master_refused(attrs, "tc4x-hsphy", TC4X_HSPHY_BASE + addr,
+                            false)) {
+        return MEMTX_ERROR;
+    }
+    *data = extract32(hsphy_read_word(opaque, addr & ~3u), (addr & 3) * 8,
+                      size * 8);
+    return MEMTX_OK;
 }
 
-static void hsphy_write(void *opaque, hwaddr addr, uint64_t val,
-                        unsigned size)
+static MemTxResult hsphy_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size, MemTxAttrs attrs)
 {
     Tc4xGethState *s = opaque;
     uint32_t off = addr & ~3u;
     uint32_t word = val;
 
+    if (tc4x_master_refused(attrs, "tc4x-hsphy", TC4X_HSPHY_BASE + addr,
+                            true)) {
+        return MEMTX_ERROR;
+    }
     if (size < 4) {
         word = deposit32(hs_get(s, off), (addr & 3) * 8, size * 8, val);
     }
     hsphy_write_word(s, off, word);
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps hsphy_ops = {
-    .read = hsphy_read,
-    .write = hsphy_write,
+    .read_with_attrs = hsphy_read,
+    .write_with_attrs = hsphy_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 8 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },

@@ -29,6 +29,7 @@
 #include "migration/vmstate.h"
 #include "hw/tricore/tc4x.h"
 #include "hw/tricore/tc4x_i2c.h"
+#include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_regs.h"
 #include "hw/tricore/tc4x_sfr_store.h"
 #include "tc4x_soc.h"
@@ -329,25 +330,37 @@ static void i2c_reg_write(Tc4xI2c *c, uint32_t off, uint32_t val)
     }
 }
 
-static uint64_t tc4x_i2c_read(void *opaque, hwaddr off, unsigned size)
+static MemTxResult tc4x_i2c_read(void *opaque, hwaddr off, uint64_t *data,
+                                 unsigned size, MemTxAttrs attrs)
 {
     Tc4xI2c *c = opaque;
     uint32_t val;
 
-    if (i2c_reg_read(c, off & ~3u, &val)) {
-        return extract32(val, (off & 3) * 8, size * 8);
+    if (tc4x_master_refused(attrs, "tc4x-i2c", i2c_bases[c->index] + off,
+                            false)) {
+        return MEMTX_ERROR;
     }
-    return tc4x_sfr_store_access_read(c->sfr, i2c_bases[c->index] + off, size);
+    if (i2c_reg_read(c, off & ~3u, &val)) {
+        *data = extract32(val, (off & 3) * 8, size * 8);
+    } else {
+        *data = tc4x_sfr_store_access_read(c->sfr, i2c_bases[c->index] + off,
+                                           size, attrs);
+    }
+    return MEMTX_OK;
 }
 
-static void tc4x_i2c_write(void *opaque, hwaddr off, uint64_t val,
-                           unsigned size)
+static MemTxResult tc4x_i2c_write(void *opaque, hwaddr off, uint64_t val,
+                                  unsigned size, MemTxAttrs attrs)
 {
     Tc4xI2c *c = opaque;
 
+    if (tc4x_master_refused(attrs, "tc4x-i2c", i2c_bases[c->index] + off,
+                            true)) {
+        return MEMTX_ERROR;
+    }
     if (!i2c_serves_write(off & ~3u)) {
         tc4x_sfr_store_access_write(c->sfr, i2c_bases[c->index] + off, val,
-                                    size);
+                                    size, attrs);
     } else if (size != 4 || (off & 3)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "tc4x-i2c%u: %u-byte write at 0x%" HWADDR_PRIx
@@ -355,11 +368,12 @@ static void tc4x_i2c_write(void *opaque, hwaddr off, uint64_t val,
     } else {
         i2c_reg_write(c, off, val);
     }
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps tc4x_i2c_ops = {
-    .read = tc4x_i2c_read,
-    .write = tc4x_i2c_write,
+    .read_with_attrs = tc4x_i2c_read,
+    .write_with_attrs = tc4x_i2c_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },

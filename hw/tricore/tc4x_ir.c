@@ -21,6 +21,7 @@
 #include "migration/vmstate.h"
 #include "cpu.h"
 #include "hw/tricore/tc4x_ir.h"
+#include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_regs.h"
 #include "trace.h"
 
@@ -257,21 +258,32 @@ void tc4x_ir_watch(Tc4xIr *ir, uint32_t src, bool on)
     }
 }
 
-static uint64_t ir_read(void *opaque, hwaddr off, unsigned size)
+static MemTxResult ir_read(void *opaque, hwaddr off, uint64_t *data,
+                           unsigned size, MemTxAttrs attrs)
 {
     Tc4xIr *ir = opaque;
 
-    return extract32(qatomic_read(&ir->src[off / 4]), (off & 3) * 8,
-                     size * 8);
+    if (tc4x_master_refused(attrs, "tc4x-ir", src_addr(off / 4) + (off & 3),
+                            false)) {
+        return MEMTX_ERROR;
+    }
+    *data = extract32(qatomic_read(&ir->src[off / 4]), (off & 3) * 8,
+                      size * 8);
+    return MEMTX_OK;
 }
 
 /* Software writes: the stored bits, then the SETR/CLRR/IOVCLR triggers */
-static void ir_write(void *opaque, hwaddr off, uint64_t val64, unsigned size)
+static MemTxResult ir_write(void *opaque, hwaddr off, uint64_t val64,
+                            unsigned size, MemTxAttrs attrs)
 {
     Tc4xIr *ir = opaque;
     unsigned n = off / 4;
     uint32_t val, v;
 
+    if (tc4x_master_refused(attrs, "tc4x-ir", src_addr(n) + (off & 3),
+                            true)) {
+        return MEMTX_ERROR;
+    }
     BQL_LOCK_GUARD();
     val = deposit32(qatomic_read(&ir->src[n]), (off & 3) * 8, size * 8,
                     val64);
@@ -292,11 +304,12 @@ static void ir_write(void *opaque, hwaddr off, uint64_t val64, unsigned size)
     } else {
         ir_update(ir);
     }
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps ir_ops = {
-    .read = ir_read,
-    .write = ir_write,
+    .read_with_attrs = ir_read,
+    .write_with_attrs = ir_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
