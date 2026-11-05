@@ -462,6 +462,55 @@ static void test_disable_releases(void)
     fake_free(f);
 }
 
+/*
+ * A fixed pacer keeps the grid but leaves guest time alone: no barrier,
+ * hold or scale request, and an untaken tick merges with the next
+ */
+static void test_fixed(void)
+{
+    Fake *f = g_new0(Fake, 1);
+
+    f->barrier = INT64_MAX;
+    f->scale = 1;
+    f->driven = true;
+    for (int t = 0; t < TC4X_PACER_TIMERS; t++) {
+        f->timer[t] = NO_TIMER;
+    }
+    f->take_at_once = true;
+    f->p = tc4x_pacer_create(&fake_host, f, &config, &model_ops, f);
+    tc4x_pacer_set_fixed(f->p);
+    tc4x_pacer_set_scale(f->p, 10, true, 1.0);
+    tc4x_pacer_set_enabled(f->p, true);
+    f->sample = true;
+    first_tick(f);
+    for (int k = 0; k < 2 * WINDOW; k++) {
+        g_assert_cmpint(f->timer[TC4X_PACER_TIMER_TICK], ==,
+                        T0 + k * PERIOD_NS);
+        g_assert_cmpint(f->timer[TC4X_PACER_TIMER_CHECK], ==, NO_TIMER);
+        fire_until(f, TC4X_PACER_TIMER_TICK);
+        g_assert_cmpint(f->barrier, ==, INT64_MAX);
+        g_assert_cmpuint(f->scale, ==, 1);
+    }
+    tc4x_pacer_urgent(f->p);
+    f->pending[2] = true;
+    tc4x_pacer_hold(f->p);
+    g_assert_cmpuint(f->scale, ==, 1);
+    g_assert_cmpint(f->timer[TC4X_PACER_TIMER_HOLD], ==, NO_TIMER);
+    g_assert_cmpint(stats(f).merged, ==, 0);
+
+    f->take_at_once = false;
+    fire_until(f, TC4X_PACER_TIMER_TICK);
+    fire_until(f, TC4X_PACER_TIMER_TICK);
+    g_assert_cmpint(f->stepped_to, ==, T0 + (2 * WINDOW + 1) * PERIOD_NS);
+    g_assert_cmpint(stats(f).merged, ==, 2);
+    g_assert_cmpint(stats(f).holds, ==, 0);
+    g_assert_cmpint(f->barrier, ==, INT64_MAX);
+    g_assert_cmpuint(f->scale, ==, 1);
+    tc4x_pacer_set_enabled(f->p, false);
+    g_assert_cmpuint(f->scale, ==, 1);
+    fake_free(f);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -478,5 +527,6 @@ int main(int argc, char **argv)
                     test_adaptive_step_down);
     g_test_add_func("/tc4x-pacer/src-hold", test_src_hold);
     g_test_add_func("/tc4x-pacer/disable-releases", test_disable_releases);
+    g_test_add_func("/tc4x-pacer/fixed", test_fixed);
     return g_test_run();
 }

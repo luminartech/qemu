@@ -8,7 +8,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qemu/guest-random.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qobject/qlist.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
@@ -19,6 +21,7 @@
 #include "system/reset.h"
 #include "system/address-spaces.h"
 #include "system/hostmem.h"
+#include "exec/icount.h"
 #include "system/blockdev.h"
 #include "system/block-backend.h"
 #include "chardev/char.h"
@@ -209,6 +212,38 @@ static void tc4x_add_sim_bridge(Tc4xMachineState *m)
     m->sim_bridge = TC4X_SIM_BRIDGE(dev);
 }
 
+/*
+ * Deterministic mode: guest time and every device event follow the
+ * instruction count, which is the same in every run only with a fixed
+ * icount shift and no real-time sleep of idle CPUs (-icount also makes
+ * TCG single-threaded); guest random numbers, which board devices draw
+ * with qemu_guest_getrandom(), then come from -seed.
+ */
+static bool tc4x_check_deterministic(Tc4xMachineState *m, Error **errp)
+{
+    if (m->time_scale < 1) {
+        error_setg(errp, "tc4x: time-scale must be at least 1");
+        return false;
+    }
+    if (!m->deterministic) {
+        if (m->time_scale != 1) {
+            error_setg(errp, "tc4x: time-scale needs deterministic=on");
+            return false;
+        }
+        return true;
+    }
+    if (icount_enabled() != ICOUNT_PRECISE || icount_sleep_enabled()) {
+        error_setg(errp, "tc4x: deterministic=on needs "
+                   "-icount shift=N,sleep=off");
+        return false;
+    }
+    if (!qemu_guest_random_seeded()) {
+        error_setg(errp, "tc4x: deterministic=on needs -seed");
+        return false;
+    }
+    return true;
+}
+
 static void tc4x_init(MachineState *ms)
 {
     Tc4xMachineState *m = TC4X_MACHINE(ms);
@@ -217,6 +252,7 @@ static void tc4x_init(MachineState *ms)
     DeviceState *dev;
     QList *straps;
 
+    tc4x_check_deterministic(m, &error_fatal);
     assert(m->board_name || tmc->board);
     m->board = tc4x_board_create(m->board_name ? m->board_name : tmc->board);
     object_property_add_child(OBJECT(ms), "tc4x-board", OBJECT(m->board));
@@ -230,6 +266,8 @@ static void tc4x_init(MachineState *ms)
     qdev_prop_set_uint32(dev, "console", bc->console);
     qdev_prop_set_chr(dev, "console-chardev", serial_hd(0));
     qdev_prop_set_bit(dev, "imprecise-io", m->imprecise_io);
+    qdev_prop_set_bit(dev, "deterministic", m->deterministic);
+    qdev_prop_set_uint32(dev, "time-scale", m->time_scale);
     straps = qlist_new();
     for (unsigned i = 0; i < bc->n_inputs; i++) {
         const Tc4xBoardInput *in = &bc->inputs[i];
@@ -360,6 +398,33 @@ static void tc4x_set_imprecise_io(Object *obj, bool value, Error **errp)
     TC4X_MACHINE(obj)->imprecise_io = value;
 }
 
+static bool tc4x_get_deterministic(Object *obj, Error **errp)
+{
+    return TC4X_MACHINE(obj)->deterministic;
+}
+
+static void tc4x_set_deterministic(Object *obj, bool value, Error **errp)
+{
+    TC4X_MACHINE(obj)->deterministic = value;
+}
+
+static void tc4x_get_time_scale(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    visit_type_uint32(v, name, &TC4X_MACHINE(obj)->time_scale, errp);
+}
+
+static void tc4x_set_time_scale(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    visit_type_uint32(v, name, &TC4X_MACHINE(obj)->time_scale, errp);
+}
+
+static void tc4x_machine_instance_init(Object *obj)
+{
+    TC4X_MACHINE(obj)->time_scale = 1;
+}
+
 static void tc4x_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -393,6 +458,21 @@ static void tc4x_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "imprecise-io",
         "SFR accesses take effect at the next TB instead of the next "
         "instruction: faster, not instruction-precise (default off)");
+
+    object_class_property_add_bool(oc, "deterministic",
+                                   tc4x_get_deterministic,
+                                   tc4x_set_deterministic);
+    object_class_property_set_description(oc, "deterministic",
+        "Guest time and device events follow the instruction count, so "
+        "runs repeat exactly; needs -icount shift=N,sleep=off, "
+        "-accel tcg,thread=single and -seed (default off)");
+
+    object_class_property_add(oc, "time-scale", "uint32",
+                              tc4x_get_time_scale, tc4x_set_time_scale,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "time-scale",
+        "With deterministic=on: guest time runs at 1/time-scale of "
+        "QEMU_CLOCK_VIRTUAL, fixed (default 1)");
 
     mc->init = tc4x_init;
     mc->reset = tc4x_reset;
@@ -429,6 +509,7 @@ static const TypeInfo tc4x_machine_types[] = {
         .parent = TYPE_MACHINE,
         .abstract = true,
         .instance_size = sizeof(Tc4xMachineState),
+        .instance_init = tc4x_machine_instance_init,
         .class_size = sizeof(Tc4xMachineClass),
         .class_init = tc4x_machine_class_init,
     }, {

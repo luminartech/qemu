@@ -39,6 +39,8 @@ struct Tc4xMachineState {
     char *shm_dir;
     char *flash_dir;
     bool imprecise_io;
+    bool deterministic;
+    uint32_t time_scale;
 };
 
 #endif

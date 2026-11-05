@@ -9,6 +9,11 @@
  * time reaches its deadline: it is re-armed whenever the scale changes or
  * guest time resumes from the barrier.
  *
+ * With property "deterministic", guest time runs at the fixed 1/time-scale
+ * of QEMU_CLOCK_VIRTUAL (a function of the instruction count under
+ * -icount): requests and the sim bridge's timescale do not change it, and
+ * pacers are fixed (tc4x_pacer_set_fixed()), so there is no barrier.
+ *
  * sysbus MMIO regions 0..6: the first page of the SFRs of CPU n, which
  * starts with its STM; region 7: the first page of eGTM cluster 0, which
  * holds TBU channel 0.  The pages serve the STM count (CPUn_STM_ABS) and
@@ -53,7 +58,8 @@ uint32_t tc4x_timebase_scale(Tc4xTimebase *tb);
 
 /*
  * One client's request for the guest time scale: guest time runs at the
- * largest scale requested.  A new request asks for scale 1.
+ * largest scale requested (deterministic: at time-scale regardless).  A new
+ * request asks for scale 1.
  */
 typedef struct Tc4xTimeRequest Tc4xTimeRequest;
 Tc4xTimeRequest *tc4x_timebase_new_request(Tc4xTimebase *tb);

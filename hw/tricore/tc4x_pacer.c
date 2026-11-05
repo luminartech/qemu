@@ -24,6 +24,7 @@ struct Tc4xPacer {
     void *opaque;
 
     bool enabled;
+    bool fixed;             /* tc4x_pacer_set_fixed(): guest time untouched */
     bool driven;
     int64_t tick_due;       /* guest time of the next tick (0: none) */
     int64_t check_due;      /* half-period check of the last one (0: none) */
@@ -64,7 +65,9 @@ static int64_t host_ns_for_guest(Tc4xPacer *p, int64_t ns)
 
 static void barrier(Tc4xPacer *p, int64_t ns)
 {
-    p->host->barrier(p->host_opaque, ns);
+    if (!p->fixed) {
+        p->host->barrier(p->host_opaque, ns);
+    }
 }
 
 static void timer_set(Tc4xPacer *p, Tc4xPacerTimer t, int64_t ns)
@@ -117,6 +120,9 @@ static void apply_scale(Tc4xPacer *p)
 {
     uint32_t applied = driven_scale(p);
 
+    if (p->fixed) {
+        return;
+    }
     if (p->src_hold) {
         applied = MAX(applied, p->tune.src_hold_scale);
     }
@@ -173,7 +179,8 @@ static void src_hold_end(Tc4xPacer *p)
 
 void tc4x_pacer_hold(Tc4xPacer *p)
 {
-    if (!p->adaptive || p->src_hold || !pending(p, p->cfg.hold_src)) {
+    if (p->fixed || !p->adaptive || p->src_hold ||
+        !pending(p, p->cfg.hold_src)) {
         return;
     }
     p->src_hold = true;
@@ -225,7 +232,7 @@ static void check(Tc4xPacer *p)
 
 void tc4x_pacer_urgent(Tc4xPacer *p)
 {
-    if (!p->adaptive || !p->driven ||
+    if (p->fixed || !p->adaptive || !p->driven ||
         p->stats.ticks - p->last_bump_tick < p->tune.urgent_ticks) {
         return;
     }
@@ -244,7 +251,7 @@ void tc4x_pacer_sample(Tc4xPacer *p)
     uint32_t next = p->live_scale;
 
     p->tick_was_held = false;
-    if (!p->adaptive || !p->driven) {
+    if (p->fixed || !p->adaptive || !p->driven) {
         return;
     }
     p->window_holds += held;
@@ -273,13 +280,15 @@ void tc4x_pacer_sample(Tc4xPacer *p)
 void tc4x_pacer_raise(Tc4xPacer *p, uint32_t src)
 {
     p->host->raise(p->host_opaque, src);
-    p->check_due = p->tick_now + p->cfg.check_ns;
+    if (!p->fixed) {
+        p->check_due = p->tick_now + p->cfg.check_ns;
+    }
 }
 
 static void set_driven(Tc4xPacer *p, bool driven)
 {
     p->driven = driven;
-    if (p->floor_scale <= 1) {
+    if (p->fixed || p->floor_scale <= 1) {
         return;
     }
     if (driven) {
@@ -328,7 +337,7 @@ static void tick(Tc4xPacer *p)
      * with interrupts masked merges after hold_max_ns.  This also covers a
      * tick raised late, whose half-period check falls after the next slot.
      */
-    if (tick_owed(p) &&
+    if (!p->fixed && tick_owed(p) &&
         (!p->tick_hold || host_now - p->hold_host_ns < p->tune.hold_max_ns)) {
         if (!p->tick_hold) {
             tick_hold_start(p);
@@ -409,7 +418,7 @@ void tc4x_pacer_set_enabled(Tc4xPacer *p, bool enabled)
         barrier(p, INT64_MAX);
         if (p->driven) {
             p->driven = false;
-            if (p->floor_scale > 1) {
+            if (!p->fixed && p->floor_scale > 1) {
                 p->host->request_scale(p->host_opaque, p->idle_scale);
             }
         }
@@ -417,6 +426,12 @@ void tc4x_pacer_set_enabled(Tc4xPacer *p, bool enabled)
         p->check_due = 0;
     }
     schedule(p);
+}
+
+void tc4x_pacer_set_fixed(Tc4xPacer *p)
+{
+    assert(!p->enabled);
+    p->fixed = true;
 }
 
 void tc4x_pacer_set_scale(Tc4xPacer *p, uint32_t scale, bool adaptive,

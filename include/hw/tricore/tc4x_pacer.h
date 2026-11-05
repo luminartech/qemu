@@ -21,6 +21,11 @@
  * While board code reports itself idle, ticks come at idle_period_ns and
  * guest time is neither stopped nor slowed.
  *
+ * A fixed pacer (deterministic machines, where guest time is a function of
+ * the instruction count) only raises the interrupts on the grid: it never
+ * stops, holds or rescales guest time, and a tick the core has not taken
+ * merges with the next, as on hardware.
+ *
  * The pacer reaches time, interrupts and timers only through Tc4xPacerHost,
  * so tests can bind it to a fake host.  Everything runs in the main loop
  * under the BQL.
@@ -141,6 +146,12 @@ Tc4xPacer *tc4x_pacer_create(const Tc4xPacerHost *host, void *host_opaque,
  * barrier, hold or raised scale.
  */
 void tc4x_pacer_set_enabled(Tc4xPacer *p, bool enabled);
+
+/*
+ * Leave guest time alone (see above); before the pacer is first enabled.
+ * tc4x_pacer_set_scale() then only sets what tc4x_pacer_stats() reports.
+ */
+void tc4x_pacer_set_fixed(Tc4xPacer *p);
 
 /*
  * Guest time scale while driven: @scale fixed, or with @adaptive the floor

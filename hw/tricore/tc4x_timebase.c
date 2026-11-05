@@ -104,6 +104,8 @@ struct Tc4xTimebase {
     Tc4xIr *ir;
     TriCoreCPU *cpu[TC4X_TIMEBASE_NUM_CPUS];
     bool imprecise_io;
+    bool deterministic;     /* scale fixed at time_scale, no pacing */
+    uint32_t time_scale;
 
     Tc4xTimebasePage stm_page[TC4X_TIMEBASE_NUM_CPUS];
     Tc4xTimebasePage tbu_page;
@@ -304,6 +306,9 @@ void tc4x_timebase_request(Tc4xTimebase *tb, Tc4xTimeRequest *r,
     uint32_t eff = 1;
 
     r->scale = MAX(1, scale);
+    if (tb->deterministic) {
+        return;
+    }
     for (guint i = 0; i < tb->requests->len; i++) {
         Tc4xTimeRequest *q = g_ptr_array_index(tb->requests, i);
 
@@ -377,6 +382,8 @@ static void stm_fire(void *opaque)
     bool os = t->cmp ? FIELD_EX32(icr, CPU_STM_ICR, CMP1OS) :
                        FIELD_EX32(icr, CPU_STM_ICR, CMP0OS);
 
+    trace_tc4x_timebase_stm_match(t->cpu, t->vm, t->cmp,
+                                  tc4x_timebase_ns(tb));
     tc4x_sfr_store_set(tb->sfr, isr_addr,
                        tc4x_sfr_store_get(tb->sfr, isr_addr) | BIT(t->cmp));
     t->fired = true;
@@ -665,6 +672,9 @@ Tc4xPacer *tc4x_timebase_new_pacer(Tc4xTimebase *tb,
     timer_init_ns(&tp->timer[TC4X_PACER_TIMER_HOLD], QEMU_CLOCK_VIRTUAL,
                   pacer_hold_timer, tp);
     tp->pacer = tc4x_pacer_create(&pacer_host, tp, cfg, ops, opaque);
+    if (tb->deterministic) {
+        tc4x_pacer_set_fixed(tp->pacer);
+    }
     for (unsigned i = 0; i < cfg->n_srcs; i++) {
         tc4x_ir_add_ack_listener(tb->ir, cfg->srcs[i], pacer_acked, tp);
     }
@@ -777,6 +787,16 @@ static void tc4x_timebase_realize(DeviceState *dev, Error **errp)
             return;
         }
     }
+    if (tb->time_scale < 1) {
+        error_setg(errp, "tc4x-timebase: time-scale must be at least 1");
+        return;
+    }
+    if (tb->deterministic) {
+        tb->scale = tb->time_scale;
+    } else if (tb->time_scale != 1) {
+        error_setg(errp, "tc4x-timebase: time-scale needs deterministic=on");
+        return;
+    }
     for (int c = 0; c < TC4X_TIMEBASE_NUM_CPUS; c++) {
         timebase_enable_page(tb, &tb->stm_page[c], stm_page_serves);
     }
@@ -785,6 +805,8 @@ static void tc4x_timebase_realize(DeviceState *dev, Error **errp)
 
 static const Property tc4x_timebase_properties[] = {
     DEFINE_PROP_BOOL("imprecise-io", Tc4xTimebase, imprecise_io, false),
+    DEFINE_PROP_BOOL("deterministic", Tc4xTimebase, deterministic, false),
+    DEFINE_PROP_UINT32("time-scale", Tc4xTimebase, time_scale, 1),
     DEFINE_PROP_LINK("sfr-store", Tc4xTimebase, sfr, TYPE_TC4X_SFR_STORE,
                      Tc4xSfrStore *),
     DEFINE_PROP_LINK("ir", Tc4xTimebase, ir, TYPE_TC4X_IR, Tc4xIr *),
@@ -818,6 +840,11 @@ static bool tc4x_timebase_sim_run(Tc4xSimCommands *obj, int argc,
 
     if (argc != 2 || !tc4x_sim_parse_uint(argv[1], UINT32_MAX, &scale)) {
         g_string_append(out, "err usage: timescale N\n");
+        return true;
+    }
+    if (tb->deterministic) {
+        g_string_append_printf(out, "err timescale is fixed at %u in "
+                               "deterministic mode\n", tb->scale);
         return true;
     }
     if (!tb->sim_request) {

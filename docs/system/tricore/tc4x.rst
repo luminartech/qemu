@@ -123,6 +123,15 @@ Machine properties:
   loops, but no longer instruction-precise; off by default, and icount
   keeps the precise behaviour.
 
+``deterministic=on``
+  Runs repeat exactly (see `Deterministic mode`_).  Needs
+  ``-icount shift=N,sleep=off``, ``-accel tcg,thread=single`` and
+  ``-seed``; QEMU refuses to start without them.
+
+``time-scale=N``
+  With ``deterministic=on``: guest time runs at 1/N of QEMU virtual time,
+  fixed (default 1).
+
 The SoC is the device ``tc4x-soc``, the machine's child ``soc``.  Its
 properties ``lmu-memdev`` and ``core0-memdev`` .. ``core6-memdev`` take
 the LMU (64 MiB) and the scratchpad RAMs of a core (2 MiB) from a memory
@@ -181,6 +190,7 @@ The devices serve:
 ``cores``                      per-core PC, state, ICR and some registers
 ``hot [MIN]``                  SFRs read at least MIN times since last asked
 ``timescale N``                request guest time at 1/N of virtual time
+                               (refused with ``deterministic=on``)
 ``adc K CH VOLTS``             set a TMADC pin voltage
 ``gpio PORT PIN 0|1|release``  drive or release an input
 ``button press|release``       the kit's user button
@@ -251,6 +261,32 @@ time at the next slot until the main loop raised it, and holds guest time
 (at a large scale) while a raised interrupt is still pending, so that no
 two periods merge into one interrupt.  Its logic is covered by
 ``tests/unit/test-tc4x-pacer.c``.
+
+Deterministic mode
+------------------
+
+With ``deterministic=on`` the guest-visible results of a run depend only on
+the command line, the images and the inputs:
+
+- Guest time is QEMU virtual time divided by the fixed ``time-scale``, and
+  with ``-icount shift=N,sleep=off`` virtual time is the instruction count
+  times 2^N ns (idle CPUs skip ahead to the next timer).  One TCG thread
+  runs the CPUs in turn, so 7 busy cores share the count.
+- Requests for another scale (``timescale``) are refused or ignored, and
+  pacers only raise their interrupts on the grid: they neither stop nor
+  slow guest time, and a period the core has not taken merges with the
+  next, as on silicon.
+- Device timers are QEMU_CLOCK_VIRTUAL timers, which -icount runs at a
+  fixed instruction count; work that the default mode hands to the main
+  loop (DMA jobs started without the BQL, interrupt acknowledge listeners)
+  runs from such a timer due at once.
+- Guest random numbers come from ``qemu_guest_getrandom`` seeded by
+  ``-seed``.
+
+Not covered: input from outside (console and sim-bridge commands, network
+frames) arrives at host time; an external model that must answer a guest
+write at a fixed point watches it with ``watch ADDR sync`` and acknowledges
+it.  It runs several times slower than the default multi-threaded mode.
 
 Hot paths without the BQL
 -------------------------

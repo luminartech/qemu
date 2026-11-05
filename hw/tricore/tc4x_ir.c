@@ -44,14 +44,17 @@ typedef struct Tc4xIrAckListener {
  * BQL, and service requests come from any thread, so src (written),
  * pending, cpu_prio and acked are under lock; src is read atomically
  * without it.  Acknowledges of listened nodes reach their listeners in
- * the main loop (ack_bh).  listeners and cpu are set up during machine
- * init; watched and watched_sync are under the BQL.
+ * the main loop (ack_bh), or with "deterministic" from a QEMU_CLOCK_VIRTUAL
+ * timer due at once, which -icount runs at a fixed instruction count.
+ * listeners and cpu are set up during machine init; watched and
+ * watched_sync are under the BQL.
  */
 struct Tc4xIr {
     SysBusDevice parent_obj;
 
     MemoryRegion mmio;
     bool imprecise_io;
+    bool deterministic;
     TriCoreCPU *cpu[TC4X_IR_NUM_CPUS];
 
     QemuRecMutex lock;
@@ -60,6 +63,7 @@ struct Tc4xIr {
     uint32_t cpu_prio[TC4X_IR_NUM_CPUS];
     GArray *acked;              /* indexes acknowledged since ack_bh */
     QEMUBH *ack_bh;
+    QEMUTimer ack_timer;        /* deterministic: in place of ack_bh */
     Tc4xIrAckListener listeners[TC4X_IR_ACK_LISTENERS_MAX];
     unsigned n_listeners;
 
@@ -235,7 +239,11 @@ static void ir_ack(void *opaque, uint32_t core, uint32_t prio)
                 uint32_t src = src_addr(n);
 
                 g_array_append_val(ir->acked, src);
-                qemu_bh_schedule(ir->ack_bh);
+                if (ir->deterministic) {
+                    timer_mod_ns(&ir->ack_timer, 0);
+                } else {
+                    qemu_bh_schedule(ir->ack_bh);
+                }
             }
             return;
         }
@@ -367,6 +375,7 @@ static void tc4x_ir_realize(DeviceState *dev, Error **errp)
         ir->cpu[c]->irq_ack_opaque = ir;
     }
     ir->ack_bh = qemu_bh_new(ir_ack_bh, ir);
+    timer_init_ns(&ir->ack_timer, QEMU_CLOCK_VIRTUAL, ir_ack_bh, ir);
     /* SRC reads have no side effects; writes take the BQL */
     memory_region_enable_lockless_io(&ir->mmio);
     memory_region_set_imprecise_io(&ir->mmio, ir->imprecise_io);
@@ -374,6 +383,7 @@ static void tc4x_ir_realize(DeviceState *dev, Error **errp)
 
 static const Property tc4x_ir_properties[] = {
     DEFINE_PROP_BOOL("imprecise-io", Tc4xIr, imprecise_io, false),
+    DEFINE_PROP_BOOL("deterministic", Tc4xIr, deterministic, false),
     DEFINE_PROP_LINK("cpu0", Tc4xIr, cpu[0], TYPE_TRICORE_CPU, TriCoreCPU *),
     DEFINE_PROP_LINK("cpu1", Tc4xIr, cpu[1], TYPE_TRICORE_CPU, TriCoreCPU *),
     DEFINE_PROP_LINK("cpu2", Tc4xIr, cpu[2], TYPE_TRICORE_CPU, TriCoreCPU *),

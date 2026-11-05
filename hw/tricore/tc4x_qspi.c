@@ -65,10 +65,16 @@ struct Tc4xQspi {
     Tc4xIr *ir;
     uint32_t index;
     bool imprecise_io;
+    bool deterministic;
     const Tc4xQspiDmaOps *dma;
     void *dma_opaque;
-    /* DMA jobs run under the BQL: kicks from writes without it wait here */
+    /*
+     * DMA jobs run under the BQL: kicks from writes without it wait here,
+     * or with "deterministic" in a QEMU_CLOCK_VIRTUAL timer due at once,
+     * which -icount runs at a fixed instruction count
+     */
     QEMUBH *kick_bh;
+    QEMUTimer kick_timer;
 
     /* the bus lock */
     QemuRecMutex lock;
@@ -180,7 +186,12 @@ static void qspi_dma_kick(Tc4xQspi *q)
         return;     /* written by the transmit list itself / fed by a board */
     }
     if (!bql_locked()) {
-        if (qspi_dma_armed(q)) {
+        if (!qspi_dma_armed(q)) {
+            return;
+        }
+        if (q->deterministic) {
+            timer_mod_ns(&q->kick_timer, 0);
+        } else {
             qemu_bh_schedule(q->kick_bh);
         }
         return;
@@ -525,6 +536,7 @@ static void tc4x_qspi_realize(DeviceState *dev, Error **errp)
     tc4x_sfr_store_add_passthrough(q->sfr, &q->mmio, tc4x_qspi_serves, q);
     q->kick_bh = qemu_bh_new_guarded(qspi_kick_bh, q,
                                      &dev->mem_reentrancy_guard);
+    timer_init_ns(&q->kick_timer, QEMU_CLOCK_VIRTUAL, qspi_kick_bh, q);
 }
 
 static void tc4x_qspi_unrealize(DeviceState *dev)
@@ -532,11 +544,13 @@ static void tc4x_qspi_unrealize(DeviceState *dev)
     Tc4xQspi *q = TC4X_QSPI(dev);
 
     qemu_bh_delete(q->kick_bh);
+    timer_del(&q->kick_timer);
 }
 
 static const Property tc4x_qspi_properties[] = {
     DEFINE_PROP_UINT32("index", Tc4xQspi, index, UINT32_MAX),
     DEFINE_PROP_BOOL("imprecise-io", Tc4xQspi, imprecise_io, false),
+    DEFINE_PROP_BOOL("deterministic", Tc4xQspi, deterministic, false),
     DEFINE_PROP_LINK("sfr-store", Tc4xQspi, sfr, TYPE_TC4X_SFR_STORE,
                      Tc4xSfrStore *),
     DEFINE_PROP_LINK("ir", Tc4xQspi, ir, TYPE_TC4X_IR, Tc4xIr *),

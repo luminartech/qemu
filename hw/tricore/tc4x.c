@@ -233,6 +233,8 @@ struct Tc4xSoc {
     uint32_t boot_pc_board;     /* this reset's start address from the board */
     bool boot_hold;             /* this reset leaves core 0 halted */
     bool imprecise_io;      /* SFR accesses skip the TCG I/O rewind */
+    bool deterministic;     /* guest time from the instruction count */
+    uint32_t time_scale;    /* deterministic: the fixed guest time scale */
     uint32_t num_port_straps;
     uint32_t *port_straps;  /* TC4X_PORTS_STRAP() entries */
 };
@@ -1432,6 +1434,7 @@ static bool tc4x_soc_add_ir(Tc4xSoc *s, Error **errp)
 
     object_property_add_child(OBJECT(s), "ir", OBJECT(dev));
     qdev_prop_set_bit(dev, "imprecise-io", s->imprecise_io);
+    qdev_prop_set_bit(dev, "deterministic", s->deterministic);
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         g_autofree char *name = g_strdup_printf("cpu%d", c);
 
@@ -1458,6 +1461,8 @@ static bool tc4x_soc_add_timebase(Tc4xSoc *s, Error **errp)
 
     object_property_add_child(OBJECT(s), "timebase", OBJECT(dev));
     qdev_prop_set_bit(dev, "imprecise-io", s->imprecise_io);
+    qdev_prop_set_bit(dev, "deterministic", s->deterministic);
+    qdev_prop_set_uint32(dev, "time-scale", s->time_scale);
     object_property_set_link(OBJECT(dev), "sfr-store", OBJECT(s->sfr),
                              &error_abort);
     object_property_set_link(OBJECT(dev), "ir", OBJECT(s->ir), &error_abort);
@@ -1522,6 +1527,7 @@ static bool tc4x_soc_add_qspi(Tc4xSoc *s, Error **errp)
         object_property_add_child(OBJECT(s), name, OBJECT(dev));
         qdev_prop_set_uint32(dev, "index", n);
         qdev_prop_set_bit(dev, "imprecise-io", s->imprecise_io);
+        qdev_prop_set_bit(dev, "deterministic", s->deterministic);
         object_property_set_link(OBJECT(dev), "sfr-store", OBJECT(s->sfr),
                                  &error_abort);
         object_property_set_link(OBJECT(dev), "ir", OBJECT(s->ir),
@@ -1699,6 +1705,8 @@ static const Property tc4x_soc_properties[] = {
     DEFINE_PROP_UINT32("console", Tc4xSoc, console, 0),
     DEFINE_PROP_CHR("console-chardev", Tc4xSoc, uart),
     DEFINE_PROP_BOOL("imprecise-io", Tc4xSoc, imprecise_io, false),
+    DEFINE_PROP_BOOL("deterministic", Tc4xSoc, deterministic, false),
+    DEFINE_PROP_UINT32("time-scale", Tc4xSoc, time_scale, 1),
     DEFINE_PROP_ARRAY("port-straps", Tc4xSoc, num_port_straps, port_straps,
                       qdev_prop_uint32, uint32_t),
     DEFINE_PROP_LINK("lmu-memdev", Tc4xSoc, lmu_memdev, TYPE_MEMORY_BACKEND,
