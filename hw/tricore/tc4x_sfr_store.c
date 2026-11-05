@@ -72,6 +72,12 @@ typedef struct Tc4xSfrReadHook {
     void *opaque;
 } Tc4xSfrReadHook;
 
+typedef struct Tc4xSfrPassthrough {
+    MemoryRegion *mr;
+    Tc4xSfrServesFn serves;
+    void *opaque;
+} Tc4xSfrPassthrough;
+
 /*
  * Locking: sfr_l1 and the pages are published atomically and read on any
  * thread; values and flags in a page are atomic.  The tables (semantics,
@@ -90,7 +96,7 @@ struct Tc4xSfrStore {
     GHashTable *write_hooks;    /* addr -> Tc4xSfrWriteHook */
     GHashTable *read_hooks;     /* addr -> Tc4xSfrReadHook */
     GHashTable *watches;        /* addr -> Tc4xSimWatch */
-    GPtrArray *passthrough;     /* MemoryRegions that forward to the store */
+    GArray *passthrough;        /* Tc4xSfrPassthrough */
 
     const Tc4xSfrModelOps *models;
     void *models_opaque;
@@ -323,12 +329,26 @@ static void sfr_set_bql_only(Tc4xSfrStore *st, uint32_t addr)
     clear_bit_atomic(sfr_word(addr), pg->plain_write);
 }
 
+/* Whether @sec is a passthrough region at an offset it leaves to the store */
+static bool sfr_passed_through(Tc4xSfrStore *st, MemoryRegionSection *sec)
+{
+    for (guint i = 0; i < st->passthrough->len; i++) {
+        Tc4xSfrPassthrough *pt = &g_array_index(st->passthrough,
+                                                Tc4xSfrPassthrough, i);
+
+        if (pt->mr == sec->mr) {
+            return !pt->serves(pt->opaque, sec->offset_within_region);
+        }
+    }
+    return false;
+}
+
 Object *tc4x_sfr_store_owner(Tc4xSfrStore *st, uint32_t addr)
 {
     MemoryRegionSection sec = memory_region_find(get_system_memory(), addr, 4);
     Object *owner = sec.mr ? memory_region_owner(sec.mr) : NULL;
     bool store = owner == OBJECT(st) ||
-                 (sec.mr && g_ptr_array_find(st->passthrough, sec.mr, NULL));
+                 (sec.mr && sfr_passed_through(st, &sec));
 
     if (sec.mr) {
         memory_region_unref(sec.mr);
@@ -339,9 +359,12 @@ Object *tc4x_sfr_store_owner(Tc4xSfrStore *st, uint32_t addr)
     return owner ? owner : OBJECT(get_system_memory());
 }
 
-void tc4x_sfr_store_add_passthrough(Tc4xSfrStore *st, MemoryRegion *mr)
+void tc4x_sfr_store_add_passthrough(Tc4xSfrStore *st, MemoryRegion *mr,
+                                    Tc4xSfrServesFn serves, void *opaque)
 {
-    g_ptr_array_add(st->passthrough, mr);
+    Tc4xSfrPassthrough pt = { .mr = mr, .serves = serves, .opaque = opaque };
+
+    g_array_append_val(st->passthrough, pt);
 }
 
 /* Guest writes of a watched register take the BQL and report themselves */
@@ -702,7 +725,7 @@ static void tc4x_sfr_store_init(Object *obj)
     }
     st->hook_attrs = MEMTXATTRS_UNSPECIFIED;
     st->semantics = g_hash_table_new(g_direct_hash, g_direct_equal);
-    st->passthrough = g_ptr_array_new();
+    st->passthrough = g_array_new(false, false, sizeof(Tc4xSfrPassthrough));
     st->kresets = g_hash_table_new(g_direct_hash, g_direct_equal);
     st->write_hooks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                             NULL, g_free);

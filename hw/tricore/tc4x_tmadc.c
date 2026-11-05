@@ -270,6 +270,15 @@ static void tmadc_start(Tc4xTmadc *adc, unsigned k)
     }
 }
 
+/* Results and status, which tc4x_tmadc_read() computes */
+static bool tc4x_tmadc_serves(void *opaque, hwaddr off)
+{
+    hwaddr reg = off % TMADC_STRIDE & ~3u;
+
+    return (reg >= TMADC_RES(0) && reg < TMADC_RES_END) ||
+           reg == TMADC_MODSTAT;
+}
+
 static MemTxResult tc4x_tmadc_read(void *opaque, hwaddr off, uint64_t *data,
                                    unsigned size, MemTxAttrs attrs)
 {
@@ -468,7 +477,8 @@ static void tc4x_tmadc_realize(DeviceState *dev, Error **errp)
     }
     memory_region_enable_lockless_io(&adc->mmio);
     memory_region_set_imprecise_io(&adc->mmio, adc->imprecise_io);
-    tc4x_sfr_store_add_passthrough(adc->sfr, &adc->mmio);
+    tc4x_sfr_store_add_passthrough(adc->sfr, &adc->mmio, tc4x_tmadc_serves,
+                                   adc);
 }
 
 static const Property tc4x_tmadc_properties[] = {

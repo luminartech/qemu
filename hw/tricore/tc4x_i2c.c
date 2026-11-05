@@ -294,6 +294,23 @@ static bool i2c_serves_write(uint32_t off)
     }
 }
 
+/* The registers i2c_reg_read() or i2c_reg_write() serve */
+static bool tc4x_i2c_serves(void *opaque, hwaddr off)
+{
+    switch (off & ~3u) {
+    case I2C_REG(RIS):
+    case I2C_REG(MIS):
+    case I2C_REG(PIRQSS):
+    case I2C_REG(ERRIRQSS):
+    case I2C_REG(BUSSTAT):
+    case I2C_REG(RPSSTAT):
+    case I2C_REG(FFSSTAT):
+        return true;
+    default:
+        return i2c_serves_write(off & ~3u);
+    }
+}
+
 /* A word write of a register i2c_serves_write() accepts */
 static void i2c_reg_write(Tc4xI2c *c, uint32_t off, uint32_t val)
 {
@@ -417,7 +434,7 @@ static void tc4x_i2c_realize(DeviceState *dev, Error **errp)
         return;
     }
     memory_region_set_imprecise_io(&c->mmio, c->imprecise_io);
-    tc4x_sfr_store_add_passthrough(c->sfr, &c->mmio);
+    tc4x_sfr_store_add_passthrough(c->sfr, &c->mmio, tc4x_i2c_serves, c);
 }
 
 static const Property tc4x_i2c_properties[] = {

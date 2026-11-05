@@ -177,6 +177,11 @@ static bool ports_serves(hwaddr off)
            off == PORT_OMCR || off == PORT_OMSR || padcfg_pin(off, &pin);
 }
 
+static bool tc4x_ports_serves(void *opaque, hwaddr off)
+{
+    return ports_serves(off % PORT_STRIDE & ~3u);
+}
+
 /* The word at offset @off of port @n, one ports_serves() accepts */
 static uint32_t port_read_word(Tc4xPorts *p, unsigned n, hwaddr off,
                                uint32_t addr)
@@ -500,7 +505,7 @@ static void tc4x_ports_realize(DeviceState *dev, Error **errp)
     }
     memory_region_enable_lockless_io(&p->mmio);
     memory_region_set_imprecise_io(&p->mmio, p->imprecise_io);
-    tc4x_sfr_store_add_passthrough(p->sfr, &p->mmio);
+    tc4x_sfr_store_add_passthrough(p->sfr, &p->mmio, tc4x_ports_serves, p);
 }
 
 static const Property tc4x_ports_properties[] = {

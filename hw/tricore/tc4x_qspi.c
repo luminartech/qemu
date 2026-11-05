@@ -320,6 +320,16 @@ static bool qspi_serves_write(hwaddr off)
            (off >= QSPI_REG(DATAENTRY0) && off < QSPI_REG(RXEXIT0));
 }
 
+/* The registers tc4x_qspi_read() or qspi_write_word() serve */
+static bool tc4x_qspi_serves(void *opaque, hwaddr off)
+{
+    hwaddr word = off & ~3u;
+
+    return word == QSPI_REG(STATUS) ||
+           (word >= QSPI_REG(RXEXIT0) && word < QSPI_REG(RXEXITD)) ||
+           qspi_serves_write(word);
+}
+
 /* A full-word write, under the bus lock */
 static void qspi_write_word(Tc4xQspi *q, hwaddr off, uint32_t val)
 {
@@ -512,7 +522,7 @@ static void tc4x_qspi_realize(DeviceState *dev, Error **errp)
     }
     memory_region_enable_lockless_io(&q->mmio);
     memory_region_set_imprecise_io(&q->mmio, q->imprecise_io);
-    tc4x_sfr_store_add_passthrough(q->sfr, &q->mmio);
+    tc4x_sfr_store_add_passthrough(q->sfr, &q->mmio, tc4x_qspi_serves, q);
     q->kick_bh = qemu_bh_new_guarded(qspi_kick_bh, q,
                                      &dev->mem_reentrancy_guard);
 }

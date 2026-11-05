@@ -735,12 +735,28 @@ static void tc4x_timebase_init(Object *obj)
     }
 }
 
+/*
+ * The time stamps, and the compare view, whose accesses go to the store
+ * words of VM0
+ */
+static bool stm_page_serves(void *opaque, hwaddr off)
+{
+    return (off >= STM_ABS && off < STM_ABS + 8) ||
+           (off >= STM_VIEW && off < STM_VIEW + STM_VM_STRIDE);
+}
+
+static bool tbu_page_serves(void *opaque, hwaddr off)
+{
+    return (off & ~3u) == TBU_CH0 - TBU_PAGE;
+}
+
 /* A page passes the accesses it does not serve to the store */
-static void timebase_enable_page(Tc4xTimebase *tb, Tc4xTimebasePage *pg)
+static void timebase_enable_page(Tc4xTimebase *tb, Tc4xTimebasePage *pg,
+                                 Tc4xSfrServesFn serves)
 {
     memory_region_enable_lockless_io(&pg->mr);
     memory_region_set_imprecise_io(&pg->mr, tb->imprecise_io);
-    tc4x_sfr_store_add_passthrough(tb->sfr, &pg->mr);
+    tc4x_sfr_store_add_passthrough(tb->sfr, &pg->mr, serves, pg);
 }
 
 static void tc4x_timebase_realize(DeviceState *dev, Error **errp)
@@ -762,9 +778,9 @@ static void tc4x_timebase_realize(DeviceState *dev, Error **errp)
         }
     }
     for (int c = 0; c < TC4X_TIMEBASE_NUM_CPUS; c++) {
-        timebase_enable_page(tb, &tb->stm_page[c]);
+        timebase_enable_page(tb, &tb->stm_page[c], stm_page_serves);
     }
-    timebase_enable_page(tb, &tb->tbu_page);
+    timebase_enable_page(tb, &tb->tbu_page, tbu_page_serves);
 }
 
 static const Property tc4x_timebase_properties[] = {

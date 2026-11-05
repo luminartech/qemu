@@ -86,17 +86,22 @@ void tc4x_sfr_store_force(Tc4xSfrStore *st, uint32_t addr, uint32_t value,
                           uint32_t mask);
 
 /*
- * The device whose registers overlay the store at @addr, or NULL when the
- * store serves @addr
+ * The device that serves the register at @addr, or NULL when the store
+ * serves it
  */
 Object *tc4x_sfr_store_owner(Tc4xSfrStore *st, uint32_t addr);
 
+/* Whether a passthrough region serves the register at offset @off itself */
+typedef bool (*Tc4xSfrServesFn)(void *opaque, hwaddr off);
+
 /*
- * @mr, a region of another device over the store, serves some registers
- * itself and passes the other accesses to tc4x_sfr_store_access_read/write:
- * its addresses count as the store's
+ * @mr, a region of another device over the store, serves the registers
+ * @serves accepts (reads or writes of them do not reach the store) and
+ * passes the other accesses to tc4x_sfr_store_access_read/write: those
+ * count as the store's, the served ones as the device's
  */
-void tc4x_sfr_store_add_passthrough(Tc4xSfrStore *st, MemoryRegion *mr);
+void tc4x_sfr_store_add_passthrough(Tc4xSfrStore *st, MemoryRegion *mr,
+                                    Tc4xSfrServesFn serves, void *opaque);
 
 
 /*
