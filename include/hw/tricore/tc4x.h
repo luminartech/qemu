@@ -123,7 +123,11 @@ typedef struct Tc4xI2cSlaveOps {
     void (*stop)(void *opaque);
 } Tc4xI2cSlaveOps;
 
-/* Attach a slave at @addr of I2C@bus, replacing the one there */
+/*
+ * Attach a slave at 7-bit address @addr of I2C@bus (an I2C slave device on
+ * the controller's bus), replacing an attached slave there.  An address
+ * taken by another device ends QEMU with an error.  Machine init only.
+ */
 void tc4x_i2c_attach(Tc4xSoc *soc, unsigned bus, uint8_t addr,
                      const Tc4xI2cSlaveOps *ops, void *opaque);
 

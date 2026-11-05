@@ -13,6 +13,7 @@
 #include "qemu/units.h"
 #include "hw/tricore/tc4x.h"
 #include "hw/tricore/tc4x_board.h"
+#include "hw/tricore/tc4x_i2c.h"
 
 #define TC4X_NUM_CORES      7           /* CPU0..5 and CPUcs (core 6) */
 #define TC4X_CORE_RAM_SIZE  (2 * MiB)       /* DSPR + PSPR (at +1 MiB) */
@@ -29,7 +30,6 @@
 
 typedef struct Tc4xGpio Tc4xGpio;
 typedef struct Tc4xAdc Tc4xAdc;
-typedef struct Tc4xI2c Tc4xI2c;
 
 Tc4xGpio *tc4x_soc_gpio(Tc4xSoc *soc);
 Tc4xTimebase *tc4x_soc_timebase(Tc4xSoc *soc);
@@ -38,7 +38,8 @@ Tc4xTimebase *tc4x_soc_timebase(Tc4xSoc *soc);
 uint32_t tc4x_reg_cmpxchg(Tc4xSoc *soc, uint32_t addr, uint32_t old,
                           uint32_t val);
 Tc4xAdc *tc4x_soc_adc(Tc4xSoc *soc);
-Tc4xI2c *tc4x_soc_i2c(Tc4xSoc *soc);
+/* I2C controller @n (below TC4X_I2C_COUNT) */
+Tc4xI2c *tc4x_soc_i2c(Tc4xSoc *soc, unsigned n);
 
 /* Add register write semantics and kernel resets, replacing earlier ones */
 void tc4x_soc_add_semantics(Tc4xSoc *soc, const Tc4xRegSemantics *sem,
@@ -73,10 +74,5 @@ bool tc4x_gpio_write_lockless(Tc4xGpio *g, uint32_t addr, uint32_t val);
 Tc4xAdc *tc4x_adc_new(Tc4xSoc *soc);
 bool tc4x_adc_read(Tc4xAdc *a, uint32_t addr, uint32_t *val);
 bool tc4x_adc_write(Tc4xAdc *a, uint32_t addr, uint32_t val);
-
-Tc4xI2c *tc4x_i2c_new(Tc4xSoc *soc);
-bool tc4x_i2c_owns(uint32_t addr);
-bool tc4x_i2c_read(Tc4xI2c *c, uint32_t addr, uint32_t *val);
-bool tc4x_i2c_write(Tc4xI2c *c, uint32_t addr, uint32_t val);
 
 #endif

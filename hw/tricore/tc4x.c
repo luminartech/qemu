@@ -328,7 +328,7 @@ struct Tc4xSoc {
 
     Tc4xGpio *gpio;
     Tc4xAdc *adc;
-    Tc4xI2c *i2c;
+    Tc4xI2c *i2c[TC4X_I2C_COUNT];
 
     Tc4xDmuIf dmu_if[2];        /* host, CSRM */
     Tc4xDmuIf *dmu_cur;         /* the interface running a command */
@@ -357,9 +357,9 @@ Tc4xAdc *tc4x_soc_adc(Tc4xSoc *s)
     return s->adc;
 }
 
-Tc4xI2c *tc4x_soc_i2c(Tc4xSoc *s)
+Tc4xI2c *tc4x_soc_i2c(Tc4xSoc *s, unsigned n)
 {
-    return s->i2c;
+    return s->i2c[n];
 }
 
 static uint32_t reg_get(Tc4xSoc *s, uint32_t addr)
@@ -1321,7 +1321,7 @@ static bool soc_read_word(Tc4xSoc *s, uint32_t addr, uint32_t *val)
     int core;
 
     if (tc4x_gpio_read(s->gpio, addr, val) ||
-        tc4x_i2c_read(s->i2c, addr, val) || tc4x_adc_read(s->adc, addr, val)) {
+        tc4x_adc_read(s->adc, addr, val)) {
         /* a pin or bus model */
     } else if (sfr_is_cpu(addr, &core, &off)) {
         if (off == CPU_HRA_CORE_ID || off == CPU_HRHV_CORE_ID) {
@@ -1398,9 +1398,6 @@ static Tc4xSfrPath soc_sfr_read_lockless(void *opaque, uint32_t addr,
     if (tc4x_gpio_read(s->gpio, word, val) ||
         tc4x_adc_read(s->adc, word, val)) {
         return TC4X_SFR_PATH_SERVED;
-    }
-    if (tc4x_i2c_owns(word)) {
-        return TC4X_SFR_PATH_LOCKED;
     }
     if (!qspi_decode(word, &qn, &qoff)) {
         return TC4X_SFR_PATH_STORE;
@@ -1487,7 +1484,6 @@ static bool soc_sfr_write(void *opaque, uint32_t addr, uint32_t *val)
     }
     if (asclin_write(s, addr, *val) || dma_write(s, addr, *val) ||
         tc4x_gpio_write(s->gpio, addr, *val) ||
-        tc4x_i2c_write(s->i2c, addr, *val) ||
         tc4x_adc_write(s->adc, addr, *val)) {
         return true;
     }
@@ -2186,6 +2182,27 @@ static bool tc4x_soc_add_timebase(Tc4xSoc *s, Error **errp)
     return true;
 }
 
+/* The I2C controllers over the store at their kernel registers */
+static bool tc4x_soc_add_i2c(Tc4xSoc *s, Error **errp)
+{
+    for (unsigned n = 0; n < TC4X_I2C_COUNT; n++) {
+        g_autofree char *name = g_strdup_printf("i2c[%u]", n);
+        DeviceState *dev = qdev_new(TYPE_TC4X_I2C);
+
+        object_property_add_child(OBJECT(s), name, OBJECT(dev));
+        qdev_prop_set_uint32(dev, "index", n);
+        qdev_prop_set_bit(dev, "imprecise-io", s->imprecise_io);
+        object_property_set_link(OBJECT(dev), "sfr-store", OBJECT(s->sfr),
+                                 &error_abort);
+        if (!sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), errp)) {
+            return false;
+        }
+        s->i2c[n] = TC4X_I2C(dev);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, tc4x_i2c_base(n), 0);
+    }
+    return true;
+}
+
 /*
  * The SFR store under the SoC's models.  TOM shadow registers SR0/SR1,
  * which cores rewrite often, are plain storage that GLB_CTRL copies to
@@ -2281,13 +2298,13 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
             return;
         }
     }
-    if (!tc4x_soc_add_ir(s, errp) || !tc4x_soc_add_timebase(s, errp)) {
+    if (!tc4x_soc_add_ir(s, errp) || !tc4x_soc_add_timebase(s, errp) ||
+        !tc4x_soc_add_i2c(s, errp)) {
         return;
     }
     s->bridge_time_request = tc4x_timebase_new_request(s->timebase);
     s->gpio = tc4x_gpio_new(s);
     s->adc = tc4x_adc_new(s);
-    s->i2c = tc4x_i2c_new(s);
     tc4x_force_soc_status(s);
     tc4x_geth_init(s, sysmem);
 

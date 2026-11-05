@@ -17,3 +17,4 @@ config TC4X
     default y
     depends on TRICORE
     select TC4X_GETH
+    select I2C
