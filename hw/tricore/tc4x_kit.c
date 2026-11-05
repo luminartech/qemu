@@ -30,6 +30,7 @@
 #include "hw/tricore/tc4x.h"
 #include "hw/tricore/tc4x_board.h"
 #include "hw/tricore/tc4x_machine.h"
+#include "hw/tricore/tc4x_sim_bridge.h"
 #include "system/reset.h"
 #include "trace.h"
 
@@ -240,26 +241,25 @@ static void kit_phy_class_init(ObjectClass *oc, const void *data)
  * button press|release   push or let go of the user button
  * link up|down           plug or unplug the Ethernet cable
  */
-static bool kit_command(void *opaque, int argc, char **argv, GString *out)
+static bool kit_sim_run(Tc4xSimCommands *obj, int argc, char **argv,
+                        GString *out)
 {
-    KitTc4d7Lite *k = opaque;
+    KitTc4d7Lite *k = KIT_TC4D7_LITE(obj);
 
     if (!strcmp(argv[0], "button")) {
-        if (argc < 2 || (strcmp(argv[1], "press") &&
+        if (argc != 2 || (strcmp(argv[1], "press") &&
                          strcmp(argv[1], "release"))) {
             g_string_append(out, "err usage: button press|release\n");
             return true;
         }
         tc4x_gpio_set_input(k->soc, KIT_BUTTON_PORT, KIT_BUTTON_PIN,
                             strcmp(argv[1], "press") != 0);
-    } else if (!strcmp(argv[0], "link")) {
-        if (argc < 2 || (strcmp(argv[1], "up") && strcmp(argv[1], "down"))) {
+    } else {    /* link */
+        if (argc != 2 || (strcmp(argv[1], "up") && strcmp(argv[1], "down"))) {
             g_string_append(out, "err usage: link up|down\n");
             return true;
         }
         k->phy->cable = !strcmp(argv[1], "up");
-    } else {
-        return false;
     }
     g_string_append(out, "ok\n");
     return true;
@@ -276,9 +276,6 @@ static void kit_init(Tc4xBoard *board, Tc4xSoc *soc)
     memset(k->eeprom, 0xFF, sizeof(k->eeprom));
     memcpy(&k->eeprom[KIT_EEPROM_EUI48], kit_eui48, sizeof(kit_eui48));
     tc4x_i2c_attach(soc, KIT_EEPROM_BUS, KIT_EEPROM_ADDR, &kit_eeprom_ops, k);
-
-    tc4x_sim_add_command(soc, "button", kit_command, k, false);
-    tc4x_sim_add_command(soc, "link", kit_command, k, false);
 }
 
 /* The PHY on GETH0 port 0 */
@@ -300,9 +297,12 @@ static const Tc4xBoardInput kit_inputs[] = {
     { KIT_BUTTON_PORT, KIT_BUTTON_PIN, 1 },     /* released */
 };
 
+static const char *const kit_sim_commands[] = { "button", "link", NULL };
+
 static void kit_class_init(ObjectClass *oc, const void *data)
 {
     Tc4xBoardClass *bc = TC4X_BOARD_CLASS(oc);
+    Tc4xSimCommandsClass *sc = TC4X_SIM_COMMANDS_CLASS(oc);
 
     bc->desc = "Infineon AURIX TC4D7 lite kit: LEDs, button, potentiometer, "
                "EEPROM, Ethernet PHY";
@@ -311,6 +311,8 @@ static void kit_class_init(ObjectClass *oc, const void *data)
     bc->n_inputs = ARRAY_SIZE(kit_inputs);
     bc->wire = kit_wire;
     bc->init = kit_init;
+    sc->commands = kit_sim_commands;
+    sc->run = kit_sim_run;
 }
 
 /* -M kit-tc4d7-lite: the tc4x machine with board=kit-tc4d7-lite */
@@ -339,6 +341,10 @@ static const TypeInfo kit_types[] = {
         .parent = TYPE_TC4X_BOARD,
         .instance_size = sizeof(KitTc4d7Lite),
         .class_init = kit_class_init,
+        .interfaces = (const InterfaceInfo[]) {
+            { TYPE_TC4X_SIM_COMMANDS },
+            { }
+        },
     }, {
         .name = MACHINE_TYPE_NAME(KIT_NAME),
         .parent = TYPE_TC4X_MACHINE,

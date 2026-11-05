@@ -28,6 +28,7 @@
 #include "hw/tricore/tc4x_ports.h"
 #include "hw/tricore/tc4x_regs.h"
 #include "hw/tricore/tc4x_sfr_store.h"
+#include "hw/tricore/tc4x_sim_bridge.h"
 #include "tc4x_soc.h"
 #include "trace.h"
 
@@ -403,15 +404,13 @@ void tc4x_gpio_add_listener(Tc4xSoc *soc, unsigned port,
 }
 
 /* gpio PORT PIN 0|1|release: drive or let go of an input */
-bool tc4x_ports_command(void *opaque, int argc, char **argv, GString *out)
+static bool tc4x_ports_sim_run(Tc4xSimCommands *obj, int argc, char **argv,
+                               GString *out)
 {
-    Tc4xPorts *p = opaque;
+    Tc4xPorts *p = TC4X_PORTS(obj);
     unsigned n, pin, level = 0;
     bool release;
 
-    if (strcmp(argv[0], "gpio") != 0) {
-        return false;
-    }
     release = argc == 4 && !strcmp(argv[3], "release");
     if (argc != 4 || qemu_strtoui(argv[1], NULL, 10, &n) < 0 ||
         qemu_strtoui(argv[2], NULL, 0, &pin) < 0 ||
@@ -517,10 +516,13 @@ static const VMStateDescription vmstate_tc4x_ports = {
     .unmigratable = 1,
 };
 
+static const char *const tc4x_ports_sim_commands[] = { "gpio", NULL };
+
 static void tc4x_ports_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     ResettableClass *rc = RESETTABLE_CLASS(oc);
+    Tc4xSimCommandsClass *sc = TC4X_SIM_COMMANDS_CLASS(oc);
 
     dc->desc = "TC4x GPIO ports";
     dc->realize = tc4x_ports_realize;
@@ -529,6 +531,8 @@ static void tc4x_ports_class_init(ObjectClass *oc, const void *data)
     dc->user_creatable = false;
     rc->phases.hold = tc4x_ports_reset_hold;
     rc->phases.exit = tc4x_ports_reset_exit;
+    sc->commands = tc4x_ports_sim_commands;
+    sc->run = tc4x_ports_sim_run;
     device_class_set_props(dc, tc4x_ports_properties);
 }
 
@@ -540,6 +544,10 @@ static const TypeInfo tc4x_ports_types[] = {
         .instance_init = tc4x_ports_init,
         .instance_finalize = tc4x_ports_finalize,
         .class_init = tc4x_ports_class_init,
+        .interfaces = (const InterfaceInfo[]) {
+            { TYPE_TC4X_SIM_COMMANDS },
+            { }
+        },
     },
 };
 

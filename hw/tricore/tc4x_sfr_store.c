@@ -29,6 +29,7 @@
 #include "hw/core/boards.h"
 #include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_sfr_store.h"
+#include "hw/tricore/tc4x_sim_bridge.h"
 #include "trace.h"
 
 #define SFR_PAGE_BITS       12
@@ -731,10 +732,29 @@ static const VMStateDescription vmstate_tc4x_sfr_store = {
     .unmigratable = 1,
 };
 
+/* hot [MIN]: the registers read at least MIN times since the last hot */
+static bool tc4x_sfr_store_sim_run(Tc4xSimCommands *obj, int argc,
+                                   char **argv, GString *out)
+{
+    uint64_t min = 100;
+
+    if (argc > 2 ||
+        (argc == 2 && !tc4x_sim_parse_uint(argv[1], UINT32_MAX, &min))) {
+        g_string_append(out, "err usage: hot [MIN]\n");
+        return true;
+    }
+    tc4x_sfr_store_hot(TC4X_SFR_STORE(obj), min, out);
+    g_string_append(out, "ok\n");
+    return true;
+}
+
+static const char *const tc4x_sfr_store_sim_commands[] = { "hot", NULL };
+
 static void tc4x_sfr_store_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     ResettableClass *rc = RESETTABLE_CLASS(oc);
+    Tc4xSimCommandsClass *sc = TC4X_SIM_COMMANDS_CLASS(oc);
 
     dc->desc = "TC4x SFR store";
     dc->realize = tc4x_sfr_store_realize;
@@ -742,6 +762,8 @@ static void tc4x_sfr_store_class_init(ObjectClass *oc, const void *data)
     /* part of the tc4x SoC */
     dc->user_creatable = false;
     rc->phases.hold = tc4x_sfr_store_reset_hold;
+    sc->commands = tc4x_sfr_store_sim_commands;
+    sc->run = tc4x_sfr_store_sim_run;
     device_class_set_props(dc, tc4x_sfr_store_properties);
 }
 
@@ -752,6 +774,10 @@ static const TypeInfo tc4x_sfr_store_types[] = {
         .instance_size = sizeof(Tc4xSfrStore),
         .instance_init = tc4x_sfr_store_init,
         .class_init = tc4x_sfr_store_class_init,
+        .interfaces = (const InterfaceInfo[]) {
+            { TYPE_TC4X_SIM_COMMANDS },
+            { }
+        },
     },
 };
 

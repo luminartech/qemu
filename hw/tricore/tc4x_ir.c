@@ -23,6 +23,7 @@
 #include "hw/tricore/tc4x_ir.h"
 #include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_regs.h"
+#include "hw/tricore/tc4x_sim_bridge.h"
 #include "trace.h"
 
 #define TC4X_IR_ACK_LISTENERS_MAX   8
@@ -381,10 +382,32 @@ static const VMStateDescription vmstate_tc4x_ir = {
     .unmigratable = 1,
 };
 
+/* irq SRC: a hardware service request of the node at SRC */
+static bool tc4x_ir_sim_run(Tc4xSimCommands *obj, int argc, char **argv,
+                            GString *out)
+{
+    Tc4xIr *ir = TC4X_IR(obj);
+    uint64_t src;
+
+    if (argc != 2 || !tc4x_sim_parse_uint(argv[1], UINT32_MAX, &src)) {
+        g_string_append(out, "err usage: irq SRC\n");
+    } else if (!tc4x_ir_is_src(src)) {
+        g_string_append_printf(out, "err 0x%08" PRIx64 " is not a service "
+                               "request node\n", src);
+    } else {
+        qemu_irq_pulse(tc4x_ir_src(ir, src & ~3u));
+        g_string_append(out, "ok\n");
+    }
+    return true;
+}
+
+static const char *const tc4x_ir_sim_commands[] = { "irq", NULL };
+
 static void tc4x_ir_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     ResettableClass *rc = RESETTABLE_CLASS(oc);
+    Tc4xSimCommandsClass *sc = TC4X_SIM_COMMANDS_CLASS(oc);
 
     dc->desc = "TC4x interrupt router";
     dc->realize = tc4x_ir_realize;
@@ -392,6 +415,8 @@ static void tc4x_ir_class_init(ObjectClass *oc, const void *data)
     /* part of the tc4x SoC */
     dc->user_creatable = false;
     rc->phases.hold = tc4x_ir_reset_hold;
+    sc->commands = tc4x_ir_sim_commands;
+    sc->run = tc4x_ir_sim_run;
     device_class_set_props(dc, tc4x_ir_properties);
 }
 
@@ -402,6 +427,10 @@ static const TypeInfo tc4x_ir_types[] = {
         .instance_size = sizeof(Tc4xIr),
         .instance_init = tc4x_ir_init,
         .class_init = tc4x_ir_class_init,
+        .interfaces = (const InterfaceInfo[]) {
+            { TYPE_TC4X_SIM_COMMANDS },
+            { }
+        },
     },
 };
 

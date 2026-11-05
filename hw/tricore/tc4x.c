@@ -49,6 +49,7 @@
 #include "hw/tricore/tc4x_sfr_store.h"
 #include "hw/tricore/tc4x_ir.h"
 #include "hw/tricore/tc4x_master.h"
+#include "hw/tricore/tc4x_sim_bridge.h"
 #include "hw/tricore/tc4x_timebase.h"
 #include "tc4x_soc.h"
 
@@ -185,13 +186,6 @@ typedef struct Tc4xTomCounter {
     int64_t t0_ns;      /* guest time of that write */
 } Tc4xTomCounter;
 
-typedef struct Tc4xSimCommand {
-    const char *prefix;
-    Tc4xSimCommandFn fn;
-    void *opaque;
-    bool qspi_lock;
-} Tc4xSimCommand;
-
 struct Tc4xSoc {
     DeviceState parent_obj;
 
@@ -219,17 +213,11 @@ struct Tc4xSoc {
     Object *dma_policy;     /* TYPE_TC4X_DMA_POLICY */
 
     Tc4xTimebase *timebase;
-    Tc4xTimeRequest *bridge_time_request;
-    MemTxAttrs bridge_attrs;    /* the bus master of bridge r and w */
 
     uint32_t console;       /* ASCLIN instance of the console chardev */
     CharFrontend uart;
     uint8_t rx_fifo[ASCLIN_RXFIFO_DEPTH];
     unsigned rx_head, rx_count;
-
-    CharFrontend sim;
-    GString *sim_line;
-    GArray *sim_commands;   /* Tc4xSimCommand */
 
     /*
      * Channels with TSR.HTRE (hardware requests enabled): changed under the
@@ -309,20 +297,6 @@ uint32_t tc4x_reg_cmpxchg(Tc4xSoc *s, uint32_t addr, uint32_t old,
                           uint32_t val)
 {
     return tc4x_sfr_store_cmpxchg(s->sfr, addr, old, val);
-}
-
-static void G_GNUC_PRINTF(2, 3) sim_printf(Tc4xSoc *s, const char *fmt, ...)
-{
-    va_list ap;
-    g_autofree char *line = NULL;
-
-    if (!qemu_chr_fe_backend_connected(&s->sim)) {
-        return;
-    }
-    va_start(ap, fmt);
-    line = g_strdup_vprintf(fmt, ap);
-    va_end(ap);
-    qemu_chr_fe_write_all(&s->sim, (const uint8_t *)line, strlen(line));
 }
 
 /* A hardware service request of the node at @src (any thread) */
@@ -1054,8 +1028,8 @@ static bool soc_sfr_write(void *opaque, uint32_t addr, uint32_t *val)
 static void soc_sfr_watched(void *opaque, uint32_t addr, uint32_t val,
                             unsigned size)
 {
-    sim_printf(opaque, "ev w 0x%08x 0x%08x %u %d\n", addr, val, size,
-               current_cpu ? current_cpu->cpu_index : -1);
+    tc4x_sim_event("w 0x%08x 0x%08x %u %d", addr, val, size,
+                   current_cpu ? current_cpu->cpu_index : -1);
 }
 
 static const Tc4xSfrModelOps soc_sfr_models = {
@@ -1088,34 +1062,8 @@ Tc4xPacer *tc4x_pacer_new(Tc4xSoc *s, const Tc4xPacerConfig *cfg,
     return tc4x_timebase_new_pacer(s->timebase, cfg, ops, opaque);
 }
 
-void tc4x_sim_add_command(Tc4xSoc *s, const char *prefix, Tc4xSimCommandFn fn,
-                          void *opaque, bool qspi_lock)
-{
-    Tc4xSimCommand c = {
-        .prefix = prefix, .fn = fn, .opaque = opaque, .qspi_lock = qspi_lock,
-    };
-
-    g_array_append_val(s->sim_commands, c);
-}
-
-/*
- * Only commands registered with qspi_lock take the QSPI lock: vmstop waits
- * for vCPUs, which may wait for it.
- */
-static bool sim_needs_qspi_lock(Tc4xSoc *s, const char *name)
-{
-    for (guint i = 0; i < s->sim_commands->len; i++) {
-        Tc4xSimCommand *c = &g_array_index(s->sim_commands, Tc4xSimCommand, i);
-
-        if (c->qspi_lock && g_str_has_prefix(name, c->prefix)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /* Register commands act on the store only: else reply err */
-static bool sim_store_backed(Tc4xSoc *s, uint32_t addr)
+static bool sim_store_backed(Tc4xSoc *s, uint32_t addr, GString *out)
 {
     Object *owner = tc4x_sfr_store_owner(s->sfr, addr & ~3u);
     g_autofree char *path = NULL;
@@ -1124,191 +1072,88 @@ static bool sim_store_backed(Tc4xSoc *s, uint32_t addr)
         return true;
     }
     path = object_get_canonical_path(owner);
-    sim_printf(s, "err 0x%08x owned by %s\n", addr, path ? path : "?");
+    g_string_append_printf(out, "err 0x%08x owned by %s\n", addr,
+                           path ? path : "?");
     return false;
 }
 
-/* master [debug | cpu N [safe] | dma CH]: the bus master of r and w */
-static void sim_master(Tc4xSoc *s, int argc, char **argv)
+static void soc_cores(Tc4xSoc *s, GString *out)
 {
-    bool safe = argc == 4 && !strcmp(argv[3], "safe");
-    unsigned n, m;
-    int core;
+    for (int c = 0; c < TC4X_NUM_CORES; c++) {
+        CPUTriCoreState *env = &s->cpu[c]->env;
 
-    if (argc == 2 && !strcmp(argv[1], "debug")) {
-        s->bridge_attrs = tc4x_master_attrs(TC4X_MASTER_DEBUG, false);
-    } else if ((argc == 3 || safe) && !strcmp(argv[1], "cpu") &&
-               !qemu_strtoui(argv[2], NULL, 0, &n) && n < TC4X_NUM_CORES) {
-        s->bridge_attrs = tc4x_master_attrs(TC4X_MASTER_CPU(n), safe);
-    } else if (argc == 3 && !strcmp(argv[1], "dma") &&
-               !qemu_strtoui(argv[2], NULL, 0, &n) && n < DMA_NUM_CH) {
-        s->bridge_attrs = tc4x_master_attrs(TC4X_MASTER_DMA(n), false);
-    } else if (argc != 1) {
-        sim_printf(s, "err usage: master [debug | cpu N [safe] | dma CH]\n");
-        return;
+        g_string_append_printf(out, "core %d pc 0x%08x %s icr 0x%08x "
+                               "prio %u d4 0x%08x d5 0x%08x d6 0x%08x "
+                               "a11 0x%08x\n",
+                               c, env->PC,
+                               env->boot_halted ? "bhalt" :
+                               CPU(s->cpu[c])->halted ? "wait" : "run",
+                               env->ICR, env->pending_irq_prio, env->gpr_d[4],
+                               env->gpr_d[5], env->gpr_d[6], env->gpr_a[11]);
     }
-    m = TC4X_REQUESTER_MASTER(s->bridge_attrs.requester_id);
-    core = tc4x_master_core(s->bridge_attrs);
-    if (m == TC4X_MASTER_DEBUG) {
-        sim_printf(s, "ok debug\n");
-    } else if (core >= 0) {
-        sim_printf(s, "ok cpu %d%s\n", core,
-                   TC4X_REQUESTER_SAFE(s->bridge_attrs.requester_id) ?
-                   " safe" : "");
-    } else {
-        sim_printf(s, "ok dma %u\n", m - TC4X_MASTER_DMA(0));
-    }
+    g_string_append(out, "ok\n");
 }
 
-static void sim_exec_argv(Tc4xSoc *s, int argc, char **argv)
+/*
+ * poke ADDR VAL, force ADDR VAL [MASK], unforce ADDR: stored values of
+ * the store's registers; watch ADDR, unwatch ADDR: report guest writes;
+ * cores: the state of the cores
+ */
+static bool soc_sim_run(Tc4xSimCommands *obj, int argc, char **argv,
+                        GString *out)
 {
-    uint64_t a[4] = { 0 };
+    Tc4xSoc *s = TC4X_SOC(obj);
+    const char *cmd = argv[0];
+    uint64_t addr = 0, val = 0, mask = UINT32_MAX;
+    bool ok;
 
-    for (int i = 1; i < argc && i <= 3; i++) {
-        a[i] = g_ascii_strtoull(argv[i], NULL, 0);
-    }
-
-    if (!strcmp(argv[0], "r") && argc >= 2) {
-        uint32_t size = argc >= 3 ? a[2] : 4;
-        uint32_t v = 0;
-
-        if (size != 1 && size != 2 && size != 4) {
-            sim_printf(s, "err size must be 1, 2 or 4\n");
-            return;
-        }
-        address_space_read(&address_space_memory, a[1], s->bridge_attrs, &v,
-                           size);
-        sim_printf(s, "ok 0x%08x\n", le32_to_cpu(v));
-    } else if (!strcmp(argv[0], "w") && argc >= 3) {
-        uint32_t size = argc >= 4 ? a[3] : 4;
-        uint32_t v = cpu_to_le32(a[2]);
-
-        if (size != 1 && size != 2 && size != 4) {
-            sim_printf(s, "err size must be 1, 2 or 4\n");
-            return;
-        }
-        /* as a debugger: it patches flash, which refuses guest stores */
-        if (!tc4x_flash_patch(&s->flash, a[1], &v, size)) {
-            address_space_write(&address_space_memory, a[1], s->bridge_attrs,
-                                &v, size);
-        }
-        sim_printf(s, "ok\n");
-    } else if (!strcmp(argv[0], "poke") && argc >= 3) {
-        if (sim_store_backed(s, a[1])) {
-            reg_set(s, a[1] & ~3u, a[2]);
-            dma_htre_sync(s, a[1] & ~3u);
-            sim_printf(s, "ok\n");
-        }
-    } else if (!strcmp(argv[0], "force") && argc >= 3) {
-        if (sim_store_backed(s, a[1])) {
-            tc4x_sfr_store_force(s->sfr, a[1] & ~3u, a[2],
-                                 argc >= 4 ? a[3] : 0xFFFFFFFFu);
-            sim_printf(s, "ok\n");
-        }
-    } else if (!strcmp(argv[0], "unforce") && argc >= 2) {
-        if (sim_store_backed(s, a[1])) {
-            tc4x_sfr_store_force(s->sfr, a[1] & ~3u, 0, 0);
-            sim_printf(s, "ok\n");
-        }
-    } else if (!strcmp(argv[0], "irq") && argc >= 2) {
-        if (tc4x_ir_is_src(a[1])) {
-            tc4x_irq_raise(s, a[1] & ~3u);
-            sim_printf(s, "ok\n");
+    if (!strcmp(cmd, "cores")) {
+        if (argc != 1) {
+            g_string_append(out, "err usage: cores\n");
         } else {
-            sim_printf(s, "err 0x%08x is not a service request node\n",
-                       (uint32_t)a[1]);
+            soc_cores(s, out);
         }
-    } else if ((!strcmp(argv[0], "watch") || !strcmp(argv[0], "unwatch")) &&
-               argc >= 2) {
-        bool on = !strcmp(argv[0], "watch");
-
-        if (tc4x_ir_is_src(a[1])) {
-            tc4x_ir_watch(s->ir, a[1] & ~3u, on);
-            sim_printf(s, "ok\n");
-        } else if (sim_store_backed(s, a[1])) {
-            tc4x_sfr_store_watch(s->sfr, a[1] & ~3u, on);
-            sim_printf(s, "ok\n");
-        }
-    } else if (!strcmp(argv[0], "cores")) {
-        for (int c = 0; c < TC4X_NUM_CORES; c++) {
-            CPUTriCoreState *env = &s->cpu[c]->env;
-
-            sim_printf(s, "core %d pc 0x%08x %s icr 0x%08x prio %u "
-                       "d4 0x%08x d5 0x%08x d6 0x%08x a11 0x%08x\n",
-                       c, env->PC,
-                       env->boot_halted ? "bhalt" :
-                       CPU(s->cpu[c])->halted ? "wait" : "run",
-                       env->ICR, env->pending_irq_prio, env->gpr_d[4],
-                       env->gpr_d[5], env->gpr_d[6], env->gpr_a[11]);
-        }
-        sim_printf(s, "ok\n");
-    } else if (!strcmp(argv[0], "hot")) {
-        g_autoptr(GString) out = g_string_new(NULL);
-
-        tc4x_sfr_store_hot(s->sfr, argc >= 2 ? a[1] : 100, out);
-        sim_printf(s, "%sok\n", out->str);
-    } else if (!strcmp(argv[0], "vmstop")) {
-        vm_stop(RUN_STATE_PAUSED);
-        sim_printf(s, "ok\n");
-    } else if (!strcmp(argv[0], "vmcont")) {
-        vm_start();
-        sim_printf(s, "ok\n");
-    } else if (!strcmp(argv[0], "master")) {
-        sim_master(s, argc, argv);
-    } else if (!strcmp(argv[0], "timescale") && argc >= 2) {
-        tc4x_timebase_request(s->timebase, s->bridge_time_request, a[1]);
-        sim_printf(s, "ok %u\n", tc4x_timebase_scale(s->timebase));
+        return true;
+    }
+    if (!strcmp(cmd, "poke")) {
+        ok = argc == 3;
+    } else if (!strcmp(cmd, "force")) {
+        ok = argc == 3 || (argc == 4 &&
+                           tc4x_sim_parse_uint(argv[3], UINT32_MAX, &mask));
     } else {
-        g_autoptr(GString) out = g_string_new(NULL);
+        ok = argc == 2;     /* unforce, watch, unwatch */
+    }
+    ok = ok && tc4x_sim_parse_uint(argv[1], UINT32_MAX, &addr) &&
+         (argc < 3 || tc4x_sim_parse_uint(argv[2], UINT32_MAX, &val));
+    if (!ok) {
+        g_string_append_printf(out, "err usage: %s ADDR%s\n", cmd,
+                               !strcmp(cmd, "poke") ? " VAL" :
+                               !strcmp(cmd, "force") ? " VAL [MASK]" : "");
+        return true;
+    }
 
-        for (guint i = 0; i < s->sim_commands->len; i++) {
-            Tc4xSimCommand *c = &g_array_index(s->sim_commands,
-                                               Tc4xSimCommand, i);
+    if (!strcmp(cmd, "watch") || !strcmp(cmd, "unwatch")) {
+        bool on = !strcmp(cmd, "watch");
 
-            if (g_str_has_prefix(argv[0], c->prefix) &&
-                c->fn(c->opaque, argc, argv, out)) {
-                sim_printf(s, "%s", out->str);
-                return;
-            }
+        if (tc4x_ir_is_src(addr)) {
+            tc4x_ir_watch(s->ir, addr & ~3u, on);
+        } else if (sim_store_backed(s, addr, out)) {
+            tc4x_sfr_store_watch(s->sfr, addr & ~3u, on);
+        } else {
+            return true;
         }
-        sim_printf(s, "err unknown command '%s'\n", argv[0]);
+    } else if (!sim_store_backed(s, addr, out)) {
+        return true;
+    } else if (!strcmp(cmd, "poke")) {
+        reg_set(s, addr & ~3u, val);
+        dma_htre_sync(s, addr & ~3u);
+    } else if (!strcmp(cmd, "force")) {
+        tc4x_sfr_store_force(s->sfr, addr & ~3u, val, mask);
+    } else {
+        tc4x_sfr_store_force(s->sfr, addr & ~3u, 0, 0);
     }
-}
-
-void tc4x_sim_exec(Tc4xSoc *s, char *line)
-{
-    g_auto(GStrv) argv = g_strsplit_set(g_strstrip(line), " \t", -1);
-    int argc = g_strv_length(argv);
-
-    if (argc == 0 || argv[0][0] == '\0' || argv[0][0] == '#') {
-        return;
-    }
-    if (sim_needs_qspi_lock(s, argv[0])) {
-        tc4x_qspi_lock(s);
-        sim_exec_argv(s, argc, argv);
-        tc4x_qspi_unlock(s);
-        return;
-    }
-    sim_exec_argv(s, argc, argv);
-}
-
-static int sim_can_receive(void *opaque)
-{
-    return 256;
-}
-
-static void sim_receive(void *opaque, const uint8_t *buf, int size)
-{
-    Tc4xSoc *s = opaque;
-
-    for (int i = 0; i < size; i++) {
-        if (buf[i] == '\n') {
-            tc4x_sim_exec(s, s->sim_line->str);
-            g_string_truncate(s->sim_line, 0);
-        } else if (buf[i] != '\r') {
-            g_string_append_c(s->sim_line, buf[i]);
-        }
-    }
+    g_string_append(out, "ok\n");
+    return true;
 }
 
 /*
@@ -1701,7 +1546,6 @@ static bool tc4x_soc_add_tmadc(Tc4xSoc *s, Error **errp)
         }
     }
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, tc4x_tmadc_base(), 0);
-    tc4x_sim_add_command(s, "adc", tc4x_tmadc_command, s->tmadc, false);
     return true;
 }
 
@@ -1724,7 +1568,6 @@ static bool tc4x_soc_add_ports(Tc4xSoc *s, Error **errp)
     }
     s->ports = TC4X_PORTS(dev);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, tc4x_ports_base(), 0);
-    tc4x_sim_add_command(s, "gpio", tc4x_ports_command, s->ports, false);
     return true;
 }
 
@@ -1783,8 +1626,6 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
     }
     s->tom_cn0 = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                        NULL, g_free);
-    s->sim_line = g_string_new(NULL);
-    s->sim_commands = g_array_new(false, false, sizeof(Tc4xSimCommand));
 
     for (int c = 0; c < TC4X_NUM_CORES; c++) {
         g_autofree char *name = g_strdup_printf("core%d.spr", c);
@@ -1823,8 +1664,6 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
         !tc4x_soc_add_ports(s, errp) || !tc4x_soc_add_tmadc(s, errp)) {
         return;
     }
-    s->bridge_time_request = tc4x_timebase_new_request(s->timebase);
-    s->bridge_attrs = tc4x_master_attrs(TC4X_MASTER_DEBUG, false);
     tc4x_force_soc_status(s);
     if (!tc4x_soc_add_geth(s, sysmem, errp)) {
         return;
@@ -1832,15 +1671,12 @@ static void tc4x_soc_realize(DeviceState *dev, Error **errp)
 
     qemu_chr_fe_set_handlers(&s->uart, uart_can_receive, uart_receive, NULL,
                              NULL, s, NULL, true);
-    qemu_chr_fe_set_handlers(&s->sim, sim_can_receive, sim_receive, NULL,
-                             NULL, s, NULL, true);
 }
 
 static const Property tc4x_soc_properties[] = {
     DEFINE_PROP_STRING("cpu-type", Tc4xSoc, cpu_type),
     DEFINE_PROP_UINT32("console", Tc4xSoc, console, 0),
     DEFINE_PROP_CHR("console-chardev", Tc4xSoc, uart),
-    DEFINE_PROP_CHR("sim-chardev", Tc4xSoc, sim),
     DEFINE_PROP_BOOL("imprecise-io", Tc4xSoc, imprecise_io, false),
     DEFINE_PROP_ARRAY("port-straps", Tc4xSoc, num_port_straps, port_straps,
                       qdev_prop_uint32, uint32_t),
@@ -1879,16 +1715,23 @@ static void tc4x_soc_init(Object *obj)
                              OBJ_PROP_LINK_STRONG);
 }
 
+static const char *const soc_sim_commands[] = {
+    "poke", "force", "unforce", "watch", "unwatch", "cores", NULL
+};
+
 static void tc4x_soc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     ResettableClass *rc = RESETTABLE_CLASS(oc);
+    Tc4xSimCommandsClass *sc = TC4X_SIM_COMMANDS_CLASS(oc);
 
     dc->desc = "Infineon AURIX TC4Dx SoC";
     dc->realize = tc4x_soc_realize;
     /* created by the tc4x machines only */
     dc->user_creatable = false;
     rc->phases.hold = tc4x_soc_reset_hold;
+    sc->commands = soc_sim_commands;
+    sc->run = soc_sim_run;
     device_class_set_props(dc, tc4x_soc_properties);
 }
 
@@ -1903,6 +1746,10 @@ static const TypeInfo tc4x_soc_types[] = {
         .instance_size = sizeof(Tc4xSoc),
         .instance_init = tc4x_soc_init,
         .class_init = tc4x_soc_class_init,
+        .interfaces = (const InterfaceInfo[]) {
+            { TYPE_TC4X_SIM_COMMANDS },
+            { }
+        },
     },
 };
 

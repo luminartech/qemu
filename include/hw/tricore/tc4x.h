@@ -242,10 +242,12 @@ void tc4x_time_add_retime_notifier(Tc4xSoc *soc, Tc4xRetimeFn fn,
                                    void *opaque);
 
 /*
- * Sim-bridge and sfr-script commands whose name starts with @prefix.  @fn
- * returns false for a command it does not know, else appends its reply
- * lines (ending in "ok ..." or "err ...") to @out.  With @qspi_lock the
- * command runs under the QSPI bus locks (it touches QSPI slave state).
+ * Sim-bridge and sfr-script commands whose name starts with @prefix,
+ * offered after the objects that serve the word (TYPE_TC4X_SIM_COMMANDS,
+ * tc4x_sim_bridge.h).  @fn returns false for a command it does not know,
+ * else appends its reply lines (ending in "ok ..." or "err ...") to @out.
+ * With @qspi_lock the command runs under the QSPI bus locks (it touches
+ * QSPI slave state).  Board init only.
  */
 typedef bool (*Tc4xSimCommandFn)(void *opaque, int argc, char **argv,
                                  GString *out);

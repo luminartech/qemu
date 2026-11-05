@@ -59,20 +59,11 @@ void tc4x_flash_dmu_error_running(Tc4xFlashState *s, uint32_t err);
  */
 void tc4x_soc_boot(Tc4xSoc *soc, uint32_t entry);
 
-/* Run one sim-bridge command line; replies go to the sim chardev */
-void tc4x_sim_exec(Tc4xSoc *soc, char *line);
-
 /*
  * @fn sees every change of port @port's output latch (machine init only;
  * fails with an error for a port that does not exist)
  */
 void tc4x_ports_add_listener(Tc4xPorts *p, unsigned port,
                              Tc4xGpioListenerFn fn, void *opaque);
-
-/* The sim-bridge command "gpio" of the ports @opaque */
-bool tc4x_ports_command(void *opaque, int argc, char **argv, GString *out);
-
-/* The sim-bridge command "adc" of the TMADC kernels @opaque */
-bool tc4x_tmadc_command(void *opaque, int argc, char **argv, GString *out);
 
 #endif

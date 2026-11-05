@@ -21,9 +21,11 @@
 #include "system/hostmem.h"
 #include "system/blockdev.h"
 #include "system/block-backend.h"
+#include "chardev/char.h"
 #include "elf.h"
 #include "cpu.h"
 #include "hw/tricore/tc4x_machine.h"
+#include "hw/tricore/tc4x_sim_bridge.h"
 #include "tc4x_soc.h"
 
 static void tc4x_load_image(Tc4xMachineState *m, const char *file)
@@ -180,6 +182,33 @@ static void tc4x_set_flash_drives(Tc4xMachineState *m, DeviceState *soc)
     }
 }
 
+/*
+ * The sim bridge on the character device sim-chardev names, else on the
+ * second serial port
+ */
+static void tc4x_add_sim_bridge(Tc4xMachineState *m)
+{
+    DeviceState *dev = qdev_new(TYPE_TC4X_SIM_BRIDGE);
+    Chardev *chr = serial_hd(1);
+
+    if (m->sim_chardev) {
+        chr = qemu_chr_find(m->sim_chardev);
+        if (!chr) {
+            error_report("tc4x: sim-chardev '%s' is not a character device",
+                         m->sim_chardev);
+            exit(1);
+        }
+    }
+    object_property_add_child(OBJECT(m), "sim-bridge", OBJECT(dev));
+    if (chr) {
+        qdev_prop_set_chr(dev, "chardev", chr);
+    }
+    object_property_set_link(OBJECT(dev), "soc", OBJECT(m->soc),
+                             &error_abort);
+    qdev_realize_and_unref(dev, NULL, &error_fatal);
+    m->sim_bridge = TC4X_SIM_BRIDGE(dev);
+}
+
 static void tc4x_init(MachineState *ms)
 {
     Tc4xMachineState *m = TC4X_MACHINE(ms);
@@ -200,7 +229,6 @@ static void tc4x_init(MachineState *ms)
     qdev_prop_set_string(dev, "cpu-type", ms->cpu_type);
     qdev_prop_set_uint32(dev, "console", bc->console);
     qdev_prop_set_chr(dev, "console-chardev", serial_hd(0));
-    qdev_prop_set_chr(dev, "sim-chardev", serial_hd(1));
     qdev_prop_set_bit(dev, "imprecise-io", m->imprecise_io);
     straps = qlist_new();
     for (unsigned i = 0; i < bc->n_inputs; i++) {
@@ -230,6 +258,7 @@ static void tc4x_init(MachineState *ms)
     }
     qdev_realize_and_unref(dev, NULL, &error_fatal);
     qemu_register_resettable(OBJECT(dev));
+    tc4x_add_sim_bridge(m);
 
     tc4x_apply_board(m->soc, bc);
     if (bc->init) {
@@ -237,16 +266,12 @@ static void tc4x_init(MachineState *ms)
     }
 
     if (m->sfr_script) {
-        g_autofree char *text = NULL;
-        g_auto(GStrv) lines = NULL;
+        Error *err = NULL;
 
-        if (!g_file_get_contents(m->sfr_script, &text, NULL, NULL)) {
-            error_report("tc4x: cannot read sfr-script '%s'", m->sfr_script);
+        if (!tc4x_sim_bridge_run_script(m->sim_bridge, m->sfr_script,
+                                        &err)) {
+            error_reportf_err(err, "tc4x: sfr-script: ");
             exit(1);
-        }
-        lines = g_strsplit(text, "\n", -1);
-        for (int i = 0; lines[i]; i++) {
-            tc4x_sim_exec(m->soc, lines[i]);
         }
     }
 
@@ -270,6 +295,20 @@ static void tc4x_set_sfr_script(Object *obj, const char *value, Error **errp)
 
     g_free(m->sfr_script);
     m->sfr_script = g_strdup(value);
+}
+
+static char *tc4x_get_sim_chardev(Object *obj, Error **errp)
+{
+    return g_strdup(TC4X_MACHINE(obj)->sim_chardev);
+}
+
+static void tc4x_set_sim_chardev(Object *obj, const char *value,
+                                 Error **errp)
+{
+    Tc4xMachineState *m = TC4X_MACHINE(obj);
+
+    g_free(m->sim_chardev);
+    m->sim_chardev = g_strdup(value);
 }
 
 static char *tc4x_get_board(Object *obj, Error **errp)
@@ -340,7 +379,14 @@ static void tc4x_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "sfr-script", tc4x_get_sfr_script,
                                   tc4x_set_sfr_script);
     object_class_property_set_description(oc, "sfr-script",
-        "File of sim-bridge commands (force/poke/watch) run at machine init");
+        "File of sim-bridge commands run at machine init; a command "
+        "that fails stops QEMU");
+
+    object_class_property_add_str(oc, "sim-chardev", tc4x_get_sim_chardev,
+                                  tc4x_set_sim_chardev);
+    object_class_property_set_description(oc, "sim-chardev",
+        "ID of the character device of the sim bridge (default: the "
+        "second serial port)");
 
     object_class_property_add_bool(oc, "imprecise-io", tc4x_get_imprecise_io,
                                    tc4x_set_imprecise_io);

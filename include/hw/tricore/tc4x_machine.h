@@ -14,6 +14,7 @@
 #include "hw/core/boards.h"
 #include "hw/tricore/tc4x.h"
 #include "hw/tricore/tc4x_board.h"
+#include "hw/tricore/tc4x_sim_bridge.h"
 
 #define TYPE_TC4X_MACHINE "tc4x-common-machine"
 OBJECT_DECLARE_TYPE(Tc4xMachineState, Tc4xMachineClass, TC4X_MACHINE)
@@ -30,8 +31,10 @@ struct Tc4xMachineState {
 
     Tc4xSoc *soc;
     Tc4xBoard *board;
+    Tc4xSimBridge *sim_bridge;
     uint32_t entry;         /* entry point of the first image */
     char *sfr_script;
+    char *sim_chardev;
     char *board_name;       /* board= of the tc4x machine */
     char *shm_dir;
     char *flash_dir;

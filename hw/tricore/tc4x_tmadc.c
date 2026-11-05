@@ -29,6 +29,7 @@
 #include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_regs.h"
 #include "hw/tricore/tc4x_sfr_store.h"
+#include "hw/tricore/tc4x_sim_bridge.h"
 #include "hw/tricore/tc4x_timebase.h"
 #include "hw/tricore/tc4x_tmadc.h"
 #include "tc4x_soc.h"
@@ -382,16 +383,16 @@ static void tmadc_set_period(Object *obj, Visitor *v, const char *name,
 
 /*
  * adc K CH VOLTS: set the "volts" property of a channel.  Board commands
- * that start with "adc" and a word other than a number are not this one.
+ * "adc" with a word other than a number are not this one.
  */
-bool tc4x_tmadc_command(void *opaque, int argc, char **argv, GString *out)
+static bool tc4x_tmadc_sim_run(Tc4xSimCommands *obj, int argc, char **argv,
+                               GString *out)
 {
-    Tc4xTmadc *adc = opaque;
+    Tc4xTmadc *adc = TC4X_TMADC(obj);
     unsigned k, ch;
     double volts;
 
-    if (strcmp(argv[0], "adc") != 0 ||
-        (argc > 1 && !g_ascii_isdigit(argv[1][0]))) {
+    if (argc > 1 && !g_ascii_isdigit(argv[1][0])) {
         return false;
     }
     if (argc != 4 || qemu_strtoui(argv[1], NULL, 0, &k) < 0 ||
@@ -483,10 +484,13 @@ static const VMStateDescription vmstate_tc4x_tmadc = {
     .unmigratable = 1,
 };
 
+static const char *const tc4x_tmadc_sim_commands[] = { "adc", NULL };
+
 static void tc4x_tmadc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     ResettableClass *rc = RESETTABLE_CLASS(oc);
+    Tc4xSimCommandsClass *sc = TC4X_SIM_COMMANDS_CLASS(oc);
 
     dc->desc = "TC4x TMADC kernels";
     dc->realize = tc4x_tmadc_realize;
@@ -494,6 +498,8 @@ static void tc4x_tmadc_class_init(ObjectClass *oc, const void *data)
     /* part of the tc4x SoC */
     dc->user_creatable = false;
     rc->phases.hold = tc4x_tmadc_reset_hold;
+    sc->commands = tc4x_tmadc_sim_commands;
+    sc->run = tc4x_tmadc_sim_run;
     device_class_set_props(dc, tc4x_tmadc_properties);
 }
 
@@ -565,6 +571,10 @@ static const TypeInfo tc4x_tmadc_types[] = {
         .instance_size = sizeof(Tc4xTmadc),
         .instance_init = tc4x_tmadc_init,
         .class_init = tc4x_tmadc_class_init,
+        .interfaces = (const InterfaceInfo[]) {
+            { TYPE_TC4X_SIM_COMMANDS },
+            { }
+        },
     }, {
         .name = TYPE_TC4X_ANALOG_LEGACY,
         .parent = TYPE_OBJECT,

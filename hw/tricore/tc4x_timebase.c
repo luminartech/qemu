@@ -30,6 +30,7 @@
 #include "hw/tricore/tc4x_master.h"
 #include "hw/tricore/tc4x_regs.h"
 #include "hw/tricore/tc4x_sfr_store.h"
+#include "hw/tricore/tc4x_sim_bridge.h"
 #include "hw/tricore/tc4x_timebase.h"
 #include "trace.h"
 
@@ -119,6 +120,7 @@ struct Tc4xTimebase {
     int64_t barrier;
 
     GPtrArray *requests;
+    Tc4xTimeRequest *sim_request;   /* of the sim bridge's timescale */
     QLIST_HEAD(, Tc4xGuestTimer) timers;
     GArray *retime;             /* Tc4xRetimeNotifier */
     Tc4xStmCompare stm[TC4X_TIMEBASE_NUM_CPUS][TC4X_STM_VMS][2];
@@ -791,10 +793,32 @@ static const VMStateDescription vmstate_tc4x_timebase = {
     .unmigratable = 1,
 };
 
+/* timescale N: request guest time at 1/N of virtual time (0, 1: none) */
+static bool tc4x_timebase_sim_run(Tc4xSimCommands *obj, int argc,
+                                  char **argv, GString *out)
+{
+    Tc4xTimebase *tb = TC4X_TIMEBASE(obj);
+    uint64_t scale;
+
+    if (argc != 2 || !tc4x_sim_parse_uint(argv[1], UINT32_MAX, &scale)) {
+        g_string_append(out, "err usage: timescale N\n");
+        return true;
+    }
+    if (!tb->sim_request) {
+        tb->sim_request = tc4x_timebase_new_request(tb);
+    }
+    tc4x_timebase_request(tb, tb->sim_request, scale);
+    g_string_append_printf(out, "ok %u\n", tc4x_timebase_scale(tb));
+    return true;
+}
+
+static const char *const tc4x_timebase_sim_commands[] = { "timescale", NULL };
+
 static void tc4x_timebase_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     ResettableClass *rc = RESETTABLE_CLASS(oc);
+    Tc4xSimCommandsClass *sc = TC4X_SIM_COMMANDS_CLASS(oc);
 
     dc->desc = "TC4x time base (STM, TBU)";
     dc->realize = tc4x_timebase_realize;
@@ -802,6 +826,8 @@ static void tc4x_timebase_class_init(ObjectClass *oc, const void *data)
     /* part of the tc4x SoC */
     dc->user_creatable = false;
     rc->phases.hold = tc4x_timebase_reset_hold;
+    sc->commands = tc4x_timebase_sim_commands;
+    sc->run = tc4x_timebase_sim_run;
     device_class_set_props(dc, tc4x_timebase_properties);
 }
 
@@ -812,6 +838,10 @@ static const TypeInfo tc4x_timebase_types[] = {
         .instance_size = sizeof(Tc4xTimebase),
         .instance_init = tc4x_timebase_init,
         .class_init = tc4x_timebase_class_init,
+        .interfaces = (const InterfaceInfo[]) {
+            { TYPE_TC4X_SIM_COMMANDS },
+            { }
+        },
     },
 };
 

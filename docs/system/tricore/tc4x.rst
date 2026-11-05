@@ -101,7 +101,11 @@ Machine properties:
   board.
 
 ``sfr-script=FILE``
-  File of sim-bridge commands run at machine init (after the board).
+  File of sim-bridge commands run at machine init (after the board); a
+  command that fails stops QEMU.
+
+``sim-chardev=ID``
+  Character device of the sim bridge (default: the second serial port).
 
 ``shm-dir=DIR``
   Back every RAM with a shared file ``DIR/NAME`` that external processes
@@ -137,14 +141,36 @@ CPU property, with ``-global tc4x-tricore-cpu.csa-cache=on``:
 Sim bridge
 ----------
 
-The second serial port is the sim bridge, a line-oriented command interface
-for external processes and tests.  Commands take numbers in C syntax and reply with a line
-starting with ``ok`` or ``err``:
+The sim bridge (device ``tc4x-sim-bridge``, the machine's child
+``sim-bridge``) is a line-oriented command interface for external
+processes and tests, on the character device that the machine property
+``sim-chardev`` names (``-chardev socket,id=sim,path=sim.sock,server=on,wait=off
+-M kit-tc4d7-lite,sim-chardev=sim``), else on the second serial port.
+Commands take numbers in C syntax (decimal, ``0x`` hexadecimal, ``0``
+octal); every command is answered by zero or more data lines and a line
+that starts with ``ok`` or ``err``.  A malformed number, an argument too
+many or a value out of range is an ``err`` reply, never a default.
+
+The bridge serves:
+
+=========================================  ====================================
+``r ADDR [SIZE]``                          read through the bus, ``ok VALUE``;
+                                           a read the bus refuses is ``err
+                                           VALUE bus error at ADDR``
+``w ADDR VAL [SIZE]``                      write through the bus (side effects
+                                           run); as a debugger, it patches
+                                           flash
+``master [debug|cpu N [safe]|dma CH]``     the bus master of ``r`` and ``w``
+                                           (default: the debug master)
+``get PATH PROP``                          a QOM property, ``ok VALUE``
+``set PATH PROP VALUE``                    set a QOM property from its text
+                                           form
+``vmstop``, ``vmcont``                     pause and resume the guest
+=========================================  ====================================
+
+The devices serve:
 
 =============================  ==============================================
-``r ADDR [SIZE]``              read through the bus, ``ok VALUE``
-``w ADDR VAL [SIZE]``          write through the bus (side effects run);
-                               as a debugger, it patches flash
 ``poke ADDR VAL``              set an SFR's stored value, no side effects
 ``force ADDR VAL [MASK]``      SFR reads return VAL on MASK until ``unforce``
 ``irq SRC``                    hardware-set SRR of a service request node
@@ -153,13 +179,24 @@ starting with ``ok`` or ``err``:
 ``cores``                      per-core PC, state, ICR and some registers
 ``hot [MIN]``                  SFRs read at least MIN times since last asked
 ``timescale N``                request guest time at 1/N of virtual time
-``vmstop``, ``vmcont``         pause and resume the guest
 ``adc K CH VOLTS``             set a TMADC pin voltage
 ``gpio PORT PIN 0|1|release``  drive or release an input
+``button press|release``       the kit's user button
+``link up|down``               the kit's Ethernet cable
 =============================  ==============================================
 
-Asynchronous events: ``ev w ...`` for watched writes.  Board code adds its
-own commands with ``tc4x_sim_add_command()``.
+``poke``, ``force`` and ``unforce`` act on registers of the SFR store only;
+for a register a device serves, the reply is ``err ADDR owned by PATH``.
+
+Event lines start with ``ev`` and may come at any time, before a reply
+included: ``ev w ...`` for watched writes.
+
+A device, a board or any other object adds commands by implementing the
+QOM interface ``tc4x-sim-commands`` (``include/hw/tricore/tc4x_sim_bridge.h``):
+the class lists its command words and runs them; the bridge finds the
+object in the QOM tree.  ``tc4x_sim_event()`` sends an event line.  The
+``sfr-script`` machine property runs a file of commands at machine init;
+a command that fails stops QEMU with the line and its reply.
 
 Flash
 -----
